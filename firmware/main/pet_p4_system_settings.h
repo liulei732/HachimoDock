@@ -46,6 +46,7 @@ typedef struct {
   pet_wifi_snapshot_t wifi;
   pet_lan_pair_view_t lan;
   pet_wifi_ap_t target;
+  bool feed_request_failed;
   unsigned selected, list_start, key_row, key_column, password_length;
   unsigned keyboard, saved_action;
   bool editing_saved_password, confirm_forget;

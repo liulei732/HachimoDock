@@ -353,13 +353,13 @@ void pet_settings_input(pet_p4_runtime_state_t *state, pet_settings_input_t inpu
     if (input == PET_SETTINGS_ENTER && page.feed_can_save &&
         pet_private_local_result() != PET_PRIVATE_BUSY) {
       if (page.selected) {
-        page.request_busy = !feed_apply(true);
+        page.feed_request_failed = !feed_apply(true);
       } else {
         clear_password();
         mbedtls_platform_zeroize(&feed_secret, sizeof(feed_secret));
         page.feed_username = page.feed_kind == PET_PRIVATE_MQTT;
         page.short_password = false;
-        page.request_busy = false;
+        page.feed_request_failed = false;
         page.keyboard = page.key_row = page.key_column = 0;
         page.screen = PET_SETTINGS_FEED_ENTRY;
       }

@@ -91,7 +91,7 @@ static void render_settings_page(const pet_settings_view_t *settings) {
     draw_text_line_vcenter(settings->feed_host, 25, 90, 48, 590, ink, 1, true);
     draw_text_line_vcenter(settings->feed_target, 25, 144, 40, 590, muted, 1, true);
     const char *status = !settings->feed_can_save ? "设备安全存储尚未配置" :
-      settings->request_busy ? "操作失败，请重试" :
+      settings->feed_request_failed ? "操作失败，请重试" :
       settings->feed_result == PET_PRIVATE_BUSY ? "正在保存" :
       settings->feed_result == PET_PRIVATE_SET ? "已保存" :
       settings->feed_result == PET_PRIVATE_ABSENT ? "已清除" :
@@ -215,7 +215,7 @@ static void render_settings_page(const pet_settings_view_t *settings) {
       } else draw_text_line_vcenter(label, 39, 102, 43, 455, muted, 1, true);
       if (settings->short_password)
         draw_text_line_vcenter("请核对后重试", 455, 102, 43, 140, accent, 1, true);
-      else if (settings->request_busy)
+      else if (settings->feed_request_failed)
         draw_text_line_vcenter("请稍候", 496, 102, 43, 100, accent, 1, true);
     } else {
       draw_text_line_vcenter("输入密码", 139, 16, 54, 450, ink, 2, true);
