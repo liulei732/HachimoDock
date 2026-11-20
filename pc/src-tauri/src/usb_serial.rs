@@ -3127,19 +3127,37 @@ impl UsbSerialManager {
         }
         self.send_inner("widget/data", payload, true, Some(board), connection, None)
     }
-    pub(crate) fn send_app_snapshot(&self,board:&str,payload:&serde_json::Value)->Result<(),String>{
-        // App controls need feedback while their own audio is playing. Wait for
-        // a chunk boundary, never for an entire stream; do not replay the action.
-        // This is called only by a host worker, never by the serial reader.
-        if serde_json::to_vec(payload).map_err(|e|e.to_string())?.len()>2048{return Err("应用快照过大".into());}
-        let _guard=media_arbitration::acquire(&self.asset_transfer_guard,Duration::from_millis(250)).map_err(|_|"设备传输繁忙，等待下一次状态更新")?;
-        self.send_to_board(board,"app/snapshot",payload)
+    #[cfg(test)]
+    pub(crate) fn send_app_snapshot(&self, board: &str, payload: &serde_json::Value) -> Result<(), String> {
+        self.send_app_snapshot_inner(board, None, payload, true)
     }
-    pub(crate) fn try_send_app_snapshot(&self,board:&str,payload:&serde_json::Value)->Result<(),String>{
-        // Reader callbacks must not wait for media ACKs delivered by that reader.
-        if serde_json::to_vec(payload).map_err(|e|e.to_string())?.len()>2048{return Err("应用快照过大".into());}
-        let _guard=self.asset_transfer_guard.try_lock().map_err(|_|"设备资源同步中")?;
-        self.send_to_board(board,"app/snapshot",payload)
+
+    #[cfg(test)]
+    pub(crate) fn try_send_app_snapshot(&self, board: &str, payload: &serde_json::Value) -> Result<(), String> {
+        self.send_app_snapshot_inner(board, None, payload, false)
+    }
+
+    pub(crate) fn send_app_snapshot_to_generation(
+        &self, board: &str, generation: u64, payload: &serde_json::Value, can_wait: bool,
+    ) -> Result<(), String> {
+        self.send_app_snapshot_inner(board, Some(generation), payload, can_wait)
+    }
+
+    fn send_app_snapshot_inner(
+        &self, board: &str, generation: Option<u64>, payload: &serde_json::Value, can_wait: bool,
+    ) -> Result<(), String> {
+        use crate::device_transport::{APP_SNAPSHOT, APP_SNAPSHOT_MAX};
+        if serde_json::to_vec(payload).map_err(|e| e.to_string())?.len() > APP_SNAPSHOT_MAX {
+            return Err("应用快照过大".into());
+        }
+        // The USB reader must not wait for media ACKs delivered by itself.
+        let _guard = if can_wait {
+            media_arbitration::acquire(&self.asset_transfer_guard, Duration::from_millis(250))
+                .map_err(|_| "设备传输繁忙，等待下一次状态更新")?
+        } else {
+            self.asset_transfer_guard.try_lock().map_err(|_| "设备资源同步中")?
+        };
+        self.send_inner(APP_SNAPSHOT, payload, true, Some(board), generation, None)
     }
 
     /// Send without flush - for streaming bulk data.

@@ -2612,6 +2612,26 @@ still fits an older PC's 512-byte receive bound; the larger limit allows future
 31-byte descriptor versions and maximal counters plus cJSON print slack.
 
 
+## Paired LAN component host
+
+Local extension mode 22 carries the existing component `app/event` and `app/snapshot` messages
+over the authenticated P4LAN1 envelope. A successful exchange negotiates
+support for this mode. The legacy status response stays byte-compatible.
+
+The request consists of a 16-byte ASCII boot ID, a 16-byte desktop receiver
+nonce, a big-endian uint32 ACK (zero to open or peek), and an optional
+`app/snapshot` JSON payload of at most 2048 bytes. The response is a single
+zero byte for refusal, or byte 1 followed by a big-endian uint32 event ID
+(zero for empty) and the existing `app/event` JSON envelope of at most 3072 bytes.
+
+Only a paired, control-trusted peer with the current device boot can open a
+3.5-second receiver lease when USB is offline. A lease holds four events with
+fixed expiry. Only the exact head ACK removes a live event. Desktop dispatch
+deduplicates that ID and the existing component instance and sequence.
+A snapshot is sent once. Periodic state requests recover missing snapshots.
+USB takeover, pairing changes and expired leases discard pending messages.
+The device applies replies through the existing component instance checks.
+
 ## Paired LAN desktop controls
 
 Wi-Fi 6 boards advertise `ops: true` in authenticated status. After wired

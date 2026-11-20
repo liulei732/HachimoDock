@@ -94,6 +94,7 @@ mod wasm_input_contract;
 mod shared_location;
 mod location_profile;
 mod component_app;
+mod device_transport;
 mod component_composition;
 mod component_collection;
 mod app_host_collection;
@@ -3451,7 +3452,7 @@ fn handle_incoming_usb_message(
         dsh_approval::handle_device_decision(&payload);
         return;
     }
-    if topic=="app/event"{component_app::device_event(&payload);return;}
+    if topic == device_transport::APP_EVENT { component_app::wired_event(&payload); return; }
     if topic=="widget/notify"{widget_notify::device_event(emitter,&payload);return;}
     if topic=="widget/data/refresh"{component_app::data_refresh_event(&payload);return;}
     music_player::observe_capture(&topic,&payload);

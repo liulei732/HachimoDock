@@ -4264,7 +4264,11 @@ bool pet_p4_handle_line_with_reply(
     send_protocol_ack(send_line,ctx,"",NULL,false,"invalid_json","device JSON text is invalid or exceeds the container depth limit");
     return false;
   }
+#if PET_P4_SYSTEM_WIFI
+  pet_p4_lan_app_wired_route(send_line, ctx, state->board_device_id, false);
+#else
   pet_app_host_transport(send_line,ctx,state->board_device_id);
+#endif
   pet_p4_media_transport(send_line,ctx);
   root = cJSON_ParseWithOpts(line, NULL, true);
   if (!cJSON_IsObject(root)) {
@@ -4308,6 +4312,7 @@ bool pet_p4_handle_line_with_reply(
     state->usb_client_last_seen_ms = state->desktop_device_id[0] ? state->host_last_seen_ms : 0;
 #if PET_P4_SYSTEM_WIFI
     if (state->desktop_device_id[0]) pet_p4_lan_usb_active();
+    pet_p4_lan_app_wired_route(send_line, ctx, state->board_device_id, state->desktop_device_id[0] != 0);
 #endif
     pet_p4_send_hello(state, send_line, ctx);
   } else if (strcmp(topic,"debug/identity")==0){
@@ -4477,6 +4482,13 @@ bool pet_p4_handle_line_with_reply(
     state->last_update_ms+=1;
 #endif
   } else if (!strcmp(topic,"app/snapshot")) {
+#if PET_P4_SYSTEM_WIFI
+    if (!pet_p4_lan_app_wired_selected()) {
+      send_protocol_ack(send_line,ctx,topic,payload,false,"app_route_changed","app view uses another connection");
+      cJSON_Delete(root);
+      return false;
+    }
+#endif
     bool ok=pet_app_host_apply(payload,esp_timer_get_time()/1000ULL);
     if(!ok)send_protocol_ack(send_line,ctx,topic,payload,false,"app_snapshot_invalid","app snapshot did not match the active request");
     else send_protocol_ack_if_requested(send_line,ctx,topic,payload);

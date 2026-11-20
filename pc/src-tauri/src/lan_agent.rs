@@ -5,6 +5,7 @@ mod discovery;
 pub(crate) mod component;
 #[path = "lan_agent/appearance.rs"]
 pub(crate) mod appearance;
+pub(crate) mod component_host;
 #[path = "lan_agent/ota.rs"]
 pub(crate) mod ota;
 #[path = "lan_agent/reboot.rs"]
@@ -1145,6 +1146,7 @@ pub(crate) fn require_no_usb(usb: &crate::usb_serial::UsbSerialManager) -> Resul
 
 pub(crate) fn start(app: tauri::AppHandle, usb: crate::usb_serial::UsbSerialManager) {
     voice::start(app.clone(), usb.clone());
+    component_host::start(usb.clone());
     std::thread::spawn(move || {
         let mut presses = press::Poller::default();
         let mut last_sent: Option<(SocketAddr, Value, Instant)> = None;
