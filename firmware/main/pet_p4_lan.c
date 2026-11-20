@@ -4,7 +4,9 @@
 #if PET_P4_SYSTEM_WIFI
 // Network control only: keep the renderer and interpreter optimization unchanged.
 #pragma GCC optimize ("Oz")
+#include "pet_p4_app_host.h"
 #include "pet_p4_device_wifi.h"
+#include "esp_attr.h"
 #include "pet_p4_diagnostics.h"
 #include "pet_p4_lan_context.h"
 #include "pet_p4_lan_press.h"
@@ -374,6 +376,7 @@ static bool send_sealed_response(int fd, mbedtls_gcm_context *gcm, const uint8_t
 #include "pet_p4_lan_voice.inc"
 #include "pet_p4_lan_realtime.inc"
 #include "pet_p4_lan_component_wire.inc"
+#include "pet_p4_lan_app.inc"
 
 __attribute__((optimize("Oz")))
 static bool send_device_status(int fd, mbedtls_gcm_context *gcm, const uint8_t header[3],
@@ -444,6 +447,7 @@ static void handle_peer(int fd, uint8_t *cipher, uint8_t *plain, bool *handed_of
     case 2: if (!size || size > LAN_MAX_BODY) return; break;
     case LAN_PRESS_MODE: if (size != 36) return; break;
     case LAN_PRIVATE_FEED_MODE: if (size < 25 || size > PET_PRIVATE_FEED_REQUEST_MAX) return; break;
+    case LAN_APP_MODE: if (size < LAN_APP_HEADER || size > LAN_APP_HEADER + LAN_APP_SNAPSHOT_MAX) return; break;
     case LAN_VOLUME_REQUEST:
       if (size != 16 + PET_LAN_VOLUME_ID_SIZE + 1) return;
       break;
@@ -559,6 +563,9 @@ static void handle_peer(int fd, uint8_t *cipher, uint8_t *plain, bool *handed_of
       lan_voice_status(request_generation, reply);
       send_sealed_response(fd, &gcm, header, cipher, reply, sizeof(reply), deadline);
     }
+  } else if (ok && mode == LAN_APP_MODE) {
+    const size_t length = lan_app_exchange(plain, size, request_generation);
+    send_sealed_response(fd, &gcm, header, cipher, plain, length, deadline);
   } else if (ok && mode == LAN_RTC_MODE) {
     *handed_off = !wired && !pet_p4_ota_active() && !pet_p4_diagnostics_reboot_pending() &&
       rtc_wire_handoff(fd, plain, size, master, transcript, request_generation);
@@ -786,6 +793,7 @@ void pet_p4_lan_process(pet_p4_runtime_state_t *state, uint64_t now_ms) {
   atomic_store(&usb_client_active, usb);
   if (usb || state->approval_active) pet_p4_lan_voice_cancel();
   if (!lock || xSemaphoreTake(lock, 0) != pdTRUE) return;
+  lan_app_apply(state, now_ms);
   const lan_update_t update = mailbox;
   mailbox.root = NULL;
   const uint32_t current_generation = generation;
