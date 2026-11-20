@@ -1071,6 +1071,21 @@ static void send_input_event(
   cJSON_AddStringToObject(payload, "event", event_name ? event_name : "");
   cJSON_AddStringToObject(payload, "context", state ? state->screen_page : "main");
   cJSON_AddStringToObject(payload, "action", resolved_action);
+  bool confirm_voice = false;
+  uint64_t confirm_now = 0;
+  if (!handled_locally && !strcmp(resolved_action, "page_enter")) {
+    confirm_now = (uint64_t)esp_timer_get_time() / 1000;
+    confirm_voice = state && !state->session_voice_active
+      && !strcmp(state->screen_page, "main")
+      && pet_voice_feedback_can_confirm(&state->voice_feedback, confirm_now);
+    if (!cJSON_AddBoolToObject(payload, "voiceDraftVisible", confirm_voice)
+        || (confirm_voice && !cJSON_AddStringToObject(payload, "voiceUtteranceId",
+            state->voice_feedback.utterance_id))) {
+      cJSON_Delete(root);
+      cJSON_Delete(payload);
+      return;
+    }
+  }
   if (state
       && (strcmp(resolved_action, "session_next") == 0
           || strcmp(resolved_action, "session_previous") == 0)
@@ -1093,7 +1108,10 @@ static void send_input_event(
   );
   cJSON_AddItemToObject(root, "payload", payload);
   line = cJSON_PrintUnformatted(root);
-  if (line && send_line) send_line(line, ctx);
+  if (line && send_line) {
+    if (confirm_voice) pet_voice_feedback_confirm_requested(&state->voice_feedback, confirm_now);
+    send_line(line, ctx);
+  }
   cJSON_free(line);
   cJSON_Delete(root);
 }
@@ -1597,8 +1615,8 @@ static void dispatch_binding_event(
       if (state) state->session_voice_active = false;
       handled_locally = pet_p4_audio_capture_stop() == ESP_OK;
     } else if (!handled_locally && strcmp(gesture, "hold_start") == 0) {
-      if (state) state->session_voice_active = true;
       handled_locally = pet_p4_audio_capture_start(state && state->session_queue_count == 0) == ESP_OK;
+      if (state) state->session_voice_active = handled_locally;
     }
   }
   send_input_event(

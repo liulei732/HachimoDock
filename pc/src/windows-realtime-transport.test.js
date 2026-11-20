@@ -33,7 +33,7 @@ test("CH343 live audio retains 64-byte bursts and never drains or pauses RX", ()
   const live = rust("usb_serial/live_audio_pacing.rs").split("#[cfg(test)]\nmod tests")[0];
   assert.doesNotMatch(live, /writer\.flush\(/);
   assert.match(source, /let audio_frame = topic.starts_with\("audio\/"\) \|\| topic.starts_with\("media\/"\) \|\| topic == "ui\/conversation";/);
-  assert.match(source, /let live_frame = audio_frame \|\| topic == "widget\/data" \|\| topic == "app\/snapshot" \|\| topic == "ui\/text-pixels"\s*\|\| \(!bulk_frame && conn.capture_active.load\(Ordering::Acquire\)\);/);
+  assert.match(source, /let live_frame = audio_frame \|\| topic == "widget\/data" \|\| topic == "app\/snapshot" \|\| topic == "ui\/text-pixels" \|\| topic == "ui\/voice-feedback"\s*\|\| \(!bulk_frame && conn.capture_active.load\(Ordering::Acquire\)\);/);
   assert.match(source, /let bounded_frame = serial_frame_is_bounded\(topic, live_frame\);/);
   const classify=source.split("fn serial_frame_is_bounded(")[1].split("fn flush_serial_writer")[0];
   assert.match(classify, /live_frame \|\| matches!\(topic, "system\/heartbeat" \| "diagnostics\/query"\)/);

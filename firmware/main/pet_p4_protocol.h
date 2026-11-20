@@ -7,6 +7,7 @@
  */
 
 #pragma once
+#include "pet_p4_voice_feedback.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -102,6 +103,7 @@ typedef struct {
 #if PET_P4_SYSTEM_WIFI
   uint8_t session_voice_lan_button;
 #endif
+  pet_voice_feedback_t voice_feedback;
   unsigned long long session_snapshot_last_seen_ms;
   char screen_page[PET_P4_PAGE_MAX];
   /* DSH 审批上屏（R5）：PC bridge 下发的单条 pending approval。active 时渲染

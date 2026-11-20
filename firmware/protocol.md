@@ -1600,6 +1600,56 @@ local voice-service relay at `127.0.0.1:50001`. `audio/error` terminates the
 current session. `audioCapture.codec` reports `ES7210`, `ES8311`, or
 `unavailable` according to the initialized capture path.
 
+### PTT display feedback
+
+`capabilities.voiceFeedback="p4-voice-feedback-v1"` opts into the native 556×76
+bottom strip. The microphone worker calculates a bounded RMS envelope from real
+PCM locally; no cloud event, random animation or additional audio stream drives
+the meter. Silence decays to zero. Component-owned captures and realtime persona
+conversations do not own this PTT strip.
+
+An opted-in desktop may send `ui/voice-feedback` with `boardDeviceId`, the current
+`bootId`, `captureId` (the exact `audio/begin.sessionId`), `utteranceId` (the
+same session ID used for desktop PTT confirmation), a
+nonnegative integer `revision` no larger than 2^53−1, `phase`, `text` (at most
+511 UTF-8 bytes), `hint` (at most 127 UTF-8 bytes), `draftInserted`, and optional
+`failureStage` (`recognition`, `insertion`, or `submission` for an `error`).
+Supported phases are `listening`, `partial`, `recognizing`, `finalizing`,
+`draft_ready`, `submitting`, `submitted`, `error`, `cancelled`, `submit_unknown`.
+The desktop relay's locally generated capture UUID stays on the desktop.
+
+Old captures/boots, different utterance owners, older revisions and lifecycle
+regressions are ignored. Release keeps the last text while awaiting finalization;
+it cannot be reopened by a late partial. `draftInserted=true` is an input insertion
+receipt, distinct from recognition and submission. Missing results time out to
+an explicit unknown outcome; the device never retries a submission. Recognition
+text is bounded transient state, cleared when its strip expires, with no new
+audio or transcript log. Long text pages within the same single line.
+
+The insertion receipt comes from the native writer's actual acknowledgement,
+not from composer availability. It survives submission failures. Failure stages
+distinguish ASR, editor insertion and submission; legacy messages without a stage
+use a generic error title. The pure C feedback core is compiled once, with no
+additional codec or allocation in the main/UI task.
+
+The desktop projects feedback on a separate writer with one replaceable pending
+snapshot for its single active capture. A capture epoch retires old callbacks;
+revision/phase watermarks survive consumption, and terminal results cannot be
+replaced by late partials. Producers only hold a short metadata lock, never wait
+for serial IO or queue capacity. Send errors do not replay submissions. The
+topic uses the bounded, RX-preserving live path even after `audio/end`.
+Do not infer support from a firmware version or send to an unnegotiated device.
+Board and connection generation are rechecked at send time.
+
+An unhandled `page_enter` event reports `voiceDraftVisible`. When true, it also
+includes the current `voiceUtteranceId`. The desktop only accepts that event as
+voice confirmation for the matching active utterance. After the 15-second
+draft display window or away from the main page the event reports false and
+remains available for ordinary actions. Firmware without this field uses the
+legacy path. An eligible button press enters `submitting` while the result is
+pending, including presses just before the end of the draft display window.
+Only a desktop result can change this to `submitted`.
+
 ## Realtime Conversation Audio
 
 Firmware 0.7.57 implements a realtime persona conversation mode on top of the PTT

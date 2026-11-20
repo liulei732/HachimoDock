@@ -48,7 +48,7 @@ def test_conversation_captions_follow_audio_and_isolate_agent_state():
 def test_realtime_renderer_and_input_never_use_agent_queue():
     renderer = (ROOT / "main/pet_p4_renderer.c").read_text()
     assert "show_session_queue = !realtime && state && state->session_queue_count > 0" in renderer
-    assert "if (!realtime) draw_session_queue(state, now_ms);" in renderer
+    assert "if (!realtime && !(view && view->show_voice_overlay)) draw_session_queue(state, now_ms);" in renderer
     assert "realtime ? rgb565(42, 119, 225)" in renderer
     inputs = (ROOT / "main/pet_p4_input.c").read_text()
     dispatch = inputs.split("static void dispatch_binding_event(", 1)[1]
@@ -61,10 +61,9 @@ def test_realtime_renderer_and_input_never_use_agent_queue():
     assert "view.body" not in view_log
 
 
-def test_recording_row_is_shared_without_duplicate_idle_bubble():
+def test_recording_uses_only_the_bottom_overlay():
     source = (ROOT / "main/pet_p4_renderer.c").read_text()
-    assert "if (view && view->show_voice_overlay) draw_standalone_voice_overlay();" in source
+    assert "if (view && view->show_voice_overlay) draw_standalone_voice_overlay(state, now_ms);" in source
     assert "else if (!show_session_queue) draw_bubble(state, view, now_ms);" in source
-    assert "draw_voice_input_row(x, y + 18)" in source
-    assert "draw_voice_input_row(x, y + 62)" in source
-    assert source.count('draw_text_line_vcenter("LISTENING"') == 1
+    assert "draw_voice_input_row" not in source
+    assert "static const int heights[]" not in source

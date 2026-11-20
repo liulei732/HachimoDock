@@ -40,6 +40,7 @@
  *          activation-gated, prefix-preserving, AX-node-rebindable live/final Codex/Claude visible-composer synchronization
  *          plus macOS MiMoCode current-caret draft insertion, with Return/send reserved for the device Confirm action,
  *          with non-prompting macOS Accessibility diagnostics and native system-consent requests at startup and protected operations,
+ *          capture-scoped native PTT feedback with acknowledged insertion receipts and a bounded latest-state mailbox,
  *          without background fallback, managed bridge-only non-visible-agent voice injection, stale
  *          LaunchAgent/legacy bridge cleanup with install-relative Node resources
  *          and user PATH propagation for CLI shims, environment-relative coding-agent
@@ -167,6 +168,7 @@ mod reference_image;
 mod realtime_chat_log;
 mod usb_audio;
 mod device_voice_lifecycle;
+mod device_voice_feedback;
 mod usb_serial;
 mod appearance_recovery_ipc;
 mod voice_chat_settings;
@@ -839,6 +841,8 @@ async fn write_workbuddy_voice_test_draft(text: String, app: tauri::AppHandle) -
         streaming_error: Mutex::new(String::new()),
         composer_error: Mutex::new(String::new()),
         composer_visible: AtomicBool::new(false),
+        feedback_epoch: 0,
+        feedback_inserted: AtomicBool::new(false),
         recognizer: Mutex::new(DeviceVoiceInput::default()),
         composer: Mutex::new(None),
         dsh_voice_binding: Mutex::new(None),
@@ -945,6 +949,8 @@ struct DeviceVoiceContext {
     streaming_error: Mutex<String>,
     composer_error: Mutex<String>,
     composer_visible: AtomicBool,
+    feedback_epoch: u64,
+    feedback_inserted: AtomicBool,
     recognizer: Mutex<DeviceVoiceInput>,
     composer: Mutex<Option<codex_composer::CodexComposerBridge>>,
     dsh_voice_binding: Mutex<Option<serde_json::Value>>,
@@ -1330,6 +1336,41 @@ fn device_voice_composer_mode(context: &DeviceVoiceContext) -> &'static str {
     }
 }
 
+struct DeviceVoiceFeedbackMessage {
+    emitter: tauri::AppHandle,
+    board: String,
+    connection: u64,
+    payload: serde_json::Value,
+}
+fn device_voice_feedback_mailbox(
+) -> Option<&'static Arc<device_voice_feedback::Mailbox<DeviceVoiceFeedbackMessage>>> {
+    static MAILBOX: OnceLock<
+        Option<Arc<device_voice_feedback::Mailbox<DeviceVoiceFeedbackMessage>>>,
+    > = OnceLock::new();
+    MAILBOX
+        .get_or_init(|| {
+            let mailbox =
+                Arc::new(device_voice_feedback::Mailbox::<DeviceVoiceFeedbackMessage>::new());
+            let receiver = mailbox.clone();
+            thread::Builder::new()
+                .name("pet-voice-feedback".into())
+                .spawn(move || {
+                    while let Some(message) = receiver.receive() {
+                        // Serial IO owns no mailbox lock; producers only replace metadata.
+                        let manager = message.emitter.state::<usb_serial::UsbSerialManager>();
+                        let _ = manager.send_voice_feedback_for_connection(
+                            &message.board,
+                            message.connection,
+                            &message.payload,
+                        );
+                    }
+                })
+                .ok()?;
+            Some(mailbox)
+        })
+        .as_ref()
+}
+
 fn emit_device_voice_transcript(
     context: &DeviceVoiceContext,
     phase: &str,
@@ -1369,8 +1410,49 @@ fn emit_device_voice_transcript(
         "composerError": composer_error,
         "error": error,
     });
-    if matches!(context.lifecycle.stop_reason(), Ok(Some(device_voice_lifecycle::StopReason::DeliveryError(_)))) {
+    if matches!(
+        context.lifecycle.stop_reason(),
+        Ok(Some(device_voice_lifecycle::StopReason::DeliveryError(_)))
+    ) {
         event["failureDomain"] = serde_json::json!("delivery");
+    }
+    let failure_stage = if context.draft_submit_requested.load(Ordering::SeqCst) {
+        device_voice_feedback::FailureStage::Submission
+    } else if matches!(
+        context.lifecycle.stop_reason(),
+        Ok(Some(device_voice_lifecycle::StopReason::DeliveryError(_)))
+    ) {
+        device_voice_feedback::FailureStage::Insertion
+    } else {
+        device_voice_feedback::FailureStage::Recognition
+    };
+    if let (Ok(connection), Some(payload), Some(mailbox)) = (
+        context.connection_id.parse::<u64>(),
+        device_voice_feedback::payload(device_voice_feedback::Feedback {
+            device_session_id: &context.utterance_id,
+            board: &context.board_device_id,
+            boot: &context.boot_id,
+            revision,
+            phase,
+            text,
+            error,
+            failure_stage,
+            draft_inserted: context.feedback_inserted.load(Ordering::SeqCst),
+        }),
+        device_voice_feedback_mailbox(),
+    ) {
+        // No serial IO or FIFO overflow on the recognition callback.
+        mailbox.publish(
+            context.feedback_epoch,
+            revision,
+            phase,
+            DeviceVoiceFeedbackMessage {
+                emitter: context.emitter.clone(),
+                board: context.board_device_id.clone(),
+                connection,
+                payload,
+            },
+        );
     }
     let _ = context.emitter.emit("voice-transcript", event.clone());
     let _ = context.emitter.emit("usb-audio-stream", event);
@@ -1518,6 +1600,7 @@ fn insert_dsh_voice_draft(context: &DeviceVoiceContext, revision: u64, text: &st
     body.as_object_mut().map(|o| o.remove("text"));
     if !device_voice_target_is_current(context) { return Err("DSH target changed during insertion".into()); }
     *context.dsh_voice_binding.lock().map_err(|_| "DSH binding unavailable")? = Some(body);
+    context.feedback_inserted.store(true, Ordering::SeqCst);
     Ok(())
 }
 fn submit_dsh_voice_composer(context: &DeviceVoiceContext) -> Result<(), String> {
@@ -1732,6 +1815,7 @@ fn finalize_device_voice_final(
                     "reason":insertion.as_ref().err().map(|error| mimo_voice_diagnostics::failure_reason(error)).unwrap_or("written")}));
             match insertion {
                 Ok(()) => {
+                    context.feedback_inserted.store(true, Ordering::SeqCst);
                     if let Ok(mut composer_error) = context.composer_error.lock() {
                         composer_error.clear();
                     }
@@ -1858,6 +1942,7 @@ fn finalize_device_voice_final(
     if !device_voice_target_is_current(&context) {
         return;
     }
+    context.feedback_inserted.store(true, Ordering::SeqCst);
     context.draft_ready.store(true, Ordering::SeqCst);
     emit_device_voice_transcript(&context, "draft_ready", revision, &text, true, true, "");
     if context.confirm_on_ready.swap(false, Ordering::SeqCst) {
@@ -1908,6 +1993,14 @@ fn input_event_confirms_device_voice_draft(
     )
 }
 
+fn voice_confirmation_matches_draft(payload: &serde_json::Value, utterance_id: &str) -> bool {
+    let reported_id = payload.get("voiceUtteranceId").and_then(serde_json::Value::as_str);
+    match payload.get("voiceDraftVisible") {
+        Some(visible) => visible.as_bool() == Some(true) && reported_id == Some(utterance_id),
+        None => reported_id.is_none_or(|id| id == utterance_id),
+    }
+}
+
 fn confirm_pending_device_voice_draft(topic: &str, payload: &serde_json::Value) -> bool {
     let context = active_device_voice_context()
         .lock()
@@ -1917,7 +2010,7 @@ fn confirm_pending_device_voice_draft(topic: &str, payload: &serde_json::Value) 
         return false;
     };
     let requested = payload.get("voiceUtteranceId").and_then(serde_json::Value::as_str);
-    if requested.is_some_and(|id| id != context.utterance_id)
+    if !voice_confirmation_matches_draft(payload, &context.utterance_id)
         || (context.wireless_route.is_some() && requested != Some(context.utterance_id.as_str()))
     {
         return false;
@@ -2360,6 +2453,10 @@ fn start_device_voice_context(
         streaming_error: Mutex::new(String::new()),
         composer_error: Mutex::new(String::new()),
         composer_visible: AtomicBool::new(false),
+        feedback_epoch: device_voice_feedback_mailbox()
+            .map(|mailbox| mailbox.begin_capture())
+            .unwrap_or(0),
+        feedback_inserted: AtomicBool::new(false),
         recognizer: Mutex::new(DeviceVoiceInput::default()),
         composer: Mutex::new(None),
         dsh_voice_binding: Mutex::new(None),
@@ -15697,6 +15794,34 @@ mod tests {
         let final_handled = AtomicBool::new(false);
         assert!(claim_device_voice_final(&final_handled));
         assert!(!claim_device_voice_final(&final_handled));
+    }
+
+    #[test]
+    fn voice_draft_visibility_requires_the_matching_utterance() {
+        for (payload, expected) in [
+            (serde_json::json!({}), true),
+            (serde_json::json!({"voiceUtteranceId": "previous"}), false),
+            (serde_json::json!({"voiceDraftVisible": true, "voiceUtteranceId": "active"}), true),
+            (serde_json::json!({"voiceDraftVisible": true, "voiceUtteranceId": "previous"}), false),
+            (serde_json::json!({"voiceDraftVisible": true}), false),
+            (serde_json::json!({"voiceDraftVisible": false, "voiceUtteranceId": "active"}), false),
+            (serde_json::json!({"voiceDraftVisible": null}), false),
+        ] {
+            assert_eq!(voice_confirmation_matches_draft(&payload, "active"), expected);
+        }
+    }
+
+    #[test]
+    fn voice_feedback_projection_uses_the_session_id_from_audio_begin() {
+        let source = include_str!("lib.rs");
+        let receive = source.split_once("\nfn handle_incoming_usb_message(").unwrap().1;
+        let start = receive.split_once("start_device_voice_context(").unwrap().1
+            .split_once(");").unwrap().0;
+        let start = start.split_whitespace().collect::<String>();
+        assert!(start.contains("payload.get(\"sessionId\")"));
+        let projection = source.split_once("\nfn emit_device_voice_transcript(").unwrap().1
+            .split_once("\nfn complete_device_voice_context(").unwrap().0;
+        assert!(projection.contains("device_session_id: &context.utterance_id"));
     }
 
     #[test]

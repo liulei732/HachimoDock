@@ -2409,6 +2409,7 @@ void app_main(void) {
 #endif
     pet_p4_touch_process(&g_state, transport_send_line, NULL);
     pet_p4_input_process(&g_state, transport_send_line, NULL);
+    pet_p4_audio_feedback_sync(&g_state, now_ms);
     pet_p4_miniapp_activation_guard(!strcmp(g_state.screen_page, "components")
       && !pet_p4_conversation_active(&g_state) && !g_state.asset_transfer_active
       && !pet_p4_ota_transfer_active());

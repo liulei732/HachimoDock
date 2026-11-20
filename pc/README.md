@@ -102,6 +102,22 @@ Rust 检查需要先准备完整资源：`cargo test --manifest-path src-tauri/C
 
 ## 目录说明 / Directory guide
 
+### 按键语音的设备反馈
+
+配套固件通过 `capabilities.voiceFeedback="p4-voice-feedback-v1"` 声明原生底部长条。
+设备按真实 PCM 计算音量；电脑将当前录音的识别、草稿和发送状态投影到设备，
+分别显示识别失败、写入失败、发送失败和结果未知。“已写入”要求原生输入桥的实际确认，
+不以输入框可用性代替。识别文字仅作有界临时显示，不增加录音或文字日志。
+
+反馈模块与测试入口见 `src-tauri/src/device_voice_feedback.rs`、
+`src-tauri/src/usb_serial/query_duplex_tests.rs` 和 `../firmware/protocol.md`。
+`src-tauri/tauri.voice-feedback-preview.conf.json` 仅用于独立开发应用的名称、版本和
+数据目录标识，继承正式 CSP 与权限配置。准备完整原生构建资源后，可用
+`npx tauri build --config src-tauri/tauri.voice-feedback-preview.conf.json --bundles app`
+生成测试应用。测试时只让一个客户端连接同一台 USB 设备。
+
+### 源码目录
+
 - `builtin-clawpkgs/` 保存内置组件源码，`../firmware/` 构建会读取这里。
 - `public/terrier-clips/` 是出厂形象及对应预转换素材。
 - `src-tauri/firmware/esp32-p4/` 接收配套生成的 OTA 镜像；WiFi6/Pico 与芯片 v1/v3 必须分别构建，同一板型和芯片的镜像由 macOS 与 Windows 共用。

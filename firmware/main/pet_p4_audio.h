@@ -17,6 +17,8 @@ extern "C" {
 #define PET_P4_AUDIO_CHANNELS 1
 #define PET_P4_AUDIO_BITS_PER_SAMPLE 16
 #define PET_P4_AUDIO_FRAME_MS 20
+/* State-owner only. Copies bounded meter metadata; never performs codec/USB IO. */
+void pet_p4_audio_feedback_sync(pet_p4_runtime_state_t *state, uint64_t now_ms);
 void pet_p4_audio_instrument_set(bool active, unsigned effect, unsigned ambience);
 void pet_p4_audio_fruit_sound(unsigned events,unsigned volume,bool active);
 /* p4-sfx-v1: bounded component cues. Same gating as the fruit/instrument paths:
