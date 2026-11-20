@@ -1605,10 +1605,12 @@ current session. `audioCapture.codec` reports `ES7210`, `ES8311`, or
 `capabilities.voiceFeedback="p4-voice-feedback-v1"` opts into the native 556×76
 bottom strip. The microphone worker calculates a bounded RMS envelope from real
 PCM locally; no cloud event, random animation or additional audio stream drives
-the meter. Silence decays to zero. Component-owned captures and realtime persona
-conversations do not own this PTT strip.
+the meter. Silence decays to zero. USB and paired LAN PTT share the local meter.
+Paired LAN displays it during the physical hold and uses its existing
+confirmation path. Component-owned captures and realtime persona conversations
+do not own this PTT strip.
 
-An opted-in desktop may send `ui/voice-feedback` with `boardDeviceId`, the current
+Over USB, an opted-in desktop may send `ui/voice-feedback` with `boardDeviceId`, the current
 `bootId`, `captureId` (the exact `audio/begin.sessionId`), `utteranceId` (the
 same session ID used for desktop PTT confirmation), a
 nonnegative integer `revision` no larger than 2^53−1, `phase`, `text` (at most

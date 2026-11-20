@@ -138,7 +138,7 @@ void pet_p4_audio_feedback_sync(pet_p4_runtime_state_t *state, uint64_t now_ms) 
     && (!state->voice_feedback.capture_ended
         || strcmp(snapshot.capture_id, state->voice_feedback.capture_id));
   pet_voice_feedback_sync(&state->voice_feedback, &snapshot, now_ms);
-  if (ended_now) state->session_voice_active = false;
+  if (ended_now && !snapshot.meter_only) state->session_voice_active = false;
   if (pet_p4_audio_conversation_active()) {
     state->voice_feedback.phase = PET_VOICE_IDLE;
     memset(state->voice_feedback.text, 0, sizeof(state->voice_feedback.text));
@@ -1387,20 +1387,25 @@ static void audio_task(void *arg) {
     const char *reason = "released";
     snprintf(session_id, sizeof(session_id), "p4-audio-%llu-%u",
              (unsigned long long) started_ms, (unsigned int) session_sequence);
-    const bool show_ptt_meter = !capture_owner[0] && !pet_p4_audio_conversation_active();
+    bool meter_only = false;
+#if PET_P4_SYSTEM_WIFI
+    const bool wifi_ptt = !strcmp(capture_owner, wifi_ptt_label);
+    const bool wifi_capture = wifi_ptt || !strcmp(capture_owner, wifi_capture_label);
+    const unsigned wifi_owner = wifi_capture ? atomic_load(&g_wifi_audio_owner) : 0;
+    meter_only = wifi_ptt;
+#endif
+    const bool show_ptt_meter = (!capture_owner[0] || meter_only) && !pet_p4_audio_conversation_active();
     if (show_ptt_meter) {
       portENTER_CRITICAL(&g_voice_meter_lock);
       memset(&g_voice_meter, 0, sizeof(g_voice_meter));
       pet_voice_text_copy(g_voice_meter.capture_id, sizeof(g_voice_meter.capture_id), session_id);
       g_voice_meter.started_ms = started_ms; g_voice_meter.active = true;
+      g_voice_meter.meter_only = meter_only;
       portEXIT_CRITICAL(&g_voice_meter_lock);
     }
     atomic_store(&g_capture_tx_last_us, 0);
     atomic_store(&g_capture_tx_max_us, 0);
 #if PET_P4_SYSTEM_WIFI
-    const bool wifi_ptt = !strcmp(capture_owner, wifi_ptt_label);
-    const bool wifi_capture = wifi_ptt || !strcmp(capture_owner, wifi_capture_label);
-    const unsigned wifi_owner = wifi_capture ? atomic_load(&g_wifi_audio_owner) : 0;
     if (!wifi_capture)
 #endif
     send_audio_begin(session_id, session_queue_empty, capture_owner);

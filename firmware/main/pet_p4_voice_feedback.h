@@ -34,7 +34,7 @@ typedef struct {
   char capture_id[PET_VOICE_CAPTURE_BYTES];
   uint8_t bars[PET_VOICE_BARS], level;
   uint64_t started_ms, sample_ms;
-  bool active, failed;
+  bool active, failed, meter_only;
 } pet_voice_meter_t;
 
 /* IO-free core, compiled once rather than inlined into protocol/audio/render. */

@@ -39,8 +39,29 @@ static void test_draft_confirmation_window(void) {
   assert(draft.phase == PET_VOICE_SUBMITTED);
 }
 
+static void test_wireless_meter_has_no_usb_result_lifecycle(void) {
+  pet_voice_meter_t meter = {.capture_id = "wifi", .started_ms = 100, .active = true, .meter_only = true};
+  pet_voice_feedback_t v = {.capture_id = "usb", .text = "old draft", .phase = PET_VOICE_DRAFT};
+  pet_voice_meter_sample(&meter, 20, 100);
+  pet_voice_feedback_sync(&v, &meter, 100);
+  assert(v.phase == PET_VOICE_IDLE && !v.text[0] && v.started_ms == 100);
+  assert(v.bars[PET_VOICE_BARS - 1] > 0);
+  pet_voice_meter_sample(&meter, 100, 150);
+  pet_voice_feedback_sync(&v, &meter, 150);
+  assert(v.bars[PET_VOICE_BARS - 1] > v.bars[PET_VOICE_BARS - 2]);
+  assert(!pet_voice_feedback_update(&v, "wifi", "utterance", 1, "draft_ready", "text", "", 151));
+  pet_voice_feedback_sync(&v, &meter, 351);
+  assert(v.bars[PET_VOICE_BARS - 1] == 0);
+  pet_voice_meter_sample(&meter, 100, 400);
+  meter.active = false;
+  pet_voice_feedback_sync(&v, &meter, 450);
+  assert(v.phase == PET_VOICE_IDLE && v.bars[PET_VOICE_BARS - 1] == 0);
+  assert(!pet_voice_feedback_can_confirm(&v, 450));
+}
+
 int main(void) {
   test_draft_confirmation_window();
+  test_wireless_meter_has_no_usb_result_lifecycle();
   int16_t silence[PET_VOICE_PCM_SAMPLES] = {0}, quiet[PET_VOICE_PCM_SAMPLES], loud[PET_VOICE_PCM_SAMPLES];
   for (unsigned i=0; i<PET_VOICE_PCM_SAMPLES; ++i) { quiet[i]=(i%2?200:-200); loud[i]=(i%2?2000:-2000); }
   assert(pet_voice_pcm_level(silence)==0);

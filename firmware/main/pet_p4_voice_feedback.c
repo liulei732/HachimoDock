@@ -53,8 +53,15 @@ void pet_voice_feedback_sync(pet_voice_feedback_t *v,
   if (strcmp(v->capture_id, m->capture_id)) {
     memset(v, 0, sizeof(*v));
     pet_voice_text_copy(v->capture_id, sizeof(v->capture_id), m->capture_id);
-    v->phase = PET_VOICE_LISTENING; v->started_ms = m->started_ms;
+    v->started_ms = m->started_ms;
+    if (!m->meter_only) v->phase = PET_VOICE_LISTENING;
     v->expires_ms = now + 35000;
+  }
+  // Wireless PTT visibility follows the physical hold. It has no USB status
+  // receipts, so it does not enter the draft or recognition lifecycle.
+  if (!m->active && m->meter_only) {
+    memset(v->bars, 0, sizeof(v->bars));
+    return;
   }
   memcpy(v->bars, m->bars, sizeof(v->bars));
   if (m->active && m->sample_ms && now >= m->sample_ms && now - m->sample_ms > 200)
