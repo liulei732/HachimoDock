@@ -3282,6 +3282,7 @@ dependencies = [
  "image",
  "keyring",
  "libc",
+ "memchr",
  "num-bigint-dig",
  "objc2",
  "objc2-app-kit",

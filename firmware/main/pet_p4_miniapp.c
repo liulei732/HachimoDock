@@ -5103,7 +5103,12 @@ static bool app_surface_locked(pet_surface_t *surface,const pet_host_render_t *h
         }
       }
       n->disabled=n->action[0]&&!runtime_action_enabled(&g_runtime,n->action);
-      if(runtime_host_action(&g_runtime,n->action)&&n->action[0]&&!pet_host_render_enabled(host,n->action))n->disabled=true;
+      if(runtime_host_action(&g_runtime,n->action)&&n->action[0]){
+        /* Preserve styling on a held committed frame. Hit testing and the
+         * action dispatcher still use the live pending guard. */
+        bool held=host&&host->pending&&host->mode<6;
+        if(!(held?pet_host_render_offered(host,n->action):pet_host_render_enabled(host,n->action)))n->disabled=true;
+      }
       uint64_t context=((uint64_t)g_image_revision<<16)|((uint8_t)g_runtime.current_state<<8)|(uint8_t)g_runtime.current_page;
       n->pressed=!n->disabled&&i==g_pressed_node&&g_pressed_context==context&&!memcmp(g_pressed_scroll,scroll,sizeof(scroll));
 #if PET_HOST_COLLECTION_ENABLED

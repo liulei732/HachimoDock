@@ -63,6 +63,13 @@ static void draw_line(int x,int y,int x1,int y1,uint16_t c){
  assert(x>=0&&x<640&&x1>=0&&x1<640&&y>=0&&y<480&&y1>=0&&y1<480);
  if(preview)printf("[\"line\",%d,%d,%d,%d,%u]\n",x,y,x1,y1,c);
 }
+static unsigned icon_pixels;
+static uint16_t icon_ink;
+static void blend_px(int x,int y,uint8_t r,uint8_t g,uint8_t b,uint8_t alpha){
+ assert(x>=42&&x<86&&y>=139&&y<183);
+ assert(alpha&&alpha%17==0&&rgb565(r,g,b)==icon_ink);
+ ++icon_pixels;
+}
 static int text_y_in_box(const char *t,int s,int y,int h){(void)t;return y+(h-16*s)/2;}
 static void text(const char *t,int x,int y,int max,uint16_t c,int s,const char *anchor){
  assert(y>=0&&y+16*s<=480&&max>0&&s>0);assert(x>=0&&x<=640);
@@ -124,6 +131,16 @@ static bool center_draw_thumbnail(const char *id,int x,int y){
 MAIN = r'''
 int main(int argc,char **argv){
  (void)argv;
+ icon_ink=rgb565(255,248,231);
+ draw_component_icon("codex-quota-board",42,139,icon_ink,rgb565(168,100,67));
+ unsigned selected_icon_pixels=icon_pixels;
+ assert(selected_icon_pixels>0);
+ icon_ink=rgb565(184,97,49);
+ draw_component_icon("codex-quota-board",42,139,icon_ink,rgb565(242,224,196));
+ assert(icon_pixels==selected_icon_pixels*2);
+ draw_component_icon("other",42,139,icon_ink,rgb565(242,224,196));
+ assert(icon_pixels==selected_icon_pixels*2);
+
  for(count=0;count<=32;++count){
    for(selected=0;selected<(count?count:1);++selected){
      reads=0;render_component_center_page(false);
@@ -154,7 +171,7 @@ def run_renderer(preview=False):
     renderer = renderer[:start] + renderer[end:]
     with tempfile.TemporaryDirectory() as tmp:
         code, binary = Path(tmp)/"cards.c", Path(tmp)/"cards"
-        headers = '#include "pet_p4_center_layout.h"\n#include <stdbool.h>\n#include <stdlib.h>\n#include <zlib.h>\n#include "pet_p4_center_text.h"\n#include "../assets/component-center/catalog.h"\n#include "../assets/component-center/text_masks.h"\n'
+        headers = '#include "pet_p4_center_layout.h"\n#include <stdbool.h>\n#include <stdlib.h>\n#include <zlib.h>\n#include "pet_p4_center_text.h"\n#include "../assets/component-center/catalog.h"\n#include "../assets/component-center/pet_p4_codex_icon.h"\n#include "../assets/component-center/text_masks.h"\n'
         code.write_text(headers + HARNESS + renderer + MAIN)
         subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-I", str(ROOT / "main"), str(code), "-lz", "-o", str(binary)], check=True)
         return subprocess.check_output([str(binary)] + ([preview] if preview else []), text=True)

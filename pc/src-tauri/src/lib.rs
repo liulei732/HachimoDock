@@ -95,6 +95,8 @@ mod shared_location;
 mod location_profile;
 mod component_app;
 mod component_composition;
+mod local_telemetry;
+mod codex_accounts;
 mod component_collection;
 mod app_host_collection;
 mod app_component_program;
@@ -12452,6 +12454,7 @@ pub fn run() {
             auth_provider::auth_provider_begin,
             auth_provider::auth_provider_poll,
             auth_provider::auth_provider_forget,
+            codex_accounts::codex_accounts_request,
             stock_quotes::stock_watchlist_save,
             stock_quotes::stock_watchlist_refresh,
             stock_quotes::stock_quote_lookup,

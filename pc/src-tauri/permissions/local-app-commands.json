@@ -19,6 +19,7 @@
           "music_player_request",
           "component_extension_request",
           "component_app_request",
+          "codex_accounts_request",
           "component_speech_set_pet_voice",
           "music_player_import",
           "local_widget_snapshot",

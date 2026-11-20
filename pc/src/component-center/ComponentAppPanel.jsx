@@ -6,6 +6,7 @@ import {updateCollectionReply} from './host-collection.js';
 import {updateOwnedHostReply} from './variable-owners.js';
 import {bridgeReply,validImageRef} from "./service-bridge.js";
 import ServiceBridgeControls from './ServiceBridgeControls.jsx';
+import {hasCodexAccounts} from './codex-accounts-model.js';
 import "./component-app.css";
 
 const EMPTY_CITY={city:"",lat:0,lon:0};
@@ -68,6 +69,7 @@ export default function ComponentAppPanel({component,active=false,request=invoke
         <p>只会发送资源包声明的组合键；设备显示“已发送”仅表示系统已收到按键事件，不保证目标软件执行。</p>
       </div>}
       {service==="bridge"&&<ServiceBridgeControls key={`${id}:${component.versionHash}`} component={component} data={data} enabled={enabled&&!hostExpired} busy={busy} onCommand={command} onError={setError}/>}
+      {data?.permissions?.localTelemetry===true&&<p className="component-app__permissions">{hasCodexAccounts(component)?'电脑使用独立授权的账号查询额度。Token 页面根据本机 Codex 会话记录按账号汇总用量。设备会显示邮箱、会员等级、额度、模型名和汇总数字。登录凭据和原始会话记录保留在电脑上。额度查询失败时保留旧结果并标记时间。':'只读本机额度快照；不读取登录令牌内容，不向设备发送原始记录。刷新会重新读取本机快照，服务器额度变化需等待 Codex 更新。'}</p>}
       {service==="composition"&&data?.sources&&<div aria-label="组合数据源诊断"><p role="status">{Object.entries(data.sources).map(([name,phase])=>`${name}：${({ready:"可用",preparing:"更新中",error:"暂不可用，已有记录保留",busy:"队列繁忙"})[phase]||"不可用"}`).join("；")}</p>{data.bindingErrors?.length>0&&<p role="alert">部分字段暂不可用，已显示资源包声明的备用值：{data.bindingErrors.join("、")}</p>}</div>}
       {!["journey","todos","bridge"].includes(service)&&!(service==="notes"&&component.pcApplication.actions["host.tasks"])&&<div className="component-app__actions">{Object.entries(component.pcApplication.actions).filter(([,op])=>op!=="delete"&&!(service!=="news"&&component.pcApplication.autoRead&&["previous","next"].includes(op))).map(([action,op])=><button key={action} disabled={!enabled||busy||(Array.isArray(data?.ui?.actions)&&!data.ui.actions.includes(action))} onClick={()=>{const prompt=component.appRuntime.input?.confirm?.[action];if(prompt){const context=data?.ui?.context;if(window.confirm(prompt))command("action",{action,confirm:true,context});}else command("action",{action});}}>{component.defaultBindings?.find(b=>b.action===action)?.label||(service==="notes"&&op==="todo"?"转为待办":LABELS[op]||op)}</button>)}</div>}
       {service==="fetch"&&<form aria-label="网络来源白名单" onSubmit={e=>{e.preventDefault();command("configure",{hosts:fetchHosts.split(/[\s,，]+/).filter(Boolean)});}}>

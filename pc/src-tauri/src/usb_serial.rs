@@ -13392,11 +13392,67 @@ manager.activate_memory_test_connection();
 
     #[test]
     fn widget_ota_skips_directory_placeholder_files() {
+        assert!(widget_ota_should_skip_path("hachiapp.json"));
+        assert!(widget_ota_should_skip_path("pc/application.json"));
+        assert!(widget_ota_should_skip_path("pc/cover.png"));
         assert!(widget_ota_should_skip_path("assets/.keep"));
         assert!(widget_ota_should_skip_path("pc/extension.json"));
         assert!(widget_ota_should_skip_path("runtime/.keep"));
         assert!(!widget_ota_should_skip_path("runtime/widget.json"));
         assert!(!widget_ota_should_skip_path("assets/icon.png"));
+    }
+
+    #[test]
+    fn hachiapp_desktop_metadata_never_reaches_the_device_installer() {
+        struct DeviceWriter {
+            pending: Vec<u8>, waiters: Arc<Mutex<Vec<WidgetAckWaiter>>>,
+            files: Arc<Mutex<Vec<String>>>,
+        }
+        impl Write for DeviceWriter {
+            fn write(&mut self, bytes:&[u8])->std::io::Result<usize> {
+                self.pending.extend_from_slice(bytes);
+                while let Some(end)=self.pending.iter().position(|b|*b==b'\n') {
+                    let row=self.pending.drain(..=end).collect::<Vec<_>>();
+                    let request:serde_json::Value=serde_json::from_slice(&row).unwrap();
+                    let p=&request["payload"];
+                    let phase=match request["topic"].as_str().unwrap() {
+                        "widget/begin"=>"begin", "widget/chunk"=>"chunk",
+                        "widget/commit"=>"commit", other=>panic!("unexpected topic {other}"),
+                    };
+                    let mut ack=serde_json::json!({"transferId":p["transferId"],"phase":phase,"ok":true});
+                    if phase=="chunk" {
+                        let path=p["path"].as_str().unwrap();self.files.lock().unwrap().push(path.into());
+                        ack["path"]=p["path"].clone();ack["index"]=p["index"].clone();
+                        if !["component.json","negative-screen.json","share.json","buttons.json","runtime/widget.json"].contains(&path) {
+                            ack["ok"]=serde_json::json!(false);
+                            ack["msg"]=serde_json::json!("P4 mini-app package contains an unsupported file");
+                        }
+                    }
+                    resolve_widget_ack(&self.waiters,"widget-install-ack",&ack);
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self)->std::io::Result<()> {Ok(())}
+        }
+        let manager=UsbSerialManager::new();let files=Arc::new(Mutex::new(Vec::new()));
+        *manager.connection.lock().unwrap()=Some(UsbConnection {
+            connection_id:1,port_name:"synthetic-hachiapp-no-device".into(),baud_rate:P4_USB_UART_BAUD,
+            writer:Box::new(DeviceWriter {pending:Vec::new(),waiters:manager.widget_ack_waiters.clone(),files:files.clone()}),
+            board_device_id:"test-board".into(),runtime:"esp-p4".into(),device_model:String::new(),firmware:String::new(),
+            build_id:String::new(),git_sha:String::new(),build_dirty:false,protocol_schema:7,wire_protocol:String::new(),
+            capabilities:serde_json::json!({}),connected:true,cancel_reader:Arc::new(AtomicBool::new(false)),capture_active:Arc::new(AtomicBool::new(false)),
+        });
+        manager.activate_memory_test_connection();
+        let tmp=tempfile::tempdir().unwrap();std::fs::create_dir(tmp.path().join("runtime")).unwrap();std::fs::create_dir(tmp.path().join("pc")).unwrap();
+        for (path,content) in [("hachiapp.json",r#"{"format":"hachiapp/1","id":"fixture"}"#),
+            ("component.json",r#"{"id":"fixture","name":"Fixture","kind":"tool","version":"1.0.0"}"#),
+            ("runtime/widget.json",r#"{"schema_version":1,"engine":"p4-bounded-runtime-v4","vars":{},"states":["idle"],"initial_state":"idle","transitions":[],"tick":[],"dashboard":{"title":"Fixture"}}"#),
+            ("buttons.json","[]"),("negative-screen.json","{}"),("share.json","{}"),("pc/application.json","{}"),("pc/cover.png","desktop-only-cover")]
+        { std::fs::write(tmp.path().join(path),content).unwrap(); }
+        let installed=manager.install_widget_clawpkg_on_board("test-board","fixture",tmp.path(),&HashMap::new(),|_,_,_|{}).unwrap();
+        let mut sent=files.lock().unwrap().clone();sent.sort();
+        assert_eq!(sent,["buttons.json","component.json","negative-screen.json","runtime/widget.json","share.json"]);
+        assert_eq!(installed.0,5);
     }
 
     #[test]
