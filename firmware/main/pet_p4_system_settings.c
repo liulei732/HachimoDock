@@ -235,21 +235,21 @@ static void activate_key(uint64_t now_ms) {
       return;
     }
     if (page.screen == PET_SETTINGS_FEED_ENTRY && page.key_column == 4) {
-        if (page.feed_username) {
-          memcpy(feed_secret.user, password, page.password_length + 1);
+      if (page.feed_username) {
+        memcpy(feed_secret.user, password, page.password_length + 1);
+        clear_password();
+        page.feed_username = false;
+      } else {
+        memcpy(feed_secret.token, password, page.password_length + 1);
+        if (feed_apply(false)) {
           clear_password();
-          page.feed_username = false;
+          page.screen = PET_SETTINGS_FEED;
+          page.selected = 0;
         } else {
-          memcpy(feed_secret.token, password, page.password_length + 1);
-          if (feed_apply(false)) {
-            clear_password();
-            page.screen = PET_SETTINGS_FEED;
-            page.selected = 0;
-          } else {
-            mbedtls_platform_zeroize(feed_secret.token, sizeof(feed_secret.token));
-            page.short_password = true;
-          }
+          mbedtls_platform_zeroize(feed_secret.token, sizeof(feed_secret.token));
+          page.short_password = true;
         }
+      }
       return;
     }
     if (page.key_column == PET_SETTINGS_KEY_REVEAL) {
@@ -405,7 +405,7 @@ void pet_settings_input(pet_p4_runtime_state_t *state, pet_settings_input_t inpu
       if (pet_settings_wifi_find_saved(&page.wifi, &page.target) >= 0 && request(PET_WIFI_FORGET))
         page.screen = PET_SETTINGS_WIFI_SAVED;
     }
-  } else if (page.screen == PET_SETTINGS_PASSWORD) {
+  } else if (page.screen == PET_SETTINGS_PASSWORD || page.screen == PET_SETTINGS_FEED_ENTRY) {
     unsigned columns = pet_settings_page_key_columns(page.screen, page.key_row);
     if (input == PET_SETTINGS_ENTER) activate_key(ts_ms);
     if (input == PET_SETTINGS_LEFT && page.key_column) --page.key_column;
@@ -510,7 +510,7 @@ void pet_settings_touch(pet_p4_runtime_state_t *state, int x, int y, unsigned lo
       select_network();
       state->last_update_ms = ts_ms;
     }
-  } else if (page.screen == PET_SETTINGS_PASSWORD && x >= PET_SETTINGS_KEY_LEFT && x < PET_SETTINGS_KEY_LEFT + PET_SETTINGS_KEY_WIDTH &&
+  } else if ((page.screen == PET_SETTINGS_PASSWORD || page.screen == PET_SETTINGS_FEED_ENTRY) && x >= PET_SETTINGS_KEY_LEFT && x < PET_SETTINGS_KEY_LEFT + PET_SETTINGS_KEY_WIDTH &&
              y >= PET_SETTINGS_KEY_TOP && y < PET_SETTINGS_KEY_TOP + PET_SETTINGS_KEY_ROWS * PET_SETTINGS_KEY_ROW_HEIGHT) {
     page.key_row = (unsigned)(y - PET_SETTINGS_KEY_TOP) / PET_SETTINGS_KEY_ROW_HEIGHT;
     unsigned key_width = PET_SETTINGS_KEY_WIDTH / pet_settings_page_key_columns(page.screen, page.key_row);
