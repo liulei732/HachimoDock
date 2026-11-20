@@ -32,10 +32,13 @@ static inline bool pet_host_render_variable(const pet_host_render_t *s,const cha
   }
   return false;
 }
-static inline bool pet_host_render_enabled(const pet_host_render_t *s,const char *action){
+static inline bool pet_host_render_offered(const pet_host_render_t *s,const char *action){
   if(!s||!s->current||!action)return false;
   if(s->legacy)return true; /* Match legacy native action availability. */
-  if(!s->fresh||s->pending)return false;
+  if(!s->fresh)return false;
   for(unsigned i=0;i<s->action_count&&i<16;i++)if(!strcmp(action,s->actions[i]))return true;
   return false;
+}
+static inline bool pet_host_render_enabled(const pet_host_render_t *s,const char *action){
+  return pet_host_render_offered(s,action)&&(s->legacy||!s->pending);
 }

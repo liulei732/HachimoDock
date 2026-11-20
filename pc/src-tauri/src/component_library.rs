@@ -829,6 +829,9 @@ pub(crate) fn ensure_bundled(home: &Path, root: &Path) -> Result<(), String> {
 /// don't re-hash every bundled PNG on each UI refresh. Developer mode remains live.
 pub(crate) fn ensure_bundled_for_ui(home:&Path,root:&Path)->Result<(),String>{
     if cfg!(debug_assertions){return ensure_bundled(home,root);}
+    ensure_bundled_once(home,root)
+}
+fn ensure_bundled_once(home:&Path,root:&Path)->Result<(),String>{
     static SEEDED:std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(PathBuf,PathBuf)>>> = std::sync::OnceLock::new();
     let mut done=SEEDED.get_or_init(Default::default).lock().map_err(|_|"组件初始化繁忙")?;
     let key=(home.to_path_buf(),root.to_path_buf());
@@ -861,7 +864,7 @@ pub(crate) fn configure_bundled_host(home:PathBuf,root:PathBuf){
 }
 fn ensure_bundled_for_host(home:&Path,root:&Path)->Result<(),String>{
     if !root.is_dir(){return Err("客户端内置组件资源缺失，请重新安装客户端；原数据未修改".into());}
-    ensure_bundled_for_ui(home,root).map_err(|_|"客户端组件资源初始化失败，请检查磁盘空间后重试；原数据保留".into())
+    ensure_bundled_once(home,root).map_err(|_|"客户端组件资源初始化失败，请检查磁盘空间后重试；原数据保留".into())
 }
 
 fn preview_fingerprint(path:&Path)->Result<Vec<u8>,String>{
@@ -1064,9 +1067,7 @@ pub fn list(home: &Path) -> Result<ComponentLibrarySnapshot, String> {
     })
 }
 
-/// Targeted resolution for host events; do not re-decode every installed package.
-/// Cache only parsed host metadata. Re-hash actual bytes on every request:
-/// timestamps alone must never authorize modified executable/service declarations.
+/// Cache parsed metadata while re-hashing the package used for host execution.
 fn host_entry(path:&Path)->Result<ComponentLibraryEntry,String>{
     type Cache=Vec<(PathBuf,String,Option<SystemTime>,ComponentLibraryEntry)>;
     static CACHE:std::sync::OnceLock<std::sync::Mutex<Cache>>=std::sync::OnceLock::new();
@@ -1094,6 +1095,24 @@ pub(crate) fn latest(home:&Path,id:&str)->Result<Option<ComponentLibraryEntry>,S
     }
     let root=library_root(home).join(id);
     if !fs::symlink_metadata(&root).is_ok_and(|m|m.is_dir()&&!m.file_type().is_symlink()){return Ok(None);}
+    // Match the component center's imported version selection. A quick path
+    // through a single package preserves content verification on every request.
+    let selection=read_json_from_dir(&components_root(home).join("selected"), &format!("{id}.json"));
+    if let Some(hash)=selection.as_ref().and_then(|s|s["hash"].as_str())
+        .filter(|h|h.len()==16 && h.bytes().all(|c|c.is_ascii_digit() || matches!(c,b'a'..=b'f'))) {
+        let selected=root.join(hash);
+        match fs::symlink_metadata(&selected) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                let entry=host_entry(&selected)?;
+                if entry.id!=id || entry.version_hash!=hash {
+                    return Err("组件内容已变化，请重新导入".into());
+                }
+                return Ok(Some(entry));
+            }
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound => {}
+            _ => return Err("选中的组件目录不可用，请重新导入".into()),
+        }
+    }
     let mut versions=Vec::new();
     for e in fs::read_dir(root).map_err(|_|"无法读取组件库")?.take(128).flatten(){
         if !e.file_type().is_ok_and(|m|m.is_dir()){continue;}
@@ -1274,6 +1293,25 @@ mod tests {
         assert!(!latest(home.path(),"hachimi-weather").unwrap().unwrap().valid);
         fs::write(&file,original).unwrap();
         assert!(latest(home.path(),"hachimi-weather").unwrap().unwrap().valid);
+    }
+
+    #[test]
+    fn host_uses_the_same_selected_revision_as_the_component_center() {
+        let home = tempfile::tempdir().unwrap();
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../optional-clawpkgs/hachimi-weather");
+        let older = publish_source(home.path(), &source).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        copy_dir_recursive_safe(&source, other.path()).unwrap();
+        let manifest_path = other.path().join("component.json");
+        let mut manifest = read_json_from_dir(other.path(), "component.json").unwrap();
+        manifest["version"] = serde_json::json!("999.0.0");
+        fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let newer = publish_source(home.path(), other.path()).unwrap();
+        assert_eq!(latest(home.path(), &older.id).unwrap().unwrap().version_hash, newer.version_hash);
+
+        publish_source(home.path(), &source).unwrap();
+        assert_eq!(scan_latest_versions(home.path()).unwrap()[0].version_hash, older.version_hash);
+        assert_eq!(latest(home.path(), &older.id).unwrap().unwrap().version_hash, older.version_hash);
     }
 
     #[test]

@@ -30,6 +30,7 @@ tauri-plugin-http = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+memchr = "2.8"
 semver = "1"
 regex = "1"
 encoding_rs = "0.8"

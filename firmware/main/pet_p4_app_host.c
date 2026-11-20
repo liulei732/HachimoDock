@@ -33,7 +33,7 @@ static uint64_t variable_reply_at;
 static int32_t owned_integer_values[8];
 #endif
 static bool shown;
-static bool ui_valid,ui_pending;
+static bool ui_valid,ui_pending,ui_retain_frame;
 #if PET_VARIABLE_OWNERS_ENABLED
 static bool owned_fresh_locked(uint64_t now){
   return !ui_pending&&variable_reply_at&&now>=variable_reply_at&&now-variable_reply_at<10000;
@@ -87,7 +87,7 @@ static void clear_view(void){
   changed|=collection_view.valid;memset(&collection_view,0,sizeof(collection_view));
 #endif
   if(changed)variable_epoch++;
-  ui_valid=ui_pending=false;ui_count=0;ui_context[0]=0;variable_count=0;
+  ui_valid=ui_pending=ui_retain_frame=false;ui_count=0;ui_context[0]=0;variable_count=0;
 }
 static bool same_variables(const host_variable_t *incoming,int count){
   if(count!=variable_count)return false;
@@ -166,11 +166,17 @@ static bool request(const char *id,uint32_t rev,uint8_t page,const char *action,
   if(!visible)clear_view();
   if(command)last_action=now;
   shown=visible;last_poll=now;seq=++sequence;
-  if(command){applied=seq;last_reply=now;
+  if(command){applied=seq;
 #if PET_VARIABLE_OWNERS_ENABLED
     if(!ui_pending)variable_epoch++;
 #endif
-    ui_pending=true;snprintf(values[1],sizeof(values[1]),"正在处理");snprintf(values[6],sizeof(values[6]),"已请求电脑，不会重复派发");}
+    ui_pending=true;
+    if(!ui_retain_frame){
+      last_reply=now;
+      snprintf(values[1],sizeof(values[1]),"正在处理");
+      snprintf(values[6],sizeof(values[6]),"已请求电脑，不会重复派发");
+    }
+  }
   memcpy(token,instance,sizeof(token));memcpy(board,board_id,sizeof(board));snprintf(context,sizeof(context),"%s",confirmed_context?confirmed_context:observed?observed->context:ui_context);send=transport;ctx=transport_ctx;
 #if PET_SERVICE_BRIDGE_ENABLED
   memcpy(contract_copy,active_contract,sizeof(contract_copy));
@@ -307,6 +313,7 @@ bool pet_app_host_apply(const cJSON *p,uint64_t now){
   }
   const cJSON *ui=cJSON_GetObjectItemCaseSensitive(p,"ui");
   int mode=0,count=0;char actions[16][48]={{0}},context[65]={0};
+  bool retain_frame=false;
   if(ui){
     const cJSON *m=cJSON_GetObjectItemCaseSensitive(ui,"mode"),*a=cJSON_GetObjectItemCaseSensitive(ui,"actions");
     if(!cJSON_IsObject(ui)||!cJSON_IsNumber(m)||m->valuedouble!=m->valueint||m->valueint<0||m->valueint>7||!cJSON_IsArray(a)||cJSON_GetArraySize(a)>16)return false;
@@ -319,6 +326,9 @@ bool pet_app_host_apply(const cJSON *p,uint64_t now){
       snprintf(actions[i],48,"%s",s->valuestring);}
     const cJSON *token=cJSON_GetObjectItemCaseSensitive(ui,"context");
     if(token){if(!cJSON_IsString(token)||strlen(token->valuestring)>64)return false;for(const char *c=token->valuestring;*c;c++)if(!((*c>='0'&&*c<='9')||(*c>='a'&&*c<='f')))return false;snprintf(context,65,"%s",token->valuestring);}
+    const cJSON *retain=cJSON_GetObjectItemCaseSensitive(ui,"retainFrame");
+    if(retain&&!cJSON_IsBool(retain))return false;
+    retain_frame=cJSON_IsTrue(retain);
   }
 #if PET_HOST_COLLECTION_ENABLED
   if(collection&&(!ui||!context[0]))return false;
@@ -357,6 +367,7 @@ bool pet_app_host_apply(const cJSON *p,uint64_t now){
     last_reply=now;
     ui_valid=ui!=NULL;
     ui_pending=false;
+    ui_retain_frame=retain_frame;
     ui_mode=mode;
     ui_count=count;
     memcpy(ui_actions,actions,sizeof(actions));
@@ -451,7 +462,9 @@ static void render_capture(const char *id,pet_host_render_t *out,pet_p4_miniapp_
     if(owned){out->fresh=owned_fresh_locked(now);if(!out->fresh&&observed)memset(observed,0,sizeof(*observed));}
 #endif
     out->legacy=!ui_valid;out->pending=ui_pending;
-    out->mode=!out->fresh?7:ui_pending?6:ui_valid?ui_mode:0;
+    /* Pending input still uses mode 6. Rendering may hold a fresh committed
+     * frame until the matching snapshot arrives, without refreshing its lease. */
+    out->mode=!out->fresh?7:ui_pending&&!ui_retain_frame?6:ui_valid?ui_mode:0;
     if(out->fresh){out->count=variable_count;memcpy(out->variables,variables,sizeof(variables));
 #if PET_SERVICE_BRIDGE_ENABLED
       for(unsigned i=0;i<out->count;i++)if(out->variables[i].integer){

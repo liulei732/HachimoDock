@@ -154,6 +154,24 @@ int main(void){
   assert(pet_app_host_owned_integer_snapshot("app",owned_keys,2,owned_words,30013));
   assert(!pet_app_host_apply(reply,30014)); // Duplicate cannot renew freshness.
   assert(!pet_app_host_owned_integer_snapshot("app",owned_keys,2,owned_words,40012));
+  cJSON_AddBoolToObject(ui,"retainFrame",true);
+  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(reply,"sequence"),++sequence);
+  assert(pet_app_host_apply(reply,41000));
+  assert(pet_app_host_action("app",1,0,"host.even",41020));
+  pet_app_host_render_capture("app",&pending_frame,&view,41021);
+  assert(pending_frame.pending&&pending_frame.fresh&&pending_frame.mode==0);
+  assert(!strcmp(view.headline,"10002")&&pet_app_host_mode("app",41021)==6);
+  assert(!pet_app_host_enabled("app","host.even",41021));
+  assert(!pet_host_render_enabled(&pending_frame,"host.even"));
+  assert(pet_host_render_offered(&pending_frame,"host.even"));
+  pet_app_host_render_capture("app",&pending_frame,&view,51000);
+  assert(!pending_frame.fresh&&pending_frame.mode==7); // The held frame does not renew its lease.
+  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(ui,"mode"),1);
+  cJSON_ReplaceItemInObjectCaseSensitive(values,"headline",cJSON_CreateString("next"));
+  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(reply,"sequence"),sequence);
+  assert(pet_app_host_apply(reply,51001));
+  pet_app_host_render_capture("app",&pending_frame,&view,51002);
+  assert(!pending_frame.pending&&pending_frame.mode==1&&!strcmp(view.headline,"next"));
 '''
         code=code.replace('  cJSON_Delete(reply);return 0;',block+'\n  cJSON_Delete(reply);return 0;')
     compile_run(tmp_path, code, (ROOT / 'main/pet_p4_resources.c', ROOT / 'main/pet_p4_resources_device.c'),flags=(f'-DPET_VARIABLE_OWNERS_ENABLED={owners}',))

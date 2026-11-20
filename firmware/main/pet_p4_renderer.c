@@ -77,6 +77,7 @@
 #endif
 #include "pet_p4_center_layout.h"
 #include "../assets/component-center/catalog.h"
+#include "../assets/component-center/pet_p4_codex_icon.h"
 #include "../assets/component-center/text_masks.h"
 #include "pet_p4_image.h"
 #include "pet_p4_app_glyphs.h"
@@ -3732,7 +3733,20 @@ static void draw_text_center(
 // Geometric icons do not depend on emoji or private-use font glyphs.
 static void draw_component_icon(const char *id, int x, int y, uint16_t ink, uint16_t tile) {
   fill_round_rect(x, y, 44, 44, 12, tile);
-  if (strcmp(id, "stock-watchlist") == 0) {
+  if (strcmp(id, "codex-quota-board") == 0) {
+    const uint8_t red = ((ink >> 11) & 31) * 255 / 31;
+    const uint8_t green = ((ink >> 5) & 63) * 255 / 63;
+    const uint8_t blue = (ink & 31) * 255 / 31;
+    for (int row = 0; row < PET_CODEX_ICON_HEIGHT; ++row) {
+      for (int col = 0; col < PET_CODEX_ICON_WIDTH; ++col) {
+        const unsigned pixel = row * PET_CODEX_ICON_WIDTH + col;
+        const uint8_t pair = pet_codex_icon_alpha4[pixel / 2];
+        const uint8_t alpha = (pixel & 1 ? pair & 15 : pair >> 4) * 17;
+        if (alpha) blend_px(x + PET_CODEX_ICON_X + col, y + PET_CODEX_ICON_Y + row,
+                            red, green, blue, alpha);
+      }
+    }
+  } else if (strcmp(id, "stock-watchlist") == 0) {
     fill_round_rect(x+10, y+25, 5, 10, 2, ink);
     fill_round_rect(x+20, y+19, 5, 16, 2, ink);
     fill_round_rect(x+30, y+9, 5, 26, 2, ink);
