@@ -110,6 +110,9 @@ def test_dual_band_is_requested_only_for_detected_c5(tmp_path):
 #define portENTER_CRITICAL(lock) ((void)0)
 #define portEXIT_CRITICAL(lock) ((void)0)
 typedef int esp_err_t;
+typedef int esp_netif_t;
+static esp_netif_t station;
+static esp_netif_t *station_netif;
 typedef struct { int nvs_enable; } wifi_init_config_t;
 typedef int wifi_config_t;
 typedef struct { unsigned major1, minor1, patch1; } esp_hosted_coprocessor_fwver_t;
@@ -120,7 +123,7 @@ static unsigned detected, band_calls;
 static int band_result;
 static int esp_netif_init(void) {return ESP_OK;}
 static int esp_event_loop_create_default(void) {return ESP_OK;}
-static bool esp_netif_create_default_wifi_sta(void) {return true;}
+static esp_netif_t *esp_netif_create_default_wifi_sta(void) {return &station;}
 static int esp_hosted_init(void) {return ESP_OK;}
 static int esp_wifi_init(const wifi_init_config_t *p) {assert(!p->nvs_enable);return ESP_OK;}
 static int esp_wifi_set_storage(int n) {assert(n==WIFI_STORAGE_RAM);return ESP_OK;}

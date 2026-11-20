@@ -2,9 +2,11 @@
 #include "pet_p4_ble_shortcut.h"
 #include "pet_p4_protocol.h"
 #include "pet_p4_wifi_clock.h"
+#include "pet_p4_wifi_profiles.h"
 
 #if PET_P4_SYSTEM_WIFI
 #include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_attr.h"
@@ -20,7 +22,9 @@
 #include "nvs.h"
 
 #define WIFI_NAMESPACE "pet_wifi_local"
-#define WIFI_CONFIG_KEY "station_v1"
+#define WIFI_LEGACY_KEY "station_v1"
+#define WIFI_PROFILES_KEY "stations_v2"
+#define WIFI_MANUAL_ONLY_KEY "manual_only_v1"
 #define WIFI_GOT_IP BIT0
 #define WIFI_DISCONNECTED BIT1
 #define WIFI_LOST_IP BIT2
@@ -30,17 +34,12 @@
 #define HOSTED_CHIP_ESP32C5 0x17u
 
 typedef struct {
-  char ssid[PET_WIFI_SSID_SIZE];
-  char password[PET_WIFI_PASSWORD_SIZE];
-  uint8_t security;
-} station_t;
-
-typedef struct {
   pet_wifi_operation_t operation;
   pet_wifi_ap_t ap;
-  station_t station;
+  pet_wifi_station_t station;
 } request_t;
 
+static esp_netif_t *station_netif;
 static QueueHandle_t requests;
 static QueueHandle_t snapshots;
 static EventGroupHandle_t events;
@@ -60,7 +59,11 @@ static bool started;
 static bool legacy_phy;
 static bool dual_band;
 static pet_wifi_snapshot_t view;
-static station_t saved;
+static pet_wifi_profiles_t saved, pending_profiles;
+static pet_wifi_manual_only_t manual_only;
+static pet_wifi_saved_network_t legacy_network;
+static uint8_t connected_security;
+static bool profiles_on_flash;
 
 static void clear_memory(void *memory, size_t size) {
   volatile unsigned char *p = memory;
@@ -68,6 +71,17 @@ static void clear_memory(void *memory, size_t size) {
 }
 
 static void publish(void) {
+  if (!view.connected[0]) memset(&view.connection, 0, sizeof(view.connection));
+  view.saved_count = saved.count;
+  for (unsigned i = 0; i < saved.count; ++i) {
+    const pet_wifi_station_t *network = &saved.items[i];
+    pet_wifi_saved_network_t *item = &view.saved[i];
+    memcpy(item->ssid, network->ssid, sizeof(item->ssid));
+    item->security = network->security;
+    item->auto_join = pet_wifi_auto_allowed(&manual_only, network);
+    item->current = view.connected[0] && connected_security == item->security &&
+      !strcmp(view.connected, item->ssid);
+  }
   atomic_store(&online, view.connected[0] != 0);
   xQueueOverwrite(snapshots, &view);
 }
@@ -126,26 +140,94 @@ static void note_join(pet_wifi_join_stage_t stage, int error, bool interactive) 
   portEXIT_CRITICAL(&link_lock);
 }
 
-static esp_err_t save_station(const station_t *station) {
-  nvs_handle_t nvs;
-  esp_err_t result = nvs_open(WIFI_NAMESPACE, NVS_READWRITE, &nvs);
-  if (result != ESP_OK) return result;
-  result = station ? nvs_set_blob(nvs, WIFI_CONFIG_KEY, station, sizeof(*station))
-                             : nvs_erase_key(nvs, WIFI_CONFIG_KEY);
-  if (!station && result == ESP_ERR_NVS_NOT_FOUND) result = ESP_OK;
+static esp_err_t write_profiles(nvs_handle_t nvs, const pet_wifi_profiles_t *profiles) {
+  esp_err_t result = nvs_set_blob(nvs, WIFI_PROFILES_KEY, profiles, sizeof(*profiles));
   if (result == ESP_OK) result = nvs_commit(nvs);
-  nvs_close(nvs);
+  if (result == ESP_OK) profiles_on_flash = true;
   return result;
 }
 
-static void load_station(void) {
+static esp_err_t commit_profiles(const pet_wifi_station_t *modified) {
+  nvs_handle_t nvs;
+  esp_err_t result = nvs_open(WIFI_NAMESPACE, NVS_READWRITE, &nvs);
+  if (result == ESP_OK) {
+    /* Preserve the old firmware's profile unless the user forgets it or replaces
+     * its password. Ensure v2 already has the old list before erasing that key. */
+    if (modified && legacy_network.security == modified->security &&
+        !strcmp(legacy_network.ssid, modified->ssid)) {
+      if (!profiles_on_flash) result = write_profiles(nvs, &saved);
+      if (result == ESP_OK) {
+        result = nvs_erase_key(nvs, WIFI_LEGACY_KEY);
+        if (result == ESP_OK || result == ESP_ERR_NVS_NOT_FOUND) result = nvs_commit(nvs);
+        if (result == ESP_OK) legacy_network.ssid[0] = 0;
+      }
+    }
+    if (result == ESP_OK) result = write_profiles(nvs, &pending_profiles);
+    nvs_close(nvs);
+    if (result == ESP_OK) saved = pending_profiles;
+  }
+  clear_memory(&pending_profiles, sizeof(pending_profiles));
+  return result;
+}
+
+static esp_err_t set_auto_join(const pet_wifi_station_t *station, bool enabled) {
+  if (pet_wifi_auto_allowed(&manual_only, station) == enabled) return ESP_OK;
+  pet_wifi_manual_only_t next = {0};
+  for (unsigned i = 0; i < manual_only.count; ++i) {
+    const pet_wifi_network_id_t *item = &manual_only.items[i];
+    if (!pet_wifi_same_network(item, station->ssid, station->security) &&
+        pet_wifi_profiles_find(&saved, item->ssid, item->security) >= 0)
+      next.items[next.count++] = *item;
+  }
+  if (!enabled) {
+    if (next.count >= PET_WIFI_SAVED_MAX) return ESP_ERR_INVALID_STATE;
+    pet_wifi_network_id_t *item = &next.items[next.count++];
+    memcpy(item->ssid, station->ssid, sizeof(item->ssid));
+    item->security = station->security;
+  }
+  nvs_handle_t nvs;
+  esp_err_t result = nvs_open(WIFI_NAMESPACE, NVS_READWRITE, &nvs);
+  if (result != ESP_OK) return result;
+  result = nvs_set_blob(nvs, WIFI_MANUAL_ONLY_KEY, &next, sizeof(next));
+  if (result == ESP_OK) result = nvs_commit(nvs);
+  nvs_close(nvs);
+  if (result == ESP_OK) manual_only = next;
+  return result;
+}
+
+static void load_profiles(void) {
   nvs_handle_t nvs;
   if (nvs_open(WIFI_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) return;
   size_t size = sizeof(saved);
-  if (nvs_get_blob(nvs, WIFI_CONFIG_KEY, &saved, &size) != ESP_OK ||
-      size != sizeof(saved) || !memchr(saved.ssid, 0, sizeof(saved.ssid)) ||
-      !memchr(saved.password, 0, sizeof(saved.password)) || saved.security > PET_WIFI_WPA3)
-    clear_memory(&saved, sizeof(saved));
+  const esp_err_t result = nvs_get_blob(nvs, WIFI_PROFILES_KEY, &saved, &size);
+  profiles_on_flash = result == ESP_OK && size == sizeof(saved) && pet_wifi_profiles_valid(&saved);
+  if (!profiles_on_flash) clear_memory(&saved, sizeof(saved));
+
+  pet_wifi_station_t legacy = {0};
+  size = sizeof(legacy);
+  if (nvs_get_blob(nvs, WIFI_LEGACY_KEY, &legacy, &size) == ESP_OK &&
+      size == sizeof(legacy) && pet_wifi_station_valid(&legacy)) {
+    memcpy(legacy_network.ssid, legacy.ssid, sizeof(legacy.ssid));
+    legacy_network.security = legacy.security;
+    if (result == ESP_ERR_NVS_NOT_FOUND) pet_wifi_profiles_promote(&saved, 0, &legacy);
+  }
+  clear_memory(&legacy, sizeof(legacy));
+  size = sizeof(manual_only);
+  const esp_err_t policy_status = nvs_get_blob(nvs, WIFI_MANUAL_ONLY_KEY, &manual_only, &size);
+  if (policy_status != ESP_OK || size != sizeof(manual_only) ||
+      !pet_wifi_manual_only_valid(&manual_only)) {
+    memset(&manual_only, 0, sizeof(manual_only));
+    // A missing policy is the legacy default. A damaged policy must not
+    // silently opt the device back into a network the user disabled.
+    if (policy_status != ESP_ERR_NVS_NOT_FOUND) {
+      manual_only.count = saved.count;
+      for (unsigned i = 0; i < saved.count; ++i) {
+        memcpy(manual_only.items[i].ssid, saved.items[i].ssid, sizeof(saved.items[i].ssid));
+        manual_only.items[i].security = saved.items[i].security;
+      }
+      view.saved_update_failed = true;
+    }
+  }
   nvs_close(nvs);
 }
 
@@ -183,7 +265,8 @@ static bool start_radio(void) {
   if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) return false;
   result = esp_event_loop_create_default();
   if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) return false;
-  if (!esp_netif_create_default_wifi_sta()) return false;
+  station_netif = esp_netif_create_default_wifi_sta();
+  if (!station_netif) return false;
   atomic_store(&hosted_probe_step,1);
   result = esp_hosted_init();
   if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) return false;
@@ -241,6 +324,27 @@ static uint8_t security_for(wifi_auth_mode_t mode) {
   }
 }
 
+static void update_connection(const wifi_ap_record_t *ap) {
+  pet_wifi_connection_t info = {
+    .rssi = ap->rssi,
+    .channel = ap->primary,
+    .security = security_for(ap->authmode),
+  };
+  esp_netif_ip_info_t ip;
+  if (esp_netif_get_ip_info(station_netif, &ip) == ESP_OK && ip.ip.addr) {
+    snprintf(info.ip, sizeof(info.ip), IPSTR, IP2STR(&ip.ip));
+    if (ip.gw.addr) snprintf(info.gateway, sizeof(info.gateway), IPSTR, IP2STR(&ip.gw));
+  }
+  view.connection = info;
+}
+
+static void refresh_connection(void) {
+  wifi_ap_record_t ap;
+  if (view.connected[0] && esp_wifi_sta_get_ap_info(&ap) == ESP_OK &&
+      !strncmp((const char *)ap.ssid, view.connected, PET_WIFI_SSID_SIZE))
+    update_connection(&ap);
+}
+
 static bool security_matches(uint8_t requested, wifi_auth_mode_t actual) {
   const uint8_t security = security_for(actual);
   return security == requested ||
@@ -251,6 +355,8 @@ static EXT_RAM_BSS_ATTR wifi_ap_record_t records[WIFI_SCAN_RECORDS];
 
 static void scan(void) {
   view.status = PET_WIFI_SCANNING;
+  view.join_stage = PET_WIFI_JOIN_NONE;
+  view.join_reason = 0;
   view.count = 0;
   publish();
   if (esp_wifi_scan_start(NULL, true) != ESP_OK) {
@@ -296,7 +402,7 @@ static void scan(void) {
   view.status = view.connected[0] ? PET_WIFI_CONNECTED : PET_WIFI_IDLE;
 }
 
-static bool connect_station(const station_t *station, const pet_wifi_ap_t *ap_hint,
+static bool connect_station(const pet_wifi_station_t *station, const pet_wifi_ap_t *ap_hint,
                             bool interactive, bool legacy) {
   xEventGroupClearBits(events, WIFI_GOT_IP | WIFI_DISCONNECTED | WIFI_LOST_IP);
   if (esp_wifi_disconnect() == ESP_OK)
@@ -392,7 +498,9 @@ static bool connect_station(const station_t *station, const pet_wifi_ap_t *ap_hi
         portENTER_CRITICAL(&link_lock);
         link_status.connected_channel = ap.primary;
         portEXIT_CRITICAL(&link_lock);
+        connected_security = station->security;
         memcpy(view.connected, station->ssid, sizeof(view.connected));
+        update_connection(&ap);
         note_join(PET_WIFI_JOIN_OK, 0, interactive);
         return true;
       }
@@ -410,12 +518,12 @@ static bool handshake_timeout(unsigned reason) {
 static void wifi_task(void *arg) {
   (void)arg;
   pet_wifi_clock_load_offset();
-  load_station();
-  view.saved = saved.ssid[0] != 0;
+  load_profiles();
   publish();
   TickType_t retry = xTaskGetTickCount();
   unsigned retry_delay_ms = WIFI_RETRY_FIRST_MS;
   bool attempted_ble_restore=false;
+  unsigned retry_index = 0;
   for (;;) {
     if (atomic_load(&reboot_requested)) {
       view.connected[0] = 0;
@@ -429,18 +537,40 @@ static void wifi_task(void *arg) {
     pet_wifi_clock_service(pet_device_wifi_online());
     request_t request = {0};
     if (xQueueReceive(requests, &request, pdMS_TO_TICKS(500)) == pdTRUE) {
-      if (request.operation == PET_WIFI_FORGET) {
-        if (save_station(NULL) == ESP_OK) {
-          if (started) {
-            (void)esp_wifi_disconnect();
-            wifi_config_t empty = {0};
-            (void)esp_wifi_set_config(WIFI_IF_STA, &empty);
-          }
-          clear_memory(&saved, sizeof(saved));
-          view.saved = false;
-          view.connected[0] = 0;
-          view.status = PET_WIFI_IDLE;
-        } else view.status = PET_WIFI_FAILED;
+      const int index = pet_wifi_profiles_find(&saved, request.ap.ssid, request.ap.security);
+      if (request.operation == PET_WIFI_AUTO_ON || request.operation == PET_WIFI_AUTO_OFF) {
+        view.saved_update_failed = index < 0 ||
+          set_auto_join(&saved.items[index], request.operation == PET_WIFI_AUTO_ON) != ESP_OK;
+        if (!view.saved_update_failed) {
+          retry_index = 0;
+          retry = xTaskGetTickCount();
+          retry_delay_ms = WIFI_RETRY_FIRST_MS;
+        }
+      } else if (request.operation == PET_WIFI_FORGET) {
+        view.saved_update_failed = false;
+        if (index >= 0) {
+          request.station = saved.items[index];
+          clear_memory(request.station.password, sizeof(request.station.password));
+          pending_profiles = saved;
+          pet_wifi_profiles_remove(&pending_profiles, (unsigned)index);
+          const bool current = view.saved[index].current;
+          if (commit_profiles(&saved.items[index]) == ESP_OK) {
+            (void)set_auto_join(&request.station, true);
+            if (current && started) {
+              (void)esp_wifi_disconnect();
+              wifi_config_t empty = {0};
+              (void)esp_wifi_set_config(WIFI_IF_STA, &empty);
+              view.connected[0] = 0;
+            }
+            view.join_stage = PET_WIFI_JOIN_NONE;
+            view.join_reason = 0;
+            view.status = view.connected[0] ? PET_WIFI_CONNECTED : PET_WIFI_IDLE;
+            retry_index = 0;
+            retry = xTaskGetTickCount();
+          } else view.saved_update_failed = true;
+        }
+      } else if (request.operation == PET_WIFI_CONNECT && index < 0 && saved.count == PET_WIFI_SAVED_MAX) {
+        view.status = PET_WIFI_LIST_FULL;
       } else if (!start_radio()) {
         view.status = PET_WIFI_UNAVAILABLE;
       } else if (request.operation == PET_WIFI_SCAN) {
@@ -448,7 +578,12 @@ static void wifi_task(void *arg) {
       } else if (request.operation == PET_WIFI_START) {
         /* A completed scan also proves a working C6 if version RPC is unavailable. */
         if (!pet_p4_is_wifi6_hardware()) scan();
-      } else if (request.operation == PET_WIFI_CONNECT) {
+      } else if (request.operation == PET_WIFI_DETAILS) {
+        refresh_connection();
+      } else if (request.operation == PET_WIFI_CONNECT ||
+                 (request.operation == PET_WIFI_CONNECT_SAVED && index >= 0)) {
+        if (request.operation == PET_WIFI_CONNECT_SAVED) request.station = saved.items[index];
+        view.join_stage = PET_WIFI_JOIN_NONE;
         view.join_reason = 0;
         bool joined = connect_station(&request.station, &request.ap, true, false);
         if (!joined && !atomic_load(&cancelled)) {
@@ -460,18 +595,29 @@ static void wifi_task(void *arg) {
         }
         joined = joined && !atomic_load(&cancelled);
         retry_delay_ms = WIFI_RETRY_FIRST_MS;
-        const esp_err_t saved_result = joined ? save_station(&request.station) : ESP_FAIL;
-        if (joined && saved_result == ESP_OK) {
-          saved = request.station;
-          view.saved = true;
-          view.status = PET_WIFI_CONNECTED;
-        } else {
+        retry_index = 0;
+        esp_err_t saved_result = ESP_OK;
+        if (joined && (index != 0 || strcmp(saved.items[0].password, request.station.password))) {
+          // A previously forgotten network starts with auto-join enabled.
+          if (index < 0) saved_result = set_auto_join(&request.station, true);
+          pending_profiles = saved;
+          pet_wifi_profiles_promote(&pending_profiles, index < 0 ? saved.count : (unsigned)index,
+                                    &request.station);
+          const bool password_changed = index >= 0 &&
+            strcmp(saved.items[index].password, request.station.password);
+          if (saved_result == ESP_OK)
+            saved_result = commit_profiles(password_changed ? &request.station : NULL);
+          else clear_memory(&pending_profiles, sizeof(pending_profiles));
+        }
+        if (joined && saved_result == ESP_OK) view.status = PET_WIFI_CONNECTED;
+        else {
           if (joined) note_join(PET_WIFI_JOIN_SAVE, saved_result, true);
-          view.join_reason = pet_device_wifi_link_status().disconnect_reason;
+          const pet_wifi_link_status_t link = pet_device_wifi_link_status();
+          view.join_stage = link.join_stage;
+          view.join_reason = link.disconnect_reason;
           (void)esp_wifi_disconnect();
           view.connected[0] = 0;
           view.status = atomic_load(&cancelled) ? PET_WIFI_IDLE : PET_WIFI_FAILED;
-          // Restore the previous saved network on the next idle pass.
           retry = xTaskGetTickCount() + pdMS_TO_TICKS(retry_delay_ms);
         }
       }
@@ -489,27 +635,42 @@ static void wifi_task(void *arg) {
       retry_delay_ms = WIFI_RETRY_FIRST_MS;
       publish();
     }
+    const unsigned next_auto = pet_wifi_next_auto(&saved, &manual_only, retry_index);
     if (!pet_ble_shortcut_restore_requested()) attempted_ble_restore = false;
-    else if (!started && !view.saved && !attempted_ble_restore) {
+    else if (!started && next_auto >= saved.count && !attempted_ble_restore) {
       attempted_ble_restore = true;
       (void)start_radio();
     }
-    if (view.saved && !view.connected[0] && view.status != PET_WIFI_UNAVAILABLE &&
+    if (next_auto < saved.count && !view.connected[0] && view.status != PET_WIFI_UNAVAILABLE &&
         (int32_t)(xTaskGetTickCount() - retry) >= 0) {
       if (!start_radio()) view.status = PET_WIFI_UNAVAILABLE;
       else {
-        bool restored = connect_station(&saved, NULL, false, false);
+        const pet_wifi_station_t *candidate = &saved.items[next_auto];
+        bool restored = connect_station(candidate, NULL, false, false);
         if (!restored && !uxQueueMessagesWaiting(requests) &&
             handshake_timeout(pet_device_wifi_link_status().disconnect_reason))
-          restored = connect_station(&saved, NULL, false, true);
+          restored = connect_station(candidate, NULL, false, true);
+        // Foreground work can interrupt a join. Resume this candidate without backoff.
+        if (!restored && uxQueueMessagesWaiting(requests)) continue;
         if (restored) {
+          retry_index = 0;
           view.status = PET_WIFI_CONNECTED;
+          view.join_stage = PET_WIFI_JOIN_NONE;
           view.join_reason = 0;
           retry_delay_ms = WIFI_RETRY_FIRST_MS;
-        } else if (view.status == PET_WIFI_IDLE && !view.count &&
-                   !uxQueueMessagesWaiting(requests)) {
-          view.join_reason = pet_device_wifi_link_status().disconnect_reason;
-          view.status = PET_WIFI_FAILED;
+        } else {
+          retry_index = pet_wifi_next_auto(&saved, &manual_only, next_auto + 1);
+          if (retry_index < saved.count) {
+            retry = xTaskGetTickCount();
+            continue;
+          }
+          retry_index = 0;
+          if (view.status == PET_WIFI_IDLE && !view.count) {
+            const pet_wifi_link_status_t link = pet_device_wifi_link_status();
+            view.join_stage = link.join_stage;
+            view.join_reason = link.disconnect_reason;
+            view.status = PET_WIFI_FAILED;
+          }
         }
       }
       retry = xTaskGetTickCount() + pdMS_TO_TICKS(retry_delay_ms);
@@ -538,15 +699,20 @@ bool pet_device_wifi_request(pet_wifi_operation_t operation, const pet_wifi_ap_t
                              const char *password) {
   if (!requests || atomic_load(&reboot_requested)) return false;
   request_t request = {.operation = operation};
+  if (operation == PET_WIFI_CONNECT || operation == PET_WIFI_CONNECT_SAVED || operation == PET_WIFI_FORGET ||
+      operation == PET_WIFI_AUTO_ON || operation == PET_WIFI_AUTO_OFF) {
+    if (!ap || !ap->ssid[0] || ap->security > PET_WIFI_WPA3 ||
+        !memchr(ap->ssid, 0, sizeof(ap->ssid))) return false;
+    request.ap = *ap;
+  }
   if (operation == PET_WIFI_CONNECT) {
-    if (!ap || !password || !ap->ssid[0] || ap->security > PET_WIFI_WPA3) return false;
+    if (!password) return false;
     size_t length = strlen(password);
     if (length >= PET_WIFI_PASSWORD_SIZE - 1 || (ap->security == PET_WIFI_OPEN && length) ||
         (ap->security != PET_WIFI_OPEN && length < 8)) return false;
     memcpy(request.station.ssid, ap->ssid, sizeof(request.station.ssid));
     memcpy(request.station.password, password, length + 1);
     request.station.security = ap->security;
-    request.ap = *ap;
   }
   bool queued = false;
   if (!atomic_exchange(&request_pending, true)) {
@@ -563,8 +729,10 @@ void pet_device_wifi_cancel(void) {
 }
 
 void pet_device_wifi_snapshot(pet_wifi_snapshot_t *snapshot) {
+  const bool pending = atomic_load(&request_pending);
   memset(snapshot, 0, sizeof(*snapshot));
   if (!snapshots) snapshot->status = PET_WIFI_UNAVAILABLE;
   else (void)xQueuePeek(snapshots, snapshot, 0);
+  snapshot->request_pending = pending;
 }
 #endif

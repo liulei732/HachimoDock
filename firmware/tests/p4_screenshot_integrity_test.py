@@ -50,6 +50,11 @@ static char wire[2000000];static size_t used,fail_after=SIZE_MAX;
 static unsigned ticks,drains,fail_drain=UINT32_MAX;
 static bool encoding_error,audio_busy,tx_lock_error,allocation_error;
 static int locks;
+static bool private_frame;
+static bool pet_p4_renderer_frame_is_private(void) {
+  assert(locks == 1);
+  return private_frame;
+}
 static uint16_t framebuffer[640*480];
 static TickType_t xTaskGetTickCount(void){return ticks;}
 static void vTaskDelay(int delay){ticks+=(unsigned)delay;}
@@ -139,6 +144,16 @@ int main(void){
   // Pull mode retains one immutable image and answers only the requested block.
   // Lost/corrupt responses can be re-read; no duplicate capture or mutation.
   const char *pull="{\"topic\":\"debug/screenshot\",\"payload\":{\"fullResolution\":true,\"mode\":\"pull-v1\",\"requestId\":\"offline-1\"}}";
+  const char *capture_requests[] = {command, pull};
+  for (unsigned i = 0; i < sizeof(capture_requests) / sizeof(capture_requests[0]); ++i) {
+    reset();
+    private_frame = true;
+    assert(maybe_handle_debug_line(capture_requests[i], &route));
+    assert(strstr(wire, "hide the Wi-Fi password before capture"));
+    assert(!strstr(wire, "screenshot_begin") && !strstr(wire, "screenshot_chunk"));
+    assert(!g_screenshot.raw && !locks);
+  }
+  private_frame = false;
   reset();assert(maybe_handle_debug_line(pull,&route));
   assert(g_screenshot.raw&&g_screenshot.pull&&drains==1&&!strstr(wire,"screenshot_chunk"));
   char identity[32];snprintf(identity,sizeof(identity),"%s",g_screenshot.id);
@@ -262,6 +277,7 @@ int main(void){
         '#define portEXIT_CRITICAL(m) ((void)pthread_mutex_unlock(m))\n')
     vendor = ROOT / 'tests/vendor/cjson'
     subprocess.run(['cc', '-std=c11', '-D_POSIX_C_SOURCE=200809L', '-Wall', '-Wextra',
+                    '-DPET_P4_SYSTEM_WIFI=1',
                     f'-DPET_P4_SCREENSHOT_CLOSE_ACK={int(close_ack)}',
                     f'-DPET_P4_SERIAL_CONTROL_INTEGRITY={int(integrity)}',
                     f'-DPET_P4_SERIAL_CONTROL_NEGOTIATED={int(negotiated)}',f'-DTEST_FRAMED={int(framed)}',

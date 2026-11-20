@@ -1156,6 +1156,14 @@ static __attribute__((optimize("Os"))) bool maybe_handle_debug_line(const char *
     return true;
   }
 
+#if PET_P4_SYSTEM_WIFI
+  if (pet_p4_renderer_frame_is_private()) {
+    xSemaphoreGive(g_render_mutex);
+    screenshot_release();
+    screenshot_error("", "hide the Wi-Fi password before capture", -1, 0, reply_ctx);
+    return true;
+  }
+#endif
   int src_w = 0;
   int src_h = 0;
   const uint16_t *src = pet_p4_renderer_logical_framebuffer(&src_w, &src_h);
@@ -2354,6 +2362,9 @@ void app_main(void) {
     bool firmware_transfer_active = false;
     bool keep_lcd_awake = false;
     pet_p4_view_model_t render_view = {0};
+#if PET_P4_SYSTEM_WIFI
+    static pet_settings_view_t settings_render;
+#endif
 #if PET_P4_RESET_PHASE_TRACE
     pet_reset_phase_scope_t main_state_phase=pet_reset_phase_enter(PET_PHASE_STATE_WAIT);
 #endif
@@ -2535,8 +2546,7 @@ void app_main(void) {
       render_view.component_loading = pet_p4_miniapp_activation_pending();
 #if PET_P4_SYSTEM_WIFI
       if (!strcmp(render_view.page, PET_SETTINGS_PAGE)) {
-        static pet_settings_view_t settings_render;
-        pet_settings_snapshot(&settings_render);
+        pet_settings_snapshot(&settings_render, now_ms);
         render_view.settings = &settings_render;
       }
 #endif
@@ -2619,6 +2629,9 @@ void app_main(void) {
       esp_err_t err;
       xSemaphoreTake(g_render_mutex, portMAX_DELAY);
       err = pet_p4_renderer_render(g_render_state, &render_view, now_ms);
+#if PET_P4_SYSTEM_WIFI
+      if (render_view.settings) pet_settings_clear_preview(&settings_render);
+#endif
       xSemaphoreGive(g_render_mutex);
       if (err != ESP_OK) {
         ESP_LOGW(TAG, "render failed: %s", esp_err_to_name(err));
