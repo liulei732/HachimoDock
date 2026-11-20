@@ -1,4 +1,5 @@
 /* Track C component media store; see pet_p4_component_media.h. */
+#include "pet_p4_control_size.h"
 #include "pet_p4_component_media.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -219,7 +220,7 @@ bool pet_cmedia_speech_verify_file(size_t slot, uint8_t generation, const char *
   return fclose(f) == 0 && ok;
 }
 #endif
-bool pet_cmedia_stage_chunk(pet_cext_media_kind_t kind, const char *id, uint32_t index, const uint8_t *data, size_t len, char *error, size_t size) {
+PET_P4_CONTROL_SIZE bool pet_cmedia_stage_chunk(pet_cext_media_kind_t kind, const char *id, uint32_t index, const uint8_t *data, size_t len, char *error, size_t size) {
   if (kind < PET_CEXT_MEDIA_SAMPLE || kind > PET_CEXT_MEDIA_BIG || !pet_cev_name_valid(id) || !data || !len || len > kind_budget(kind) || index == UINT32_MAX) { fail(error, size, "invalid component media chunk"); return false; }
   if (!g_stage.arena) g_stage.arena = heap_caps_malloc(PET_CMEDIA_STAGE_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!g_stage.arena) { fail(error, size, "component media staging memory unavailable"); return false; }
@@ -268,7 +269,7 @@ static const cmedia_file_t *staged(pet_cext_media_kind_t kind, const char *id) {
   for (unsigned i = 0; i < g_stage.count; i++) if (g_stage.files[i].kind == kind && !strcmp(g_stage.files[i].id, id) && g_stage.files[i].complete) return &g_stage.files[i];
   return NULL;
 }
-bool pet_cmedia_stage_matches(const pet_cext_runtime_t *r, char *error, size_t size) {
+PET_P4_CONTROL_SIZE bool pet_cmedia_stage_matches(const pet_cext_runtime_t *r, char *error, size_t size) {
   if (!r) return g_stage.count == 0
 #if PET_P4_WASM_AUDIO
       && !g_speech_stage.size
@@ -339,7 +340,7 @@ static bool media_budget_name(const char *name) {
   );
 }
 
-static bool disk_budget_ok(void) {
+PET_P4_CONTROL_SIZE static bool disk_budget_ok(void) {
   size_t total = g_stage.used;
 #if PET_P4_WASM_AUDIO
   total += g_speech_stage.used;
@@ -420,7 +421,7 @@ static bool disk_budget_ok(void) {
   return budget_scan_current(epoch, deadline, 0);
 }
 static bool persist_locked(size_t slot, uint8_t generation, const pet_cext_runtime_t *r);
-bool pet_cmedia_persist(size_t slot, uint8_t generation, const pet_cext_runtime_t *r) {
+PET_P4_CONTROL_SIZE bool pet_cmedia_persist(size_t slot, uint8_t generation, const pet_cext_runtime_t *r) {
   if (slot >= PET_CEV_COMPONENTS || generation > 1 || !pet_cmedia_stage_matches(r, NULL, 0)) return false;
   lock();
   bool ok = !g_pending.serial && disk_budget_ok();
@@ -458,7 +459,7 @@ static bool persist_locked(size_t slot, uint8_t generation, const pet_cext_runti
 #endif
   return true;
 }
-void pet_cmedia_remove(size_t slot) {
+PET_P4_CONTROL_SIZE void pet_cmedia_remove(size_t slot) {
   if (slot >= PET_CEV_COMPONENTS) return;
   lock();
   if (g_pending.serial) { unlock(); return; }
@@ -551,7 +552,7 @@ bool pet_cmedia_load(size_t slot, uint8_t generation, const pet_cext_runtime_t *
   pet_cmedia_ticket_t ticket = {0};
   return pet_cmedia_prepare(slot, generation, r, &ticket) && pet_cmedia_commit(&ticket);
 }
-bool pet_cmedia_prepare(size_t slot, uint8_t generation, const pet_cext_runtime_t *r, pet_cmedia_ticket_t *ticket) {
+PET_P4_CONTROL_SIZE bool pet_cmedia_prepare(size_t slot, uint8_t generation, const pet_cext_runtime_t *r, pet_cmedia_ticket_t *ticket) {
   if (!ticket || ticket->serial || slot >= PET_CEV_COMPONENTS || generation > 1) return false;
   bool ok = true; char path[32];
   lock();
@@ -651,7 +652,7 @@ bool pet_cmedia_prepare(size_t slot, uint8_t generation, const pet_cext_runtime_
 static bool ticket_current(const pet_cmedia_ticket_t *ticket) {
   return ticket && ticket->serial && ticket->serial == g_pending.serial && ticket->generation == g_pending.generation && ticket->generation == g_generation;
 }
-bool pet_cmedia_commit(pet_cmedia_ticket_t *ticket) {
+PET_P4_CONTROL_SIZE bool pet_cmedia_commit(pet_cmedia_ticket_t *ticket) {
   lock();
   if (!ticket_current(ticket)) { unlock(); return false; }
   unsigned previous = g_current;

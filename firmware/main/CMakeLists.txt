@@ -32,6 +32,7 @@ idf_component_register(
     "pet_p4_lcd.c"
     "pet_p4_assets.c"
     "pet_p4_audio.c"
+    "pet_p4_voice_feedback.c"
     "pet_p4_audio_patch.c"
     "pet_p4_instrument_core.c"
     "pet_p4_sfx_core.c"
@@ -477,7 +478,7 @@ set_property(SOURCE "${hosted_rpc_dir}/common/proto/esp_hosted_rpc.pb-c.c"
   TARGET_DIRECTORY ${hosted_rpc_lib} APPEND PROPERTY COMPILE_OPTIONS "-fmerge-all-constants")
 endif()
 
-set_property(SOURCE "ble_budget_probe.c" "pet_p4_protocol.c" "pet_p4_component_ext.c"
+set_property(SOURCE "pet_p4_voice_feedback.c" "ble_budget_probe.c" "pet_p4_protocol.c" "pet_p4_component_ext.c"
   "pet_p4_side_scene.c" "pet_p4_wifi_data_sources.c" "pet_p4_renderer.c"
   APPEND PROPERTY COMPILE_OPTIONS "-Oz")
 

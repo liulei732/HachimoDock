@@ -3267,6 +3267,7 @@ __attribute__((optimize("Oz"))) void pet_p4_send_hello_for_board(const char *boa
   cJSON_AddNumberToObject(capabilities,"widgetServiceBridgeImageSide",192);
 #endif
   cJSON_AddStringToObject(capabilities,"widgetAppNavigation","p4-app-navigation-v1");
+  cJSON_AddStringToObject(capabilities,"voiceFeedback","p4-voice-feedback-v1");
   cJSON_AddStringToObject(capabilities,"widgetActivation","p4-widget-activation-v1");
 #if PET_P4_STORAGE_PRESERVE_UNCHANGED
   cJSON_AddStringToObject(capabilities,"widgetPreserveUnchanged","p4-preserve-unchanged-v1");
@@ -4335,6 +4336,27 @@ bool pet_p4_handle_line_with_reply(
   } else if (strncmp(topic, "state/", 6) == 0) {
     handle_state_topic(state, topic, payload);
     send_protocol_ack_if_requested(send_line, ctx, topic, payload);
+  } else if (strcmp(topic, "ui/voice-feedback") == 0) {
+    uint64_t now = (uint64_t)esp_timer_get_time() / 1000;
+    pet_p4_audio_feedback_sync(state, now);
+    const uint64_t revision = json_u64(payload, "revision", UINT64_MAX);
+    if (!strcmp(json_string(payload, "boardDeviceId"), state->board_device_id)
+        && g_boot_identity.ready && !strcmp(json_string(payload, "bootId"), g_boot_identity.id)
+        && revision != UINT64_MAX
+        && strlen(json_string(payload, "text")) < PET_VOICE_TEXT_BYTES
+        && strlen(json_string(payload, "hint")) < sizeof(state->voice_feedback.hint)) {
+      if (pet_voice_feedback_update(&state->voice_feedback,
+            json_string(payload, "captureId"), json_string(payload, "utteranceId"),
+            revision, json_string(payload, "phase"),
+            json_string(payload, "text"), json_string(payload, "hint"), now)) {
+        state->voice_feedback.draft_inserted = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(payload, "draftInserted"));
+        const char *failure = json_string(payload, "failureStage");
+        state->voice_feedback.failure_stage = !strcmp(failure, "recognition") ? PET_VOICE_FAILURE_RECOGNITION
+          : !strcmp(failure, "insertion") ? PET_VOICE_FAILURE_INSERTION
+          : !strcmp(failure, "submission") ? PET_VOICE_FAILURE_SUBMISSION : PET_VOICE_FAILURE_UNSPECIFIED;
+        state->last_update_ms += 1;
+      }
+    }
   } else if (strcmp(topic, "ui/text-pixels") == 0) {
     cJSON *reply = cJSON_CreateObject();
     if (reply) {

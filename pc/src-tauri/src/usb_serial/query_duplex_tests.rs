@@ -69,6 +69,38 @@ fn diagnostic_query_manager_keeps_rx_and_resumes_only_unwritten_suffix() {
 }
 
 #[test]
+fn voice_feedback_after_release_keeps_rx_and_never_drains() {
+    let (manager, state) = manager(false, true);
+    manager.connection.lock().unwrap().as_mut().unwrap().capabilities = serde_json::json!({
+        "voiceFeedback": crate::device_voice_feedback::ENGINE, "debugBootId": "boot-current",
+    });
+    let payload = serde_json::json!({
+        "boardDeviceId": "p4-memory", "bootId": "boot-current", "phase": "submitted",
+        "captureId": "capture", "utteranceId": "utterance", "revision": 1,
+    });
+    manager.send_voice_feedback_for_connection("p4-memory", 1, &payload).unwrap();
+    let state = state.lock().unwrap();
+    assert_eq!(state.flushes, 0);
+    assert!(!state.transient_after_prefix);
+    let frame: serde_json::Value = serde_json::from_slice(&state.bytes).unwrap();
+    assert_eq!(frame["topic"], "ui/voice-feedback");
+    assert_eq!(frame["payload"], payload);
+}
+
+#[test]
+fn voice_feedback_requires_capability_boot_and_current_connection() {
+    let (manager, state) = manager(false, false);
+    let payload = serde_json::json!({"boardDeviceId":"p4-memory", "bootId":"boot"});
+    manager.send_voice_feedback_for_connection("p4-memory", 1, &payload).unwrap();
+    manager.connection.lock().unwrap().as_mut().unwrap().capabilities = serde_json::json!({
+        "voiceFeedback": crate::device_voice_feedback::ENGINE, "debugBootId": "different-boot",
+    });
+    manager.send_voice_feedback_for_connection("p4-memory", 1, &payload).unwrap();
+    manager.send_voice_feedback_for_connection("p4-memory", 2, &payload).unwrap();
+    assert!(state.lock().unwrap().bytes.is_empty());
+}
+
+#[test]
 fn ordinary_mutation_still_pauses_and_keeps_legacy_flush_policy() {
     let (manager, state) = manager(true, false);
     manager.send("widget/activate", &serde_json::json!({"widgetId":"memory-only"})).unwrap();

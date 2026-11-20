@@ -4206,43 +4206,60 @@ static pet_p4_view_status_t session_view_status(const char *status) {
   return PET_P4_VIEW_STATUS_IDLE;
 }
 
-static void draw_voice_waveform(int x, int y, int width, uint16_t color) {
-  static const int heights[] = {4, 7, 11, 16, 9, 5, 8, 13, 6, 4};
-  int cursor = x;
-  int segments = (int) (sizeof(heights) / sizeof(heights[0]));
-  int step = width / segments;
-  for (int i = 0; i < segments; i += 1) {
-    int next = cursor + step;
-    int y1 = y + (i > 0 ? heights[i - 1] : 0);
-    int y2 = y + heights[i];
-    draw_line(cursor, y1, next, y2, color);
-    cursor = next;
+static void draw_voice_waveform(int x, int y, int width, uint16_t color,
+    const pet_voice_feedback_t *feedback) {
+  for (int i = 0; i < PET_VOICE_BARS; ++i) {
+    unsigned level = feedback->bars[i];
+    int h = 3 + (int)level * 20 / 100;
+    fill_round_rect(x + i * width / (PET_VOICE_BARS - 1), y - h / 2, 4, h, 2, color);
   }
 }
 
-static void draw_voice_input_row(int x, int y) {
-  int64_t content_started = esp_timer_get_time();
-  uint16_t ink = rgb565(28, 31, 31);
-  uint16_t muted = rgb565(92, 98, 96);
-  draw_voice_waveform(x + 30, y, 230, rgb565(255, 163, 31));
-  fill_ellipse(x + 288, y + 13, 7, 11, ink);
-  fill_rect(x + 286, y + 22, 5, 7, ink);
-  draw_line(x + 279, y + 18, x + 279, y + 25, ink);
-  draw_line(x + 279, y + 25, x + 297, y + 25, ink);
-  draw_line(x + 297, y + 25, x + 297, y + 18, ink);
-  draw_text_line_vcenter("LISTENING", x + 324, y + 11, 30, 180, muted, 1, true);
-  pet_p4_render_trace_add(&g_render_trace.voice_us,
-    elapsed_us_clamped(content_started, esp_timer_get_time()));
+/* Page long results within the same single line; no taller card or framebuffer. */
+static const char *voice_text_page(const char *text, uint64_t elapsed, int width) {
+  const char *pages[32] = {text};
+  unsigned count = 1;
+  int used = 0;
+  const char *cursor = text;
+  while (*cursor && count < 32) {
+    const char *next = cursor;
+    uint32_t cp = utf8_next(&next);
+    int advance = medium_glyph_width(cp, utf8_peek(next)) + 1;
+    if (used + advance > width) { pages[count++] = cursor; used = 0; }
+    used += advance; cursor = next;
+  }
+  unsigned page = (unsigned)(elapsed / 3000) % count;
+  return pages[page];
 }
 
-static void draw_standalone_voice_overlay(void) {
+static void draw_standalone_voice_overlay(const pet_p4_runtime_state_t *state,
+    uint64_t now_ms) {
   const int height = 76;
   const int x = PET_P4_SESSION_CARD_X;
   const int y = PET_P4_SESSION_CARD_BOTTOM - height;
+  const pet_voice_feedback_t *v = &state->voice_feedback;
+  bool failed = v->phase >= PET_VOICE_ERROR;
+  uint16_t accent = failed ? rgb565(188, 92, 32) : rgb565(25, 151, 99);
   draw_session_card_panel(x, y, PET_P4_SESSION_CARD_WIDTH, height,
     PET_P4_SESSION_CARD_RADIUS, true, rgb565(216, 221, 218));
-  fill_round_rect(x + 10, y + 14, 7, height - 28, 2, rgb565(25, 151, 99));
-  draw_voice_input_row(x, y + 18);
+  fill_round_rect(x + 10, y + 14, 5, height - 28, 2, accent);
+  bool recording = v->phase == PET_VOICE_LISTENING || v->phase == PET_VOICE_IDLE;
+  const char *title = failed && v->hint[0] ? v->hint : pet_voice_feedback_title(v);
+  draw_text_line(title, x + 25, y + 12, recording ? 110 : 500, accent, 1, true);
+  if (recording) {
+    draw_voice_waveform(x + 136, y + 23, 330, accent, v);
+    char timer[24];
+    unsigned elapsed = v->started_ms && now_ms >= v->started_ms ? (unsigned)(now_ms - v->started_ms) : 0;
+    snprintf(timer, sizeof(timer), "%u.%us", elapsed / 1000, elapsed / 100 % 10);
+    draw_text_line(timer, x + 487, y + 12, 55, rgb565(92, 98, 96), 1, true);
+  } else if (v->phase == PET_VOICE_DRAFT) {
+    draw_text_line("短按语音键发送", x + 350, y + 12, 185, rgb565(92, 98, 96), 1, true);
+  }
+  const char *body = v->text[0] ? v->text : recording ? "按住语音键说话，松开后识别"
+    : v->phase == PET_VOICE_RECOGNIZING ? "等待最终识别结果..." : "请查看电脑端后重试";
+  uint64_t elapsed = now_ms >= v->text_changed_ms ? now_ms - v->text_changed_ms : 0;
+  draw_text_line_medium(voice_text_page(body, elapsed, 506), x + 25, y + 39,
+    506, rgb565(28, 31, 31), false);
 }
 
 static void session_text(const char *agent, const pet_p4_session_queue_item_t *item, uint64_t now_ms,
@@ -4316,11 +4333,7 @@ static void draw_session_queue_uncached(
     }
     draw_bubble_card_title(&text, x + 30, y + 10, w - 82, ink);
 
-    if (is_selected && state->session_voice_active) {
-      draw_voice_input_row(x, y + 62);
-    } else {
-      draw_card_body_lines(text.body, x + 30, y + 50, w - 60, muted, &text);
-    }
+    draw_card_body_lines(text.body, x + 30, y + 50, w - 60, muted, &text);
     pet_bubble_pixels_release(&text);
   }
   pet_p4_render_trace_add(&g_render_trace.session_cache_draw_us,
@@ -4348,7 +4361,6 @@ static uint64_t session_overlay_signature(const pet_p4_runtime_state_t *state) {
   hash = session_cache_hash_text(hash, state->current_session_agent);
   hash = session_cache_hash_bytes(hash, &state->session_queue_count, sizeof(state->session_queue_count));
   hash = session_cache_hash_bytes(hash, &state->current_session_index, sizeof(state->current_session_index));
-  hash = session_cache_hash_bytes(hash, &state->session_voice_active, sizeof(state->session_voice_active));
   unsigned int selected, start, visible;
   session_overlay_visible_window(state, &selected, &start, &visible);
   (void)selected; /* current_session_index above retains its complete dependency. */
@@ -7810,7 +7822,8 @@ esp_err_t pet_p4_renderer_render(
 #endif
   } else {
     bool realtime = view && view->realtime_conversation;
-    bool show_session_queue = !realtime && state && state->session_queue_count > 0;
+    bool show_session_queue = !realtime && state && state->session_queue_count > 0
+      && !(view && view->show_voice_overlay);
     int64_t asset_started_us = esp_timer_get_time();
     bool drew_asset = component_media_idle
       && render_asset_pet_frame(state, view, now_ms, &presented_video_frame, &prefetched_tail);
@@ -7835,9 +7848,9 @@ esp_err_t pet_p4_renderer_render(
     /* Appearance and its overlays enter the same logical/LCD frame. While the
      * first decode is queued, retain the previous page without an early bubble. */
     if(g_main_appearance_ready){
-      if (view && view->show_voice_overlay) draw_standalone_voice_overlay();
+      if (view && view->show_voice_overlay) draw_standalone_voice_overlay(state, now_ms);
       else if (!show_session_queue) draw_bubble(state, view, now_ms);
-      if (!realtime) draw_session_queue(state, now_ms);
+      if (!realtime && !(view && view->show_voice_overlay)) draw_session_queue(state, now_ms);
       else g_session_overlay_cache_valid = false;
     }else g_session_overlay_cache_valid=false;
   }

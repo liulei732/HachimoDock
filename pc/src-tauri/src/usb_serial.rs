@@ -3165,6 +3165,24 @@ impl UsbSerialManager {
         self.send_inner(topic, payload, true, Some(board), Some(generation), None)
     }
 
+    pub(crate) fn send_voice_feedback_for_connection(
+        &self, board: &str, generation: u64, payload: &serde_json::Value,
+    ) -> Result<(), String> {
+        if generation == 0 || payload["boardDeviceId"] != board {
+            return Err("invalid voice feedback scope".into());
+        }
+        {
+            let connection = self.connection.lock().map_err(|_| "connection unavailable")?;
+            let Some(conn) = connection.as_ref() else { return Ok(()); };
+            if conn.connection_id != generation || conn.board_device_id != board
+                || conn.capabilities["voiceFeedback"].as_str() != Some(crate::device_voice_feedback::ENGINE)
+                || payload["bootId"] != conn.capabilities["debugBootId"] {
+                return Ok(());
+            }
+        }
+        self.send_inner("ui/voice-feedback", payload, true, Some(board), Some(generation), None)
+    }
+
     pub(crate) fn send_audio_bridge_command_for_connection(
         &self,
         expected_board_device_id: &str,
@@ -3448,7 +3466,7 @@ impl UsbSerialManager {
         // Replaceable widget snapshots share the audio-safe paced path. A
         // driver's blocking drain can otherwise hold the mutex indefinitely
         // even after media itself stopped using flush()/tcdrain().
-        let live_frame = audio_frame || topic == "widget/data" || topic == "app/snapshot" || topic == "ui/text-pixels"
+        let live_frame = audio_frame || topic == "widget/data" || topic == "app/snapshot" || topic == "ui/text-pixels" || topic == "ui/voice-feedback"
             || (!bulk_frame && conn.capture_active.load(Ordering::Acquire));
         // Heartbeats must keep RX running and recover only the unwritten
         // suffix, just like live frames. A busy device is not a dead handle.

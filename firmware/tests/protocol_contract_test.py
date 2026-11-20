@@ -1113,7 +1113,7 @@ def test_p4_conversation_queue_is_synced_and_rendered_with_pixel_ellipsis():
     assert "draw_session_queue(state, now_ms)" in renderer
     assert "tray_y" not in renderer
     assert "draw_voice_waveform" in renderer
-    assert "state->session_voice_active" in renderer
+    assert "state->session_voice_active" in view
     assert "item->title," in renderer
     assert "item->content[0] ? item->content : item->state" in renderer
     assert 'json_string(session, "content")' in protocol
@@ -1203,7 +1203,7 @@ def test_p4_conversation_queue_is_synced_and_rendered_with_pixel_ellipsis():
     assert "pet_p4_view_status_t marker_status = session_view_status(item->state)" in renderer
     assert "draw_working_markers || marker_status != PET_P4_VIEW_STATUS_WORKING" in renderer
     assert "draw_status_marker(marker_status, now_ms, x + w - 26, y + 26)" in renderer
-    assert "bool show_session_queue = !realtime && state && state->session_queue_count > 0;" in renderer
+    assert "bool show_session_queue = !realtime && state && state->session_queue_count > 0\n      && !(view && view->show_voice_overlay);" in renderer
     assert "bool needs_ellipsis = ellipsis && utf8_text_width(cursor, -1, scale) > max_px" in renderer
     assert "bool needs_ellipsis = ellipsis && utf8_text_width_medium(cursor) > max_px" in renderer
     assert "static bool glyph_visual_bounds(" in renderer

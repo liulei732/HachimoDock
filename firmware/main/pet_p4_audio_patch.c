@@ -2,6 +2,7 @@
  * are named by this module. Each slot has two bounded override banks. A new
  * bank's checksummed index is written LAST; incomplete staging is never live.
  * No replace-rename assumption: SPIFFS index generations select a valid bank. */
+#include "pet_p4_control_size.h"
 #include "pet_p4_audio_patch.h"
 #include "esp_attr.h"
 #include <errno.h>
@@ -83,7 +84,7 @@ static bool index_path(int slot,int bank,char *out,size_t n){int used=snprintf(o
 static bool close_written(FILE *f){bool ok=fflush(f)==0;if(ok&&PET_AUDIO_PATCH_SYNC(fileno(f))!=0)ok=false;if(fclose(f)!=0)ok=false;return ok;}
 static bool remove_one(const char *p,bool *attempted){*attempted=true;errno=0;return PET_AUDIO_PATCH_REMOVE(p)==0||errno==ENOENT;}
 static bool clear_bank(int slot,int bank,bool *attempted){char p[64];if(!index_path(slot,bank,p,sizeof(p)))return false;if(!remove_one(p,attempted))return false;for(unsigned i=0;i<PET_AUDIO_PATCH_MAX_FILES;i++){if(!file_path(slot,bank,i,p,sizeof(p))||!remove_one(p,attempted))return false;}return true;}
-static index_result_t read_index(int slot,int bank,patch_plan_t *out){
+PET_P4_CONTROL_SIZE static index_result_t read_index(int slot,int bank,patch_plan_t *out){
   char p[64];if(!index_path(slot,bank,p,sizeof(p)))return INDEX_INVALID;
   errno=0;FILE *f=PET_AUDIO_PATCH_INDEX_OPEN(p,"rb");
   if(!f)return errno==ENOENT?INDEX_ABSENT:INDEX_IO_UNKNOWN;
@@ -107,7 +108,7 @@ static index_result_t read_index(int slot,int bank,patch_plan_t *out){
   }
   return INDEX_VALID;
 }
-static bool latest(int slot,int *bank,uint32_t *generation){
+PET_P4_CONTROL_SIZE static bool latest(int slot,int *bank,uint32_t *generation){
   bool found=false;uint32_t best=0;int selected=-1;
   for(int b=0;b<2;b++){
     index_result_t result=read_index(slot,b,&scratch);
@@ -126,7 +127,7 @@ void pet_audio_patch_global_refresh(void){
       &&!strcmp(scratch.pack,PET_AUDIO_PATCH_GLOBAL_PACK))mask=global_plan_mask(&scratch);
   atomic_store_explicit(&global_family_mask,mask,memory_order_release);
 }
-bool pet_audio_patch_begin(int slot,const char *pack,const cJSON *files,uint32_t total,bool *attempted){
+PET_P4_CONTROL_SIZE bool pet_audio_patch_begin(int slot,const char *pack,const cJSON *files,uint32_t total,bool *attempted){
   if(pending.active||slot<0||slot>PET_AUDIO_PATCH_GLOBAL_SLOT||!hex(pack,64)||!cJSON_IsArray(files)||total>PET_AUDIO_PATCH_MAX_BYTES)return false;
   int count=cJSON_GetArraySize(files);if(count<0||count>(int)PET_AUDIO_PATCH_MAX_FILES)return false;
   memset(&pending,0,sizeof(pending));pending.slot=slot;pending.count=(uint32_t)count;memcpy(pending.pack,pack,65);
@@ -147,7 +148,7 @@ bool pet_audio_patch_begin(int slot,const char *pack,const cJSON *files,uint32_t
   return clear_bank(slot,pending.bank,attempted);
 }
 static patch_file_t *find_file(const char *path,unsigned *index){for(unsigned i=0;i<pending.count;i++)if(!strcmp(pending.files[i].path,path)){if(index)*index=i;return &pending.files[i];}return NULL;}
-bool pet_audio_patch_chunk(const char *path,uint32_t index,uint32_t offset,const uint8_t *bytes,size_t n,bool *attempted){
+PET_P4_CONTROL_SIZE bool pet_audio_patch_chunk(const char *path,uint32_t index,uint32_t offset,const uint8_t *bytes,size_t n,bool *attempted){
   unsigned at=0;patch_file_t *entry=find_file(path,&at);
   if(!pending.active||pending.publication_attempted||!entry||!bytes||!n||n>PET_AUDIO_PATCH_CHUNK_BYTES||index!=entry->index||offset!=entry->received||n>entry->size-entry->received)return false;
   char p[64];if(!file_path(pending.slot,pending.bank,at,p,sizeof(p)))return false;
@@ -182,7 +183,7 @@ static bool wav_exact(const char *path,const patch_file_t *entry){
   }
   ok=ok&&format&&data&&offset==entry->size;if(fclose(f)!=0)ok=false;return ok;
 }
-bool pet_audio_patch_commit(bool *attempted,uint32_t *generation){
+PET_P4_CONTROL_SIZE bool pet_audio_patch_commit(bool *attempted,uint32_t *generation){
   if(!pending.active||pending.publication_attempted)return false;
   char p[64];
   for(unsigned i=0;i<pending.count;i++){
@@ -203,10 +204,10 @@ bool pet_audio_patch_commit(bool *attempted,uint32_t *generation){
 }
 bool pet_audio_patch_abort(bool *attempted){if(!pending.active||pending.publication_attempted)return false;return clear_bank(pending.slot,pending.bank,attempted);}
 void pet_audio_patch_retire(void){memset(&pending,0,sizeof(pending));}
-bool pet_audio_patch_progress(const char *path,uint32_t *index,uint32_t *bytes){patch_file_t *entry=find_file(path,NULL);if(!pending.active||!entry)return false;*index=entry->index;*bytes=entry->received;return true;}
+PET_P4_CONTROL_SIZE bool pet_audio_patch_progress(const char *path,uint32_t *index,uint32_t *bytes){patch_file_t *entry=find_file(path,NULL);if(!pending.active||!entry)return false;*index=entry->index;*bytes=entry->received;return true;}
 unsigned pet_audio_patch_file_count(void){return pending.count;}
 uint32_t pet_audio_patch_total_bytes(void){return pending.total;}
-bool pet_audio_patch_resolve(int slot,const char *pack,const char *family,char *out,size_t n){
+PET_P4_CONTROL_SIZE bool pet_audio_patch_resolve(int slot,const char *pack,const char *family,char *out,size_t n){
   if(slot<0||slot>PET_AUDIO_PATCH_GLOBAL_SLOT||!hex(pack,64)||!family_valid(family)||!out||n<32)return false;
   int bank;uint32_t generation;if(!latest(slot,&bank,&generation)||bank<0||read_index(slot,bank,&scratch)!=INDEX_VALID||strcmp(scratch.pack,pack))return false;
   for(unsigned i=0;i<scratch.count;i++)if(!strcmp(scratch.files[i].family,family))return file_path(slot,bank,i,out,n);
