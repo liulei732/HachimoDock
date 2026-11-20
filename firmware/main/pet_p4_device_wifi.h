@@ -4,12 +4,13 @@
 #include <stdint.h>
 
 #define PET_WIFI_AP_MAX 24
+#define PET_WIFI_SAVED_MAX 6
 #define PET_WIFI_SSID_SIZE 33
 #define PET_WIFI_PASSWORD_SIZE 65
 
 typedef enum {
   PET_WIFI_IDLE, PET_WIFI_SCANNING, PET_WIFI_CONNECTING, PET_WIFI_CONNECTED,
-  PET_WIFI_FAILED, PET_WIFI_UNAVAILABLE,
+  PET_WIFI_FAILED, PET_WIFI_UNAVAILABLE, PET_WIFI_LIST_FULL,
 } pet_wifi_status_t;
 
 typedef enum {
@@ -25,15 +26,30 @@ typedef struct {
 } pet_wifi_ap_t;
 
 typedef struct {
+  char ip[16], gateway[16];
+  int8_t rssi;
+  uint8_t channel, security;
+} pet_wifi_connection_t;
+
+typedef struct {
+  char ssid[PET_WIFI_SSID_SIZE];
+  uint8_t security;
+  bool current, auto_join;
+} pet_wifi_saved_network_t;
+
+typedef struct {
   pet_wifi_status_t status;
-  uint8_t count;
+  uint8_t count, join_stage;
   uint16_t join_reason;
-  bool saved;
+  uint8_t saved_count;
+  bool saved_update_failed, request_pending;
+  pet_wifi_saved_network_t saved[PET_WIFI_SAVED_MAX];
   char connected[PET_WIFI_SSID_SIZE];
+  pet_wifi_connection_t connection;
   pet_wifi_ap_t aps[PET_WIFI_AP_MAX];
 } pet_wifi_snapshot_t;
 
-typedef enum { PET_WIFI_SCAN, PET_WIFI_CONNECT, PET_WIFI_FORGET, PET_WIFI_START } pet_wifi_operation_t;
+typedef enum { PET_WIFI_SCAN, PET_WIFI_CONNECT, PET_WIFI_FORGET, PET_WIFI_START, PET_WIFI_DETAILS, PET_WIFI_CONNECT_SAVED, PET_WIFI_AUTO_ON, PET_WIFI_AUTO_OFF } pet_wifi_operation_t;
 
 #if PET_P4_SYSTEM_WIFI
 typedef enum {

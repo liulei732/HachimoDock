@@ -7707,6 +7707,14 @@ void pet_p4_renderer_finish_boot(void) {
   g_rendering_boot = false;
 }
 
+#if PET_P4_SYSTEM_WIFI
+static bool g_wifi_password_in_frame;
+
+bool pet_p4_renderer_frame_is_private(void) {
+  return g_wifi_password_in_frame;
+}
+#endif
+
 esp_err_t pet_p4_renderer_render(
   const pet_p4_runtime_state_t *state,
   const pet_p4_view_model_t *view,
@@ -7815,8 +7823,16 @@ esp_err_t pet_p4_renderer_render(
     g_last_approval_visible = approval_visible;
   }
 #if PET_P4_SYSTEM_WIFI
-  if (view && view->settings && !strcmp(page, PET_SETTINGS_PAGE)) {
+  const bool settings_frame = view && view->settings && !strcmp(page, PET_SETTINGS_PAGE);
+  if (g_wifi_password_in_frame && !settings_frame) {
+    // Settings draws the full canvas. Other pages may leave old pixels untouched.
+    fill_rect(24, PET_SETTINGS_PASSWORD_TOP, 592,
+              PET_SETTINGS_PASSWORD_BOTTOM - PET_SETTINGS_PASSWORD_TOP, 0);
+    g_wifi_password_in_frame = false;
+  }
+  if (settings_frame) {
     render_settings_page(view->settings);
+    g_wifi_password_in_frame = view->settings->password_visible && view->settings->password_length;
   } else
 #endif
   if (strcmp(page, "components") == 0) {
@@ -8029,6 +8045,9 @@ esp_err_t pet_p4_renderer_render_transfer_status(
     : "正在传输并校验形象素材";
 
   fill_rect(0, 0, PET_P4_UI_WIDTH, PET_P4_UI_HEIGHT, background);
+#if PET_P4_SYSTEM_WIFI
+  g_wifi_password_in_frame = false;
+#endif
   fill_round_rect_outline(64, 102, 512, 276, 20, panel, outline);
   fill_ellipse(320, 170, 30, 30, orange);
   fill_ellipse(320, 170, 15, 15, panel);
