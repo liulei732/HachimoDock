@@ -397,7 +397,7 @@ int main(void) {
   assert(!pet_settings_active(&state));
   private_source = true;
   pet_settings_maintain(&state, false);
-  pet_settings_snapshot(&view);
+  pet_settings_snapshot(&view, 0);
   assert(pet_settings_active(&state) && view.screen == PET_SETTINGS_FEED);
   pet_settings_input(&state, PET_SETTINGS_BACK, 18);
   pet_settings_maintain(&state, false);
