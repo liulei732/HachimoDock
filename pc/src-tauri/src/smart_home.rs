@@ -580,7 +580,7 @@ impl Home {
         let mut status = "completed";
         self.saved.records.insert(
             0,
-            json!({"id":p["id"],"title":p["title"],"at":started,"status":"running","results":[]}),
+            json!({"id":p["id"],"title":p["title"],"at":started,"status":"running","steps":p["steps"],"results":[]}),
         );
         self.saved.records.truncate(50);
         self.save()?;
@@ -605,7 +605,7 @@ impl Home {
             self.save()?;
         }
         let record =
-            json!({"id":p["id"],"title":p["title"],"at":started,"status":status,"results":rows});
+            json!({"id":p["id"],"title":p["title"],"at":started,"status":status,"steps":p["steps"],"results":rows});
         self.saved.records[0] = record.clone();
         self.save()?;
         Ok(record)

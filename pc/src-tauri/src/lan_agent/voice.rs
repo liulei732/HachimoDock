@@ -98,7 +98,7 @@ fn capture(app: &tauri::AppHandle, route: &Route, token: u32) -> Option<Capture>
     let boot = route.target.boot_id();
     let utterance_id = uuid::Uuid::new_v4().to_string();
     start_device_voice_context(app, board, &utterance_id, &utterance_id, "", boot,
-        queue_empty, Some(route.clone()));
+        queue_empty, Some(route.clone()), None);
     let context = active_device_voice_context().lock().ok()
         .and_then(|current| current.as_ref().filter(|context| context.utterance_id == utterance_id).cloned())?;
 

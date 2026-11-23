@@ -11,7 +11,7 @@ async function fixture(t){
  globalThis.__audioFsFixture=fs;
  const code=original.replace(/import \{([^}]+)\} from '@tauri-apps\/plugin-fs';/, 'const {$1}=globalThis.__audioFsFixture;').replace("'./avatar-pipeline/families.js'",JSON.stringify(new URL('./avatar-pipeline/families.js',import.meta.url).href));
  const module=await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}#${Math.random()}`);
- return {files,calls,module};
+ return {files,calls,module,storage};
 }
 const mapPath='global-audio-cues/audio-overrides.json';
 const wav=new Uint8Array(46).fill(7);
@@ -42,8 +42,13 @@ test('invalid maps and state names fail before writing',async t=>{
 test('an older send acknowledgement cannot clear a newer sound edit',async t=>{
  const f=await fixture(t);await f.module.saveGlobalAudioCue('done',wav);
  const revision=f.module.globalAudioRevision();await f.module.saveGlobalAudioCue('error',wav);
- f.module.markGlobalAudioDirty(false,revision);assert(f.module.globalAudioDirty());
- f.module.markGlobalAudioDirty(false,f.module.globalAudioRevision());assert(!f.module.globalAudioDirty());
+ assert.equal(f.module.confirmGlobalAudio('board-a',revision),false);
+ assert(f.module.globalAudioDirty('board-a'));
+ assert(f.module.confirmGlobalAudio('board-a',f.module.globalAudioRevision()));
+ assert(!f.module.globalAudioDirty('board-a'));
+ assert(f.module.globalAudioDirty('board-b'));
+ await f.module.removeGlobalAudioCue('done');
+ assert(f.module.globalAudioDirty('board-a'));
 });
 
 test('sound edits also work when a webview lacks randomUUID',async t=>{
@@ -51,4 +56,30 @@ test('sound edits also work when a webview lacks randomUUID',async t=>{
  Object.defineProperty(globalThis,'crypto',{configurable:true,value:{}});
  t.after(()=>{if(previous)Object.defineProperty(globalThis,'crypto',previous);else delete globalThis.crypto;});
  const f=await fixture(t);await f.module.saveGlobalAudioCue('done',wav);assert(f.module.globalAudioDirty());
+});
+
+test('legacy dirty tokens carry forward; a missing legacy token proves no board receipt',async t=>{
+ const {module,storage}=await fixture(t);
+ for (const token of [null,'previous-editor-token']) {
+  if (token) storage.set('pet-manager.global-audio-cues-dirty',token);
+  const revision=module.globalAudioRevision();
+  assert.equal(revision,token||'initial');
+  assert(module.globalAudioDirty('a'));assert(module.globalAudioDirty('b'));
+  assert(module.confirmGlobalAudio('a',revision));
+  assert.equal(module.globalAudioRevision(),revision);assert(!module.globalAudioDirty('a'));
+  assert(module.globalAudioDirty('b'));
+ }
+});
+
+test('replacing an existing WAV commits a new version without rewriting its map',async t=>{
+ const {module,calls}=await fixture(t);
+ await module.saveGlobalAudioCue('done',wav);
+ const revision=module.globalAudioRevision();
+ assert(module.confirmGlobalAudio('a',revision));
+ calls.length=0;
+ const updated=wav.map(x=>x+1);
+ await module.saveGlobalAudioCue('done',updated);
+ assert.deepEqual(await module.readGlobalAudioCue('done'),updated);
+ assert(!calls.some(([action])=>action==='writeTextFile'));
+ assert(module.globalAudioDirty('a'));assert.notEqual(module.globalAudioRevision(),revision);
 });

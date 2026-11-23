@@ -72,12 +72,27 @@ export function isKeyboardChordSupported(chord, extended) {
   return usage === 0 || BLUETOOTH_KEYBOARD_KEYS.some(key => key.usage === usage);
 }
 
+// keyboard/config-state returns the full device map after reading or writing NVS.
+export function verifiedKeyboardState(state, board, change = {}) {
+  if (!board || state?.ok !== true || state.boardDeviceId !== board ||
+      [state.enabled, state.connected, state.paired, state.pairing].some(value => typeof value !== "boolean") ||
+      !Number.isInteger(state.radioState) || !Array.isArray(state.keys) || state.keys.length !== 20 ||
+      !state.keys.every(key => Number.isInteger(key) && key >= 0 && key <= 0xffff)) {
+    throw new Error("设备未返回完整的蓝牙键盘配置，请重新读取。");
+  }
+  if (("slot" in change && state.keys[change.slot] !== change.chord) ||
+      ("enabled" in change && state.enabled !== change.enabled)) {
+    throw new Error("设备回读与本次修改不同，请核对后再保存。");
+  }
+  return state;
+}
+
 const keyboardSnapshotKey = "hachimidock.bluetooth-keyboard.last-config";
 
 export function readKeyboardSnapshot(board) {
   try {
     const snapshot = JSON.parse(globalThis.localStorage.getItem(keyboardSnapshotKey));
-    return snapshot?.board && (!board || snapshot.board === board) && Array.isArray(snapshot.keys)
+    return board && snapshot?.board === board && Array.isArray(snapshot.keys)
       ? snapshot
       : null;
   } catch {

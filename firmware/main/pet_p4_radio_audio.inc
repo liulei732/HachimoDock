@@ -1,6 +1,15 @@
 /* Include from pet_p4_audio.c after the stream and music functions. These
  * helpers serialize ownership verification with producer writes and voice
  * takeover, using the audio owner's existing recursive stream lock. */
+bool pet_p4_audio_music_flush_if_owner(const char *session_id) {
+  if (!g_stream_lock || !session_id || !session_id[0]) return false;
+  xSemaphoreTakeRecursive(g_stream_lock, portMAX_DELAY);
+  bool owned = atomic_load(&g_music) && !strcmp(session_id, g_stream_session);
+  if (owned) pet_p4_audio_stream_flush();
+  xSemaphoreGiveRecursive(g_stream_lock);
+  return owned;
+}
+
 #if PET_P4_SYSTEM_WIFI
 #include "pet_p4_radio_audio.h"
 
@@ -16,15 +25,6 @@ esp_err_t pet_p4_audio_music_push_if_owner(const char *session_id, const uint8_t
     ? pet_p4_audio_stream_push(pcm, length) : ESP_ERR_INVALID_STATE;
   xSemaphoreGiveRecursive(g_stream_lock);
   return result;
-}
-
-bool pet_p4_audio_music_flush_if_owner(const char *session_id) {
-  if (!g_stream_lock) return false;
-  xSemaphoreTakeRecursive(g_stream_lock, portMAX_DELAY);
-  bool owned = radio_music_owner_locked(session_id);
-  if (owned) pet_p4_audio_stream_flush();
-  xSemaphoreGiveRecursive(g_stream_lock);
-  return owned;
 }
 
 bool pet_p4_audio_music_end_if_owner(const char *session_id) {

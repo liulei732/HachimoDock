@@ -9,7 +9,7 @@ use std::{
     net::TcpStream,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
-        mpsc, Arc, Mutex,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -33,10 +33,30 @@ struct PendingPlayback {
     pcm: Zeroizing<Vec<u8>>,
 }
 
+// Preparing binds the socket to a display session. Final captions must stay in
+// order. Transient phase/text updates can replace one another between finals.
+fn queue_hud(queue: &mut VecDeque<Zeroizing<Vec<u8>>>, body: Zeroizing<Vec<u8>>) -> bool {
+    fn transient(body: &[u8]) -> bool { (1..=3).contains(&body[0]) && body[1] & 2 == 0 }
+    if transient(&body) && queue.back().is_some_and(|last| transient(last)) {
+        queue.pop_back();
+    }
+    if queue.len() == 8 {
+        if let Some(index) = queue.iter().position(|entry| transient(entry)) {
+            queue.remove(index);
+        } else {
+            return transient(&body); // Only replaceable progress may be discarded.
+        }
+    }
+    queue.push_back(body);
+    true
+}
+
 #[derive(Default)]
 struct Turn {
     number: u32,
     id: String,
+    pending: VecDeque<PendingPlayback>,
+    open: bool,
 }
 
 pub(super) struct Link {
@@ -47,7 +67,6 @@ pub(super) struct Link {
     hud: Mutex<VecDeque<Zeroizing<Vec<u8>>>>,
     terminal_hud: Mutex<Option<Zeroizing<Vec<u8>>>>,
     retired: AtomicU32,
-    sender: Mutex<Option<mpsc::SyncSender<PendingPlayback>>>,
     turn: Mutex<Turn>,
 }
 
@@ -61,7 +80,6 @@ impl Link {
             hud: Mutex::new(VecDeque::new()),
             terminal_hud: Mutex::new(None),
             retired: AtomicU32::new(0),
-            sender: Mutex::new(None),
             turn: Mutex::new(Turn::default()),
         }
     }
@@ -82,8 +100,11 @@ impl Link {
         let body = super::lan_audio::hud_body(payload)?;
         {
             let mut pending = link.hud.lock().map_err(|_| "实时对话显示队列不可用")?;
-            if pending.len() == 8 { return Err("实时对话显示队列繁忙".into()); }
-            pending.push_back(body);
+            if !queue_hud(&mut pending, body) {
+                drop(pending);
+                request_failure(session, "wifi_hud_overflow", Some("实时对话显示队列繁忙"));
+                return Err("实时对话显示队列繁忙".into());
+            }
         }
         let owned = super::active_session().filter(|s| std::ptr::eq(s.as_ref(), session))
             .ok_or("实时对话显示所有者已变化")?;
@@ -97,12 +118,10 @@ impl Link {
             Err(RUNNING) => return Ok(()),
             Err(_) => return Err("Wi-Fi 音频会话已结束。".into()),
         }
-        let (tx, rx) = mpsc::sync_channel(PLAYBACK_QUEUE_FRAMES);
-        *link.sender.lock().map_err(|_| "Wi-Fi 音频队列不可用。")? = Some(tx);
         let owned = session.clone();
         if thread::Builder::new()
             .name("realtime-wifi".into())
-            .spawn(move || run(owned, rx))
+            .spawn(move || run(owned))
             .is_err()
         {
             link.state.store(STOPPED, Ordering::Release);
@@ -153,48 +172,56 @@ impl Link {
         false
     }
 
+    pub(super) fn timed_captions(&self) -> bool { self.target.timed_captions() }
+
+    pub(super) fn subtitle(&self, id: &str, offset: u32, text: &str) -> Result<(), String> {
+        if !self.timed_captions() { return Err("设备不支持定时字幕".into()); }
+        let body = super::lan_audio::caption_body(offset, text)?;
+        self.playback(Playback::Caption, id, &body)
+    }
+
     pub(super) fn playback(&self, kind: Playback, id: &str, bytes: &[u8]) -> Result<(), String> {
         // A half-duplex greeting may precede begin_capture. Its validated TTS
         // can activate the already admitted passive HUD connection now.
-        if self.target.hud_supported() { self.activate.store(true, Ordering::Release); }
         let mut turn = self.turn.lock().map_err(|_| "Wi-Fi 播放状态不可用。")?;
-        match kind {
-            Playback::Begin => {
-                turn.number = turn.number.checked_add(1).ok_or("Wi-Fi 播放轮次超限。")?;
-                turn.id = id.to_owned();
-            }
-            Playback::Flush if turn.number != 0 => {
-                self.retired.store(turn.number, Ordering::Release)
-            }
-            Playback::Flush => return Ok(()),
-            _ if turn.number == 0 || turn.id != id => return Err("Wi-Fi 播放轮次已变化。".into()),
-            _ => {}
+        if self.stop.load(Ordering::Acquire) || self.state.load(Ordering::Acquire) != RUNNING {
+            return Err("Wi-Fi 音频连接已关闭。".into());
         }
-        let sender = self.sender.lock().map_err(|_| "Wi-Fi 音频队列不可用。")?;
-        let sender = sender.as_ref().ok_or("Wi-Fi 音频连接已关闭。")?;
-        let send = |pcm: &[u8]| {
-            sender
-                .try_send(PendingPlayback {
-                    kind,
-                    turn: turn.number,
-                    pcm: Zeroizing::new(pcm.to_vec()),
-                })
-                .map_err(|_| "Wi-Fi 音频发送队列繁忙或设备已断开。".to_string())
+        if matches!(kind, Playback::Flush) {
+            if id != turn.id { return Err("Wi-Fi 播放轮次已变化。".into()); }
+            self.retired.store(turn.number, Ordering::Release);
+            turn.pending.clear();
+            turn.open = false;
+            return Ok(());
+        }
+        let slots = if matches!(kind, Playback::Pcm) { bytes.len().div_ceil(PCM) } else { 1 };
+        let limit = match kind {
+            Playback::Pcm | Playback::Caption => PLAYBACK_QUEUE_FRAMES - 2,
+            _ => PLAYBACK_QUEUE_FRAMES,
         };
+        if slots > limit.saturating_sub(turn.pending.len()) {
+            return Err("Wi-Fi 音频发送队列繁忙。".into());
+        }
+        if matches!(kind, Playback::Begin) {
+            turn.number = turn.number.checked_add(1).ok_or("Wi-Fi 播放轮次超限。")?;
+            turn.id = id.to_owned();
+            turn.open = true;
+            if self.target.hud_supported() { self.activate.store(true, Ordering::Release); }
+        } else if !turn.open || turn.id != id {
+            return Err("Wi-Fi 播放轮次已变化。".into());
+        }
+        if matches!(kind, Playback::End) { turn.open = false; }
+        let number = turn.number;
         if matches!(kind, Playback::Pcm) {
             for frame in bytes.chunks(PCM) {
-                if frame.len() == PCM {
-                    send(frame)?;
-                } else {
-                    let mut tail = Zeroizing::new([0; PCM]);
-                    tail[..frame.len()].copy_from_slice(frame);
-                    send(&tail[..])?;
-                }
+                let mut pcm = Zeroizing::new(frame.to_vec());
+                pcm.resize(PCM, 0); // Only the last PCM packet of a turn can be partial.
+                turn.pending.push_back(PendingPlayback { kind, turn: number, pcm });
             }
-            Ok(())
         } else {
-            send(&[])
+            turn.pending.push_back(PendingPlayback { kind, turn: number, pcm: Zeroizing::new(bytes.to_vec()) });
         }
+        Ok(())
     }
 
     fn note_drained(&self, session: &Session, turn: u32) {
@@ -311,7 +338,6 @@ impl WireWrite {
 fn pump(
     session: &Session,
     link: &Link,
-    rx: mpsc::Receiver<PendingPlayback>,
     mut stream: TcpStream,
     mut codec: LanAudio,
 ) -> io::Result<()> {
@@ -322,16 +348,15 @@ fn pump(
     let mut close_queued = false;
     let mut outgoing: Option<WireWrite> = None;
     let mut sent_turn = 0;
-    let mut queued: Option<PendingPlayback> = None;
+    let mut last_was_hud = false;
     let mut next_pcm = last_sent;
     let mut activated = !link.target.hud_supported();
     let mut last_hud: Option<Zeroizing<Vec<u8>>> = None;
 
     // The offer alone is passive. This authenticated Start record activates capture.
-    if link.stop.load(Ordering::Acquire) {
-        return Ok(());
+    if activated && !link.stop.load(Ordering::Acquire) {
+        write_record(&mut stream, codec.seal(Record::Keepalive, &[]))?;
     }
-    if activated { write_record(&mut stream, codec.seal(Record::Keepalive, &[]))?; }
     // A send window stall must leave time to drain microphone records.
     stream.set_write_timeout(Some(Duration::from_millis(8)))?;
     loop {
@@ -345,52 +370,51 @@ fn pump(
             return Err(io::ErrorKind::TimedOut.into());
         }
         if outgoing.is_none() && stop_deadline.is_some() && !close_queued {
-            let terminal = link.terminal_hud.lock().map_err(|_| io::ErrorKind::Other)?.take();
-            if let Some(body) = terminal.filter(|_| last_hud.is_some()) {
+            let mut terminal = link.terminal_hud.lock().map_err(|_| io::ErrorKind::Other)?;
+            // A stop can race admission. Bind the passive HUD before sending
+            // its terminal state, without activating microphone capture.
+            let preparing = if terminal.is_some() && last_hud.is_none() {
+                link.hud.lock().map_err(|_| io::ErrorKind::Other)?.pop_front().filter(|body| body[0] == 0)
+            } else { None };
+            if let Some(body) = preparing {
+                outgoing = Some(WireWrite::new(codec.seal_hud(&body), now)?);
+                last_hud = Some(body);
+            } else if let Some(body) = terminal.take().filter(|_| last_hud.is_some()) {
                 outgoing = Some(WireWrite::new(codec.seal_hud(&body), now)?);
             } else {
                 outgoing = Some(WireWrite::new(codec.request_close(), now)?);
                 close_queued = true;
             }
         } else if outgoing.is_none() && stop_deadline.is_none() {
-            if let Some(body) = link.hud.lock().map_err(|_| io::ErrorKind::Other)?.pop_front() {
+            let mut turn = link.turn.lock().map_err(|_| io::ErrorKind::Other)?;
+            let ready = activated && turn.pending.front().is_some_and(|cmd|
+                !matches!(cmd.kind, Playback::Pcm) || now >= next_pcm);
+            let flush = sent_turn != 0 && sent_turn <= link.retired.load(Ordering::Acquire);
+            let start = !activated && link.activate.load(Ordering::Acquire);
+            let body = if flush || (last_was_hud && (ready || start)) { None } else {
+                link.hud.lock().map_err(|_| io::ErrorKind::Other)?.pop_front()
+            };
+            if flush {
+                outgoing = Some(WireWrite::new(codec.seal_playback(Playback::Flush, sent_turn, &[]), now)?);
+                sent_turn = 0;
+            } else if let Some(body) = body {
                 outgoing = Some(WireWrite::new(codec.seal_hud(&body), now)?);
                 last_hud = Some(body);
-            } else if !activated && link.activate.load(Ordering::Acquire) {
+                last_was_hud = true;
+            } else if start {
                 outgoing = Some(WireWrite::new(codec.seal(Record::Keepalive, &[]), now)?);
                 activated = true;
-            }
-            let is_current = |command: &PendingPlayback| match command.kind {
-                Playback::Flush => sent_turn == command.turn,
-                _ => link.retired.load(Ordering::Acquire) < command.turn,
-            };
-            if outgoing.is_none() && activated {
-            if let Some(command) = queued
-                .take()
-                .filter(is_current)
-                .or_else(|| rx.try_iter().find(is_current))
-            {
-                let pcm = matches!(command.kind, Playback::Pcm);
-                if pcm && now < next_pcm {
-                    queued = Some(command);
-                } else {
-                    outgoing = Some(WireWrite::new(
-                        codec.seal_playback(command.kind, command.turn, &command.pcm),
-                        now,
-                    )?);
-                    if pcm {
-                        // Cap packet bursts independently of TTS/player bursts.
-                        // Let playback build its device-side jitter buffer.
-                        next_pcm = (next_pcm + Duration::from_millis(20))
-                            .max(now + Duration::from_millis(10));
-                    }
-                    if matches!(command.kind, Playback::Begin) {
-                        sent_turn = command.turn;
-                        next_pcm = now;
-                    }
+            } else if ready {
+                let command = turn.pending.pop_front().unwrap();
+                outgoing = Some(WireWrite::new(codec.seal_playback(command.kind, command.turn, &command.pcm), now)?);
+                last_was_hud = false;
+                match command.kind {
+                    Playback::Pcm => next_pcm = (next_pcm + Duration::from_millis(20)).max(now + Duration::from_millis(10)),
+                    Playback::Begin => { sent_turn = command.turn; next_pcm = now; }
+                    _ => {}
                 }
             }
-            }
+            drop(turn);
             if outgoing.is_none() && now.duration_since(last_sent) >= KEEPALIVE {
                 let record = if activated { codec.seal(Record::Keepalive, &[]) }
                     else { last_hud.as_ref().and_then(|body| codec.seal_hud(body)) };
@@ -406,7 +430,7 @@ fn pump(
         if let Some(record) = reader.receive(&mut stream, &mut codec)? {
             last_read = Instant::now();
             match record {
-                Record::Close if stop_deadline.is_some() => return Ok(()),
+                Record::Close if close_queued && outgoing.is_none() => return Ok(()),
                 Record::Close => return Err(io::ErrorKind::ConnectionAborted.into()),
                 Record::Audio { vad: Some(speech) } if stop_deadline.is_none() => {
                     session.capture_ready.store(true, Ordering::Release);
@@ -433,12 +457,12 @@ fn pump(
     }
 }
 
-fn run(session: Arc<Session>, rx: mpsc::Receiver<PendingPlayback>) {
+fn run(session: Arc<Session>) {
     let Some(link) = &session.wifi else {
         return;
     };
     let result = match link.target.open() {
-        Ok((stream, key)) => pump(&session, link, rx, stream, LanAudio::new(key)),
+        Ok((stream, key)) => pump(&session, link, stream, LanAudio::new(key)),
         // Without an authenticated Start record the hardware has not opened capture.
         Err(error) => {
             link.state.store(STOPPED, Ordering::Release);
@@ -446,9 +470,7 @@ fn run(session: Arc<Session>, rx: mpsc::Receiver<PendingPlayback>) {
             return;
         }
     };
-    if let Ok(mut sender) = link.sender.lock() {
-        *sender = None;
-    }
+    if let Ok(mut turn) = link.turn.lock() { turn.pending.clear(); }
     if let Err(error) = result {
         link.state.store(FAILED, Ordering::Release);
         super::diagnostics::record(
@@ -477,6 +499,24 @@ mod tests {
     use crate::usb_serial::UsbSerialManager;
     use std::sync::atomic::AtomicU32;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn hud_pressure_preserves_preparation_and_finals_and_coalesces_partial_text() {
+        fn body(phase: u8, flags: u8, tag: u8) -> Zeroizing<Vec<u8>> {
+            Zeroizing::new(vec![phase, flags, tag])
+        }
+        let mut queue = VecDeque::new();
+        assert!(queue_hud(&mut queue, body(0, 0, 0)));
+        for tag in 0..100 { assert!(queue_hud(&mut queue, body(1, 1, tag))); }
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[1][2], 99);
+        for tag in 0..7 { assert!(queue_hud(&mut queue, body(2, 3, tag))); }
+        assert_eq!(queue.len(), 8);
+        assert!(queue_hud(&mut queue, body(1, 1, 42)));
+        assert!(!queue_hud(&mut queue, body(2, 3, 8)));
+        assert_eq!(queue.pop_front().unwrap()[0], 0);
+        assert!(queue.iter().map(|entry| entry[2]).eq(0..7));
+    }
 
     #[test]
     fn a_short_write_and_backpressure_preserve_the_record_boundary() {
@@ -564,7 +604,7 @@ mod tests {
             })
             .collect();
         player.send(PlayerCmd::Begin(turn.clone())).unwrap();
-        player.send(PlayerCmd::Pcm(pcm)).unwrap();
+        player.pcm(player.epoch.load(Ordering::SeqCst), &pcm).await.unwrap();
         let (drained_tx, drained_rx) = std::sync::mpsc::channel();
         player.send(PlayerCmd::End(drained_tx)).unwrap();
 

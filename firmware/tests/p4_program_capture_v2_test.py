@@ -21,9 +21,9 @@ def test_capture_uses_complete_snapshot_and_refuses_allocation_failure(tmp_path,
 #define MALLOC_CAP_SPIRAM 1
 #define MALLOC_CAP_8BIT 2
 static struct {bool active;struct {bool enabled;struct {unsigned cells;} image;} program;char widget_id[48];} g_runtime;
-static struct {unsigned revision;} g_component_program;
+static struct {unsigned revision;bool live;} g_component_program;
 static unsigned g_image_revision=1;
-static bool g_component_program_initialized=true,fail_alloc;
+static bool g_component_program_initialized=true,fail_alloc,refuse_snapshot;
 static unsigned locks,allocations,frees,enqueues;
 static void miniapp_runtime_lock(void){assert(!locks);locks++;}
 static void miniapp_runtime_unlock(void){assert(locks==1);locks--;}
@@ -32,7 +32,7 @@ static void copy_utf8(char *out,size_t cap,const char *text){assert(strlen(text)
 static void *heap_caps_malloc(size_t bytes,int caps){assert(!locks&&bytes==sizeof(pet_program_snapshot_t));assert(caps==(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));if(fail_alloc)return NULL;allocations++;return malloc(bytes);}
 static void heap_caps_free(void *ptr){assert(ptr&&!locks);frees++;free(ptr);}
 #endif
-static bool component_program_snapshot_locked(pet_program_snapshot_t *out){assert(locks==1);memset(out,0,sizeof(*out));out->schema=1;out->cells=PET_PROGRAM_CELLS;out->values[PET_PROGRAM_CELLS-1]=12345;return true;}
+static bool component_program_snapshot_locked(pet_program_snapshot_t *out){assert(locks==1);if(refuse_snapshot)return false;memset(out,0,sizeof(*out));out->schema=1;out->cells=PET_PROGRAM_CELLS;out->values[PET_PROGRAM_CELLS-1]=12345;return true;}
 static bool pet_program_persistence_enqueue(const char *id,const pet_program_snapshot_t *snapshot){assert(!locks&&!strcmp(id,"wide-capture"));assert(snapshot->cells==PET_PROGRAM_CELLS&&snapshot->values[PET_PROGRAM_CELLS-1]==12345);enqueues++;return true;}
 '''+capture+'\n'+save+r'''
 int main(void){
@@ -47,6 +47,13 @@ int main(void){
  assert(allocations==1&&frees==1);
 #else
  (void)fail_alloc;(void)allocations;(void)frees;
+#endif
+ refuse_snapshot=true;g_component_program.live=true;
+ assert(!save_component_program()&&!locks&&enqueues==1);
+ g_component_program.live=false;
+ assert(save_component_program()&&!locks&&enqueues==1);
+#if PET_P4_PROGRAM_V2
+ assert(allocations==3&&frees==3);
 #endif
  return 0;
 }

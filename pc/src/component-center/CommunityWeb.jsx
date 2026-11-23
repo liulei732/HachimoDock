@@ -4,23 +4,27 @@ import {COMMUNITY_ORIGIN,parseCommunityMessage} from './community-bridge.js';
 import {commentStorage,readCommentIdentity,saveCommentName} from './comment-identity.js';
 import {FAVORITES_KEY,readFavorites,updateFavorites,versionState} from './community-model.js';
 import {useExitProtection} from '../lib/exit-protection.js';
+import {featureView} from './component-features.js';
 import WorkflowConfirm from './WorkflowConfirm.jsx';
 
 const request=(action,fields={})=>invoke('community_request',{input:{action,...fields}});
 // Development uses a same-origin reverse proxy, never an arbitrary URL parameter.
 const origin=import.meta.env.DEV?location.origin:COMMUNITY_ORIGIN;
-export default function CommunityWeb({view='discover',localItems,inventory,deviceInstallTargetKey,onImported,onOpenLocal}){
-  const frame=useRef(null),current=useRef(null),confirmation=useRef(null),[confirm,setConfirm]=useState(null);
+export default function CommunityWeb({view='discover',capabilityTarget,localItems,inventory,deviceInstallTargetKey,onImported,onOpenLocal}){
+  const signalTargetChange=useRef(null),frame=useRef(null),current=useRef(null),confirmation=useRef(null),[confirm,setConfirm]=useState(null);
   const [ready,setReady]=useState(false),[failed,setFailed]=useState(false),[revision,setRevision]=useState(0),[dirty,setDirty]=useState(false),[busy,setBusy]=useState(false);
-  current.current={localItems,inventory,deviceInstallTargetKey,onImported,onOpenLocal};
+  current.current={capabilityTarget,localItems,inventory,deviceInstallTargetKey,onImported,onOpenLocal};
+  const targetFingerprint=JSON.stringify(capabilityTarget);
+  useEffect(()=>{signalTargetChange.current?.();},[targetFingerprint]);
   useExitProtection(busy?'社区下载或提交尚未完成':dirty?'社区评论或昵称尚未保存':'');
   useEffect(()=>{
     let alive=true,initialized=false,activeWrites=0;const channel=crypto.randomUUID(),inflight=new Set(),done=new Set();
     setReady(false);setFailed(false);setDirty(false);
     const timer=setTimeout(()=>{if(alive&&!initialized)setFailed(true);},15000);
     const post=data=>frame.current?.contentWindow?.postMessage({...data,v:1,channel},origin);
+    signalTargetChange.current=()=>{if(initialized)post({type:'pet-community-target-changed'});};
     function local(work){const item=current.current.localItems.find(x=>x.id===work.id&&!x.isDeviceOnly),state=versionState(work,item,current.current.inventory);return {item,state};}
-    async function status(id){const work=await request('detail',{id}),{item,state}=local(work);return {hasLocal:!!item,localLabel:state.localLabel,deviceLabel:state.deviceLabel,blocked:!!(state.localNewer||state.contentConflict||state.versionUnknown||(item&&!state.updateAvailable)),downloadLabel:state.contentConflict?'同版本内容冲突':state.versionUnknown?'版本待核对':state.localNewer?'本机版本更高':item?(state.updateAvailable?'下载新版本':'已加入本机'):'下载到我的组件'};}
+    async function status(id){const work=await request('detail',{id}),{item,state}=local(work);return {contentHash:work.contentHash,featureRows:featureView(work.requirements?.featureManifest,current.current.capabilityTarget).rows,hasLocal:!!item,localLabel:state.localLabel,deviceLabel:state.deviceLabel,blocked:!!(state.localNewer||state.contentConflict||state.versionUnknown||(item&&!state.updateAvailable)),downloadLabel:state.contentConflict?'同版本内容冲突':state.versionUnknown?'版本待核对':state.localNewer?'本机版本更高':item?(state.updateAvailable?'下载新版本':'已加入本机'):'下载到我的组件'};}
     async function execute(action,fields){
       if(action==='profile'){saveCommentName(commentStorage(),fields.name);return readCommentIdentity(commentStorage());}
       if(action==='favorite'){const work=await request('detail',{id:fields.id});const values=updateFavorites(readFavorites(localStorage),work);localStorage.setItem(FAVORITES_KEY,JSON.stringify(values));return values.map(x=>({id:x.id,name:x.name}));}
@@ -55,7 +59,7 @@ export default function CommunityWeb({view='discover',localItems,inventory,devic
       catch(error){if(alive)post({type:'pet-community-response',requestId,error:typeof error==='string'?error:error.message||'操作未完成，请重试'});}
       finally{inflight.delete(requestId);done.add(requestId);if(done.size>1000)done.delete(done.values().next().value);if(write){activeWrites--;if(alive)setBusy(false);}}
     }
-    window.addEventListener('message',receive);return()=>{alive=false;clearTimeout(timer);window.removeEventListener('message',receive);confirmation.current?.(false);confirmation.current=null;};
+    window.addEventListener('message',receive);return()=>{alive=false;signalTargetChange.current=null;clearTimeout(timer);window.removeEventListener('message',receive);confirmation.current?.(false);confirmation.current=null;};
   },[view,revision]);
   return <section className="community-web" aria-label={view==='favorites'?'我的收藏':'社区广场'}>
     {!ready&&<div className="community-web-loading" role="status">{failed?'社区页面暂时未能加载；本机组件不受影响。':'正在加载社区网页…'}{failed&&<button onClick={()=>setRevision(x=>x+1)}>重新连接</button>}</div>}

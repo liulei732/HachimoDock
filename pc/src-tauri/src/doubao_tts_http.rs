@@ -1,6 +1,8 @@
 //! HTTP unidirectional streaming for TTS 2.0 Context voices. Uses the same
 //! trusted-CA/network client as other cloud calls; never logs keys or spoken text.
 //! Protocol: https://docs.volcengine.com/docs/DoubaoVoice/unidirectional-streaming-text-to-speech-http
+use crate::model_issue::{self, TTS};
+
 use super::{DoubaoTtsConfig, MAX_PCM_BYTES, SAMPLE_RATE, SESSION_TIMEOUT};
 use base64::Engine;
 use serde_json::{json, Value};
@@ -49,7 +51,7 @@ impl Decoder {
         }
         if code != 0 {
             // The provider message may echo input/credentials; only expose the code.
-            return Err(format!("豆包 TTS 合成失败（{code}），请检查音色及语音服务权限"));
+            return Err(model_issue::business(TTS,&json!(code)));
         }
         if let Some(data) = packet["data"].as_str().filter(|data| !data.is_empty()) {
             let mut pcm = base64::engine::general_purpose::STANDARD.decode(data)
@@ -71,11 +73,12 @@ impl Decoder {
     }
 }
 
-pub(super) async fn synthesize(cfg: &DoubaoTtsConfig, text: &str, on_pcm: &mut impl FnMut(&[u8])) -> Result<usize, String> {
+pub(super) async fn synthesize<Fut>(cfg: &DoubaoTtsConfig, text: &str, on_pcm: &mut impl FnMut(&[u8]) -> Fut) -> Result<usize, String>
+where Fut: std::future::Future<Output=Result<(), String>> {
     if cfg.api_key.is_empty() { return Err("豆包 TTS 未配置 API Key".into()); }
     let mut audio = json!({ "format": "pcm", "sample_rate": SAMPLE_RATE });
     if let Some(rate) = cfg.speech_rate() { audio["speech_rate"] = json!(rate); }
-    let mut response = crate::llm_network::client(SESSION_TIMEOUT)?
+    let mut response = model_issue::client(TTS, SESSION_TIMEOUT)?
         .post(URL)
         .header("X-Api-Key", &cfg.api_key)
         .header("X-Api-Resource-Id", &cfg.resource_id)
@@ -83,13 +86,17 @@ pub(super) async fn synthesize(cfg: &DoubaoTtsConfig, text: &str, on_pcm: &mut i
         .json(&json!({ "user": { "uid": "pet-manager" }, "req_params": {
             "text": text, "speaker": cfg.speaker, "audio_params": audio
         }}))
-        .send().await.map_err(|error| crate::llm_network::connection_error(&error))?;
+        .send().await.map_err(|error| model_issue::network(TTS,&error))?;
     if !response.status().is_success() {
-        return Err(format!("豆包 TTS 请求失败（HTTP {}）", response.status().as_u16()));
+        return Err(model_issue::http(TTS,response.status().as_u16(),false));
     }
     let mut decoder = Decoder::default();
-    while let Some(chunk) = response.chunk().await.map_err(|error| crate::llm_network::connection_error(&error))? {
-        decoder.push(&chunk, on_pcm)?;
+    while let Some(chunk) = response.chunk().await.map_err(|error| model_issue::network(TTS,&error))? {
+        for part in chunk.chunks(64 * 1024) {
+            let mut decoded = Vec::new();
+            decoder.push(part, &mut |pcm| decoded.extend_from_slice(pcm))?;
+            if !decoded.is_empty() { on_pcm(&decoded).await?; }
+        }
         if decoder.finished { break; }
     }
     decoder.complete()

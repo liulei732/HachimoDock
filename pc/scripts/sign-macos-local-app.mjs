@@ -47,9 +47,8 @@ if (!existsSync(appPath)) {
 // Verify install-relative service code/dependencies before either sign or verify.
 console.log(JSON.stringify({voiceRuntime:verifyVoiceBundle(resolve(appPath,"Contents/Resources"),{target:"macos",arch:process.arch})}));
 
-// Use the very same resolver as desktop-local.py and release-local.py.
 // -B prevents writing Python bytecode during signing or verification.
-const resolvedConfig = spawnSync('python3', ['-B', resolve(repositoryRoot, 'scripts/build/local_config.py'), '--source', repositoryRoot],
+const resolvedConfig = spawnSync('python3', ['-B', resolve(repositoryRoot, 'pc/scripts/signing-config.py'), '--source', repositoryRoot],
   {encoding:'utf8', timeout:10000, env:process.env});
 if (resolvedConfig.error || resolvedConfig.status !== 0) throw Error('Cannot resolve local signing workspace/config');
 const {configPath} = JSON.parse(resolvedConfig.stdout);

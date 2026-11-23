@@ -18,8 +18,9 @@ const SOURCE_RATE: f64 = 16_000.0;
 
 /// Play the PCM to completion (or until `max_duration` elapses). Blocks the calling thread;
 /// call it from a worker thread, never from the UI thread.
-pub fn play_pcm16_mono_16k(pcm: &[u8], max_duration: Duration) -> Result<(), String> {
-    if pcm.len() < 2 {
+pub fn play_pcm16_mono_16k(pcm: &[u8], max_duration: Duration,
+    cancelled: impl Fn() -> bool + Send + Sync + 'static) -> Result<(), String> {
+    if pcm.len() < 2 || cancelled() {
         return Ok(());
     }
     let samples: Arc<Vec<f32>> = Arc::new(
@@ -44,7 +45,10 @@ pub fn play_pcm16_mono_16k(pcm: &[u8], max_duration: Duration) -> Result<(), Str
     let position_writer = position.clone();
     let source = samples.clone();
 
+    let cancelled = Arc::new(cancelled);
+    let output_cancelled = cancelled.clone();
     let write = move |out: &mut [f32]| {
+        if output_cancelled() { out.fill(0.0); return; }
         let mut frame_index = position_writer.load(Ordering::Relaxed);
         for frame in out.chunks_mut(channels) {
             let source_index = (frame_index as f64 * ratio) as usize;
@@ -82,13 +86,44 @@ pub fn play_pcm16_mono_16k(pcm: &[u8], max_duration: Duration) -> Result<(), Str
         other => return Err(format!("不支持的音频输出格式: {other:?}")),
     }
     .map_err(|error| format!("打开音频输出失败: {error}"))?;
+    if cancelled() { return Ok(()); }
     stream.play().map_err(|error| format!("开始播放失败: {error}"))?;
-    let started = Instant::now();
-    while position.load(Ordering::Relaxed) < total_frames && started.elapsed() < max_duration {
-        thread::sleep(Duration::from_millis(20));
-    }
-    // let the device drain its last buffer before tearing the stream down
-    thread::sleep(Duration::from_millis(120));
+    wait_for_output(|| position.load(Ordering::Relaxed) >= total_frames, max_duration, || cancelled());
     drop(stream);
     Ok(())
+}
+
+fn wait_for_output(finished: impl Fn() -> bool, max_duration: Duration, cancelled: impl Fn() -> bool) {
+    let started = Instant::now();
+    while !cancelled() && !finished() && started.elapsed() < max_duration {
+        thread::sleep(Duration::from_millis(20));
+    }
+    // Drain the final device buffer only while this audition still owns output.
+    let drain = Instant::now();
+    while !cancelled() && drain.elapsed() < Duration::from_millis(120) {
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_during_playback_or_drain_releases_output() {
+        for finished in [false, true] {
+            let (started, observed) = std::sync::mpsc::sync_channel(1);
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop = cancelled.clone();
+            let worker = thread::spawn(move || {
+                wait_for_output(|| { let _ = started.try_send(()); finished },
+                    Duration::from_secs(2), || cancelled.load(Ordering::Acquire));
+            });
+            observed.recv_timeout(Duration::from_secs(1)).unwrap();
+            let before = Instant::now();
+            stop.store(true, Ordering::Release);
+            worker.join().unwrap();
+            assert!(before.elapsed() < Duration::from_millis(300));
+        }
+    }
 }

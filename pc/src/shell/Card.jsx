@@ -8,10 +8,10 @@
 import React, { useState } from "react";
 import { ChevronDown } from "lucide-react";
 
-export default function Card({ title, subtitle, actions, children }) {
+export default function Card({ id, title, subtitle, actions, children }) {
   const showHeader = title || subtitle || actions;
   return (
-    <section className="card">
+    <section className="card" id={id} tabIndex={id ? -1 : undefined}>
       {showHeader && (
         <header className="card__header">
           <div className="card__title-block">

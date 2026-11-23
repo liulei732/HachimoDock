@@ -13,7 +13,7 @@ import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Download, LoaderCircle } from "lucide-react";
-import { currentFirmwareCompletion, firmwareUpdateDisposition } from "../lib/firmware-version.js";
+import { parseFirmwareRevision, currentFirmwareCompletion, firmwareUpdateDisposition } from "../lib/firmware-version.js";
 import { useToast } from "./ToastStack.jsx";
 import { useExitProtection } from "../lib/exit-protection.js";
 import { firmwareAlreadyLatest, firmwareRollback, firmwareUpdateFailureMessage } from "../lib/firmware-update-error.js";
@@ -119,7 +119,7 @@ export default function FirmwareUpdateNavItem({ usb = {}, wifi }) {
   }, [connectedP4, probeKey, boardDeviceId, connectionId, awaitingBoardProbe, probeRefresh]);
 
   const currentVersion = currentCompletion?.version || String(bundledFirmware?.currentVersion || firmware || "");
-  const stageLabel = ({begin:"准备升级",upload:"写入中",recover:"恢复连接",verify:"校验中",reboot:"等待重启",validate:"确认版本"})[stage] || "准备升级";
+  const stageLabel = ({begin:"准备升级",upload:"写入中",recover:"恢复连接",verify:"校验中",reboot:"等待重启",validate:"确认版本",font:"同步气泡字库"})[stage] || "准备升级";
   const disposition = connectedP4
     ? firmwareUpdateDisposition(currentVersion, bundledFirmware?.version || currentCompletion?.version)
     : "unknown";
@@ -134,6 +134,33 @@ export default function FirmwareUpdateNavItem({ usb = {}, wifi }) {
     (wifi?.bundledFirmwareRollbackBlocked || rollbackBoardId === wifi?.boardDeviceId);
   const wifiUpdate = !usb.connected && wifi?.wirelessOta && wifiDisposition === "update" && !wifiRollback;
   const showRollback = (usbRollback && disposition !== "latest") || wifiRollback;
+
+  // Also reconcile when a client reconnects after an interrupted update.
+  const fontBoard = connectedP4 ? boardDeviceId : !usb.connected && wifi?.controlTrusted ? wifi.boardDeviceId : "";
+  const fontConnection = connectedP4 ? connectionId : null;
+  const fontBoot = connectedP4 ? null : wifi?.bootId;
+  const needsFontCheck = parseFirmwareRevision(connectedP4 ? firmware : wifi?.firmware) >= 302;
+  const fontKey = JSON.stringify([fontBoard, fontConnection, fontBoot]);
+  const [fontCheck, setFontCheck] = useState(null);
+  const [fontAttempt, setFontAttempt] = useState(0);
+  useEffect(() => {
+    if (pending || !needsFontCheck || !fontBoard || !(fontConnection || fontBoot)) return;
+    let active = true;
+    let timer;
+    const check = (retry) => {
+      setFontCheck({ key: fontKey, state: "checking" });
+      invoke("ensure_device_bubble_font", { board: fontBoard, connection: fontConnection, boot: fontBoot })
+        .then(() => { if (active) setFontCheck({ key: fontKey, state: "ready" }); })
+        .catch(error => {
+          if (!active) return;
+          setFontCheck({ key: fontKey, state: "failed", error: String(error) });
+          if (retry) timer = setTimeout(() => check(false), 16000);
+        });
+    };
+    check(true);
+    return () => { active = false; clearTimeout(timer); };
+  }, [pending, needsFontCheck, fontBoard, fontConnection, fontBoot, fontKey, fontAttempt]);
+  const fontState = needsFontCheck && fontBoard && fontCheck?.key === fontKey ? fontCheck.state : null;
 
   const startUpdate = async (confirmedBoardModel) => {
     if (updateInFlight.current || showRollback) return;
@@ -215,19 +242,24 @@ export default function FirmwareUpdateNavItem({ usb = {}, wifi }) {
     }
   };
 
+  const hoverBoard = usb.connected ? boardLabel : wifi && "WiFi6";
+  const deviceVersion = usb.connected ? currentVersion : wifiVersion;
+  const packageVersion = usb.connected ? bundledFirmware?.version : wifi?.bundledFirmwareVersion;
+  const firmwareDetails = [
+    hoverBoard,
+    deviceVersion && `设备 ${deviceVersion}`,
+    packageVersion && `内置 ${packageVersion}`,
+  ].filter(Boolean).join(" · ");
+
   return (
     <div
       className="sidebar-nav__item sidebar-firmware-update"
       aria-label="固件升级"
-      title={bundledFirmware?.version
-        ? `${boardLabel} · 设备 ${currentVersion || "未知"} · 内置 ${bundledFirmware.version}`
-        : !usb.connected && wifi?.bundledFirmwareVersion
-          ? `WiFi6 · 设备 ${wifiVersion || "未知"} · 内置 ${wifi.bundledFirmwareVersion}`
-          : "固件升级"}
+      title={firmwareDetails || "固件升级"}
     >
       {pending ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}
       <span className="sidebar-nav-label">固件升级</span>
-      {boardLabel && <span className="sidebar-firmware-update__board">{boardLabel}</span>}
+      {!usb.connected && !wifi && <span className="sidebar-firmware-update__latest">未连接</span>}
       {connectedP4 && !pending && !showRollback && !boardLabel && !requiresBoardChoice && disposition !== "latest" && (
         <span className="sidebar-firmware-update__latest" role="status">
           {currentProbe?.label || "正在识别"}
@@ -253,7 +285,15 @@ export default function FirmwareUpdateNavItem({ usb = {}, wifi }) {
       {!pending && showRollback && (
         <span className="sidebar-firmware-update__latest" role="status">已回退</span>
       )}
-      {!pending && (disposition === "latest" || wifiDisposition === "latest") && (
+      {!pending && fontState === "failed" && (
+        <button type="button" className="sidebar-firmware-update__action" title={fontCheck.error}
+          onClick={() => setFontAttempt(n => n + 1)}>重试字库</button>
+      )}
+      {!pending && fontState === "checking" && <span role="status">核对字库中</span>}
+      {!pending && needsFontCheck && !usb.connected && wifiDisposition === "latest" && !fontBoard && (
+        <span className="sidebar-firmware-update__latest" title="固件版本已核对，授权无线控制后可核对字库。">固件已最新</span>
+      )}
+      {!pending && (!needsFontCheck || fontState === "ready") && (disposition === "latest" || wifiDisposition === "latest") && (
         <span className="sidebar-firmware-update__latest">已最新</span>
       )}
     </div>

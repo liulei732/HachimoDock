@@ -33,8 +33,10 @@ def _catalog_source(code):
 #define pet_widget_trace_scope_end(name) ((void)(name))
 #define vTaskDelay(ticks) ((void)(ticks))
 #define pdMS_TO_TICKS(ms) (ms)
-typedef struct {char widget_id[48],title[64];uint8_t slot,package_generation;uint32_t widget_checksum,buttons_checksum,sprites_checksum,center_title_checksum;pet_p4_component_metadata_t package_metadata;} miniapp_catalog_item_t;
+typedef struct {char widget_id[48],title[64];uint8_t slot,package_generation;uint32_t widget_checksum,buttons_checksum,sprites_checksum,center_title_checksum,center_thumb_checksum;uint8_t center_thumb_generation;pet_p4_component_metadata_t package_metadata;} miniapp_catalog_item_t;
 typedef struct {uint8_t generation;uint32_t sequence;} miniapp_catalog_commit_t;
+/* File GC is exercised with actual banks in petui_storage_mutation_test. */
+#define center_thumb_catalog(generation,items,count,committed) ((void)0)
 static char g_storage_failure[128];
 static unsigned allocations,fail_allocation,live,opens,creates,truncates,zero_truncates,verify_reads;
 static int io_fault;

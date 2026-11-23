@@ -41,8 +41,8 @@ function runTemplate(name,root,{env={},args=[],spawn=()=>({status:0}),extra={}}=
   const processStub={platform:'darwin',arch:'arm64',argv:['node',filename,...args],execPath:'node',env,cwd:()=>cwd,exit:code=>{throw Error(`exit ${code}`);}};
   const context={...fs,...path,Buffer,URL,JSON,console:{log(){},error(){}},process:processStub,tmpdir:()=>root,
     fileURLToPath,randomUUID,createHash,spawnSync:(command,args,options)=>{
-      if(command==='python3' && args[1]?.endsWith('/scripts/build/local_config.py')) {
-        const resolver=path.resolve(scripts,'../../scripts/build/local_config.py');
+      if(command==='python3' && path.basename(args[1] || '') === 'signing-config.py') {
+        const resolver=path.join(scripts,'signing-config.py');
         const cleanEnv={...process.env};delete cleanEnv.HACHIMI_WORKSPACE_ROOT;delete cleanEnv.HACHIMI_LOCAL_CONFIG;
         return nativeSpawnSync(command,['-B',resolver,...args.slice(2)],{...options,env:{...cleanEnv,...env}});
       }
@@ -230,15 +230,6 @@ test('failed sign produces no receipt and never falls back to ad-hoc',t=>{
   assert.throws(()=>runTemplate('sign-macos-local-app.mjs',root,{env:f.env,args:[app,'--output-receipt',receipt],spawn:f.spawn}),/command failed/);
   assert.equal(fs.existsSync(receipt),false);
   assert.equal(f.calls.filter(c=>c.args.includes('--sign')).length,1);
-});
-for(const [entry,args,flag] of [
-  ['desktop-local.py',['bundle','--unsigned'],'--unsigned'],
-  ['release-local.py',['--unsigned-mac'],'--unsigned-mac'],
-])test(`${entry} rejects ${flag} before any build command or directory creation`,()=>{
-  const directory=path.resolve(scripts,'../../scripts/build');
-  const program=`import sys,runpy,subprocess,pathlib\nfrom unittest.mock import patch\nsys.path.insert(0,${JSON.stringify(directory)})\nsys.argv=${JSON.stringify([entry,...args])}\nwith patch.object(subprocess,'run',side_effect=AssertionError('unexpected build')), patch.object(subprocess,'check_output',side_effect=AssertionError('unexpected command')), patch.object(pathlib.Path,'mkdir',side_effect=AssertionError('unexpected output')):\n runpy.run_path(${JSON.stringify(path.join(directory,entry))},run_name='__main__')\n`;
-  const result=nativeSpawnSync('python3',['-c',program],{encoding:'utf8',env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'}});
-  assert.equal(result.status,2,result.stderr);assert.ok(result.stderr.includes(`${flag} is disabled`));
 });
 test('signer discovers workspace config and accepts only matching explicit SHA1',t=>{
   const base=fixture(t),root=path.join(base,'worktrees'),app=path.join(base,'Fixture.app');macApp(app);

@@ -1,0 +1,17 @@
+clock 1795305600000 480
+frame 0
+text 消星星 · 一局
+observe
+event 1 100 255
+event 3 100 255
+frame 33
+appeared 分数
+event 4 5 0
+frame 33
+text 分数
+event 4 6 0
+frame 33
+text 继续上局
+event 4 5 0
+frame 33
+text 每日一局

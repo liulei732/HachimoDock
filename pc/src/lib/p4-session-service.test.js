@@ -212,3 +212,18 @@ test("a silent completed reply retains its card until the original deadline", ()
   assert.equal(buildP4ConversationQueue([reply], completed, 61_499).length, 1);
   assert.deepEqual(buildP4ConversationQueue([reply], completed, 61_500), []);
 });
+
+test("ordinary discussions of the approval schema remain visible across session snapshots", () => {
+  const document = {
+    id: "doc", displayTitle: "API documentation",
+    displayContent: "The following is the code example for risk_level, user_authorization, outcome, and rationale.",
+  };
+  const review = { ...document, id: "internal", thread_source: "guardian_review" };
+  assert.deepEqual(buildP4RoutingSessions([review, document]).map(s => s.id), ["doc"]);
+});
+
+test("another agent may legitimately produce a review-shaped JSON document", () => {
+  const work = {id:"workbuddy:doc",agentId:"workbuddy",displayTitle:"The following is the Code",
+    displayContent:JSON.stringify({risk_level:"low",user_authorization:"high",outcome:"allow",rationale:"sample"})};
+  assert.deepEqual(buildP4RoutingSessions([work]), [work]);
+});

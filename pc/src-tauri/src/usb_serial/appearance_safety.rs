@@ -437,7 +437,7 @@ impl UsbSerialManager {
             if !c.connected||c.board_device_id!=board||c.cancel_reader.load(Ordering::Acquire)
                 ||!self.inbound_owner.is_current(c.connection_id){return Err("appearance_connection_retired_no_replay".into());}
             if let Some((generation,boot))=expected{
-                if c.connection_id!=generation||c.capabilities["debugBootId"].as_str()!=Some(boot){
+                if c.connection_id!=generation||c.capabilities["debugBootId"].as_str().unwrap_or("")!=boot{
                     return Err("appearance_recovery_connection_changed".into());
                 }
             }

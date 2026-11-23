@@ -1,0 +1,12 @@
+{
+  "dashboard": {
+    "title": "麦克风电平",
+    "headline": "等待设备授权",
+    "note": "在设备上查看声音的相对峰值，退出自动停止。",
+    "footer": "SW1 开始或停止，退出结束",
+    "visualStyle": "clean",
+    "visualPalette": "ocean",
+    "visualLayout": "tool",
+    "visualSprite": "gauge"
+  }
+}

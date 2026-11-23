@@ -161,6 +161,10 @@ fn secure_body(host: &str, resolver: &str, ip: [u8; 4], path: &str) -> Result<Ve
     Ok(body)
 }
 pub fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    resolve_checked(host, port, || Ok(()))
+}
+pub(crate) fn resolve_checked(host: &str, port: u16, check: impl Fn() -> Result<(), String>) -> Result<Vec<SocketAddr>, String> {
+    check()?;
     let host = host
         .trim_start_matches('[')
         .trim_end_matches(']')
@@ -192,7 +196,10 @@ pub fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
         {
             return Err("已拒绝非公网电台地址".into())
         }
-        _ => secure(&host)?,
+        _ => {
+            check()?;
+            secure(&host)?
+        }
     };
     let mut cache = cache.lock().unwrap();
     cache.retain(|_, (until, _)| *until > Instant::now());

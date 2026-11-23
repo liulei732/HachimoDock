@@ -31,6 +31,7 @@ typedef struct {
   uint8_t phase, field;
   int32_t pending, draft_day, draft_minute;
   uint64_t reveal_at;
+  uint64_t revealed[PET_LOCAL_GROUPS]; /* Session-only; existing saves retain their layout. */
   int64_t last_second;
 } pet_local_state_t;
 typedef struct {

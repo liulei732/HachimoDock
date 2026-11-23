@@ -84,3 +84,49 @@ def test_split_observation_is_private_same_peak_only_and_not_a_timing_policy():
     assert 'g_render_perf.peak_compare_us=g_last_compare_us' in text and '(unsigned)peak->trace.frame' in text
     assert text.index('g_render_perf.peak_compare_us=g_last_compare_us')<text.index('pet_p4_render_peak_record(')
     assert 'pet_p4_frame_unchanged(g_native_framebuffer, previous_native,' in text
+
+
+def test_panel_refresh_interrupts_select_the_legacy_path_once(tmp_path):
+    from p4_render_trace_test import function
+
+    lcd = (ROOT / 'main/pet_p4_lcd.c').read_text()
+    init = function(lcd, 'pet_p4_lcd_init')
+    default = init.index('.on_refresh_done = lcd_refresh_done_callback')
+    opt_in = init.index('if (config.nv3049) callbacks.on_refresh_done = nv_refresh_done_callback')
+    assert default < opt_in < init.index('esp_lcd_dpi_panel_register_event_callbacks')
+
+    source = tmp_path / 'panel_irq.c'
+    source.write_text(r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdatomic.h>
+#define IRAM_ATTR
+#define pdTRUE 1
+#define pdFALSE 0
+typedef void *esp_lcd_panel_handle_t, *SemaphoreHandle_t;
+typedef int esp_lcd_dpi_panel_event_data_t, BaseType_t;
+static atomic_uint g_nv_max_refresh_gap, g_nv_refresh;
+static uint32_t tick, g_nv_last_refresh_tick;
+static unsigned samples, signals;
+static uint32_t xTaskGetTickCountFromISR(void) { samples++; return tick; }
+static void xSemaphoreGiveFromISR(SemaphoreHandle_t sem, BaseType_t *awake) {
+    assert(sem == &signals);
+    signals++;
+    *awake = pdTRUE;
+}
+""" + function(lcd, 'lcd_refresh_done_callback') + '\n' + function(lcd, 'nv_refresh_done_callback') + r"""
+int main(void) {
+    assert(!lcd_refresh_done_callback(0, 0, 0));
+    assert(lcd_refresh_done_callback(0, 0, &signals));
+    assert(signals == 1 && samples == 0 && g_nv_refresh == 0);
+    tick = 100;
+    assert(nv_refresh_done_callback(0, 0, &signals));
+    tick += 17;
+    assert(nv_refresh_done_callback(0, 0, &signals));
+    assert(signals == 3 && samples == 2 && g_nv_refresh == 2 && g_nv_max_refresh_gap == 17);
+}
+""")
+    binary = tmp_path / 'panel_irq'
+    subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', str(source), '-o', str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)

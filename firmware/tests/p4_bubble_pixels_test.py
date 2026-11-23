@@ -124,6 +124,10 @@ int main(int argc,char**argv){
    assert(held.body_exact==cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(v,"exact")));
    assert(held.body_page==num(v,"page"));
   }
+  v=cJSON_GetObjectItemCaseSensitive(c,"revisionChanged");if(v){
+   static uint32_t prior;uint32_t current=pet_bubble_pixels_revision();
+   assert((prior!=current)==cJSON_IsTrue(v));prior=current;
+  }
   v=cJSON_GetObjectItemCaseSensitive(c,"titleState");if(v){
    assert(holding);
    assert(held.title_pending==cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(v,"pending")));

@@ -1,0 +1,14 @@
+frame 0
+text 消星星
+text 分数
+observe
+event 4 5 0
+frame 80
+changed
+text 20
+frame 80
+frame 80
+event 1 48 352
+event 3 48 352
+frame 33
+text +20

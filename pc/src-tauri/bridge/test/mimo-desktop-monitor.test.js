@@ -32,6 +32,13 @@ test("Desktop follows turn metadata and leaves CLI and completed history to thei
   insert.run("cli", "cli", "active", null, "cli-input", started, started);
 
   const states = [];
+  const statementProto = Object.getPrototypeOf(writer.prepare("SELECT 1"));
+  const all = statementProto.all;
+  let lifecycleQueries = 0;
+  t.mock.method(statementProto, "all", function (...args) {
+    if (this.sourceSQL.includes("FROM inbox AS i")) lifecycleQueries++;
+    return all.apply(this, args);
+  });
   const monitor = startMimoDesktopMonitor({ filename, onState: value => states.push(value) });
   t.after(() => monitor.stop());
   await delay(300);
@@ -61,5 +68,9 @@ test("Desktop follows turn metadata and leaves CLI and completed history to thei
     ["mimocode", "working", "desktop"], ["mimocode", "speaking", "desktop"], ["mimocode", "done", "desktop"],
   ]);
   assert.doesNotMatch(JSON.stringify(states), /private|past-input|current-input|cli-input/);
+  const queriesAtCompletion = lifecycleQueries;
+  assert.ok(queriesAtCompletion >= 3);
+  await delay(1200);
+  assert.equal(lifecycleQueries, queriesAtCompletion);
   monitor.stop();
 });

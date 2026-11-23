@@ -18,17 +18,20 @@ pub(crate) enum Route {
     Wifi { board: String, boot: String },
 }
 
+#[derive(Clone)]
 pub(crate) struct Target {
     pub(crate) route: Route,
     wifi: Option<Peer>,
     expiry: bool,
     device_watchlist: bool,
+    pub(super) host_flags: u8,
 }
 
 struct CheckedPeer {
     peer: Peer,
     at: Instant,
     route: Option<Route>,
+    host_flags: u8,
 }
 
 static STATUS: Mutex<Option<CheckedPeer>> = Mutex::new(None);
@@ -40,7 +43,7 @@ pub(super) fn foreground() -> Result<RwLockReadGuard<'static, ()>, String> {
     LAN_LANE.read().map_err(|_| "无线传输暂不可用".into())
 }
 
-fn background(usb: &UsbSerialManager) -> Option<RwLockWriteGuard<'static, ()>> {
+pub(super) fn background(usb: &UsbSerialManager) -> Option<RwLockWriteGuard<'static, ()>> {
     let lane = LAN_LANE.try_write().ok()?;
     require_no_usb(usb).ok()?;
     if usb.transfer_in_progress()
@@ -52,11 +55,11 @@ fn background(usb: &UsbSerialManager) -> Option<RwLockWriteGuard<'static, ()>> {
     Some(lane)
 }
 
-fn same_peer(a: &Peer, b: &Peer) -> bool {
+pub(super) fn same_peer(a: &Peer, b: &Peer) -> bool {
     a.address == b.address && a.key.as_ref() == b.key.as_ref()
 }
 
-fn valid_identity(board: &str, boot: &str) -> bool {
+pub(super) fn valid_identity(board: &str, boot: &str) -> bool {
     boot.len() == 16
         && boot.bytes().all(|b| b.is_ascii_hexdigit())
         && board
@@ -78,6 +81,7 @@ impl Target {
                         connection,
                     },
                     wifi: None,
+                    host_flags: 0,
                     expiry: status.capabilities["widgetDataExpiry"] == "p4-data-expiry-v1",
                     device_watchlist: status.capabilities["widgetWifiData"] == "p4-wifi-data-v1",
                 });
@@ -86,11 +90,14 @@ impl Target {
         let _lane = background(usb)?;
         let peer = load_peer()?;
         let mut cached = STATUS.lock().ok()?;
+        let mut wake = false;
         if cached
             .as_ref()
             .is_none_or(|old| !same_peer(&old.peer, &peer) || old.at.elapsed() >= STATUS_INTERVAL)
         {
+            let mut host_flags = 0;
             let route = query_status(&peer).ok().and_then(|status| {
+                host_flags = status.component_host_flags;
                 (status.wifi_connected
                     && status.control_trusted
                     && status.widget_data_delivery
@@ -101,19 +108,32 @@ impl Target {
                     boot: status.boot_id,
                 })
             });
+            wake = host_flags == 3 && route.is_some() && cached.as_ref().is_some_and(|old|
+                old.host_flags == 1 && old.route == route && same_peer(&old.peer, &peer));
             *cached = Some(CheckedPeer {
                 peer: peer.clone(),
                 at: Instant::now(),
                 route,
+                host_flags,
             });
         }
-        let route = cached.as_ref()?.route.clone()?;
+        let status = cached.as_ref()?;
+        let route = status.route.clone()?;
+        let host_flags = status.host_flags;
+        drop(cached);
+        drop(_lane);
+        if wake { super::component_events::foreground_observed(); }
         Some(Self {
             route,
             wifi: Some(peer),
             expiry: true,
             device_watchlist: true,
+            host_flags,
         })
+    }
+
+    pub(super) fn paired_peer(&self) -> Option<&Peer> {
+        self.wifi.as_ref()
     }
 
     pub(crate) fn supports_expiry(&self) -> bool {
@@ -125,29 +145,58 @@ impl Target {
     }
 
     pub(crate) fn publish(&self, usb: &UsbSerialManager, payload: &Value) -> Result<(), String> {
-        match &self.route {
-            Route::Usb { board, connection } => {
-                usb.send_widget_data_scoped(board, Some(*connection), payload)
+        if self.host_flags == 1 && self.wifi.is_some() && payload["source"] == "computer.status" {
+            let mut hinted = payload.clone();
+            hinted["hostActivityHint"] = true.into();
+            return publish_scoped(&self.route, self.wifi.as_ref(), usb, &hinted);
+        }
+        publish_scoped(&self.route, self.wifi.as_ref(), usb, payload)
+    }
+}
+
+// A fetch completion already owns a checked route. Reuse that exact peer and
+// USB generation without doing discovery again.
+pub(super) fn publish_scoped(
+    route: &Route,
+    wifi: Option<&Peer>,
+    usb: &UsbSerialManager,
+    payload: &Value,
+) -> Result<(), String> {
+    match route {
+        Route::Usb { board, connection } => {
+            usb.send_widget_data_scoped(board, Some(*connection), payload)
+        }
+        Route::Wifi { board, boot } => {
+            let body = request_body(board, boot, payload).ok_or("组件数据超过无线传输限制")?;
+            let _lane = background(usb).ok_or("无线组件数据传输忙")?;
+            let peer = wifi.ok_or("无线组件数据未连接")?;
+            let current = load_peer().ok_or("无线配对已变化")?;
+            if !same_peer(&current, peer) {
+                return Err("无线配对已变化".into());
             }
-            Route::Wifi { board, boot } => {
-                let body = request_body(board, boot, payload).ok_or("组件数据超过无线传输限制")?;
-                let reply = self.exchange(usb, &body, 1)?;
-                (reply == [1])
-                    .then_some(())
-                    .ok_or_else(|| "设备未接收组件数据".into())
+            require_no_usb(usb)?;
+            let reply = exchange_response(peer, MODE, &body, Some(1))
+                .map_err(|_| "无线组件数据未获确认")?;
+            if reply == [3] && payload["hostActivityHint"] == true {
+                let mut cached = STATUS.lock().map_err(|_| "无线状态不可用")?;
+                let wake = cached.as_mut().is_some_and(|old| old.mark_active(route, peer));
+                drop(cached);
+                drop(_lane);
+                if wake { super::component_events::foreground_observed(); }
+                return Ok(());
             }
+            (reply == [1]).then_some(()).ok_or_else(|| "设备未接收组件数据".into())
         }
     }
+}
 
-    fn exchange(&self, usb: &UsbSerialManager, body: &[u8], max: usize) -> Result<Vec<u8>, String> {
-        let _lane = background(usb).ok_or("无线组件数据传输忙")?;
-        let peer = self.wifi.as_ref().ok_or("无线组件数据未连接")?;
-        let current = load_peer().ok_or("无线配对已变化")?;
-        if !same_peer(&current, peer) {
-            return Err("无线配对已变化".into());
+impl CheckedPeer {
+    fn mark_active(&mut self, route: &Route, peer: &Peer) -> bool {
+        if self.host_flags != 1 || self.route.as_ref() != Some(route) || !same_peer(&self.peer, peer) {
+            return false;
         }
-        require_no_usb(usb)?;
-        exchange_response(peer, MODE, body, Some(max)).map_err(|_| "无线组件数据未获确认".into())
+        self.host_flags = 3;
+        true
     }
 }
 
@@ -162,6 +211,21 @@ fn request_body(board: &str, boot: &str, payload: &Value) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn activity_hint_requires_same_pairing_route_and_rising_edge() {
+        let peer = Peer { address:"127.0.0.1:1234".parse().unwrap(), key:zeroize::Zeroizing::new([1;16]) };
+        let route = Route::Wifi {board:"board".into(), boot:"boot".into()};
+        let mut state = CheckedPeer {peer:peer.clone(), at:Instant::now(),route:Some(route.clone()), host_flags:1};
+        let mut other = peer.clone();
+        other.key = zeroize::Zeroizing::new([2;16]);
+        assert!(!state.mark_active(&route,&other));
+        assert!(!state.mark_active(&Route::Wifi {board:"board".into(), boot:"next".into()},&peer));
+        assert!(state.mark_active(&route,&peer));
+        assert!(!state.mark_active(&route,&peer));
+        state.host_flags=0;
+        assert!(!state.mark_active(&route,&peer));
+    }
 
     #[test]
     fn request_preserves_projected_snapshot_schema_and_ttl() {

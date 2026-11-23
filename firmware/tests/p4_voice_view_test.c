@@ -24,10 +24,32 @@ int main(void) {
   pet_p4_build_view_model(&state, &view);
   assert(view.show_voice_overlay && !view.show_bubble);
 
-  // Voice always keeps the original short strip, even if a Session arrives.
+  // A real Session appearing mid-hold uses its existing card, not two overlays.
   state.session_queue_count = 1;
   pet_p4_build_view_model(&state, &view);
-  assert(view.show_voice_overlay && state.session_voice_active);
+  assert(!view.show_voice_overlay && state.session_voice_active);
+  state.voice_feedback.phase = PET_VOICE_LISTENING;
+  pet_p4_build_view_model(&state, &view);
+  assert(view.show_voice_overlay && !view.show_bubble && state.session_queue_count == 1);
+  state.session_voice_active = false;
+  state.voice_feedback.phase = PET_VOICE_DRAFT;
+  pet_p4_build_view_model(&state, &view);
+  assert(view.show_voice_overlay);
+  state.approval_active = true;
+  pet_p4_build_view_model(&state, &view);
+  assert(!view.show_voice_overlay);
+  state.approval_active = false;
+
+  // An unconfirmed outcome dismisses the overlay and restores the Agent view.
+  state.voice_feedback.phase = PET_VOICE_UNKNOWN;
+  pet_p4_build_view_model(&state, &view);
+  assert(!view.show_voice_overlay && view.show_bubble);
+  state.voice_feedback.phase = PET_VOICE_ERROR;
+  pet_p4_build_view_model(&state, &view);
+  assert(view.show_voice_overlay);
+
+  state.voice_feedback.phase = PET_VOICE_IDLE;
+  state.session_voice_active = true;
   state.session_queue_count = 0;
   pet_p4_build_view_model(&state, &view);
   assert(view.show_voice_overlay);
@@ -52,14 +74,6 @@ int main(void) {
 
   strcpy(state.current_state, "idle");
   strcpy(state.current_speech, "休息中");
-  state.voice_feedback.phase = PET_VOICE_RECOGNIZING;
-  pet_p4_build_view_model(&state, &view);
-  assert(view.show_voice_overlay && !view.show_bubble);
-  state.voice_feedback.phase = PET_VOICE_DRAFT;
-  strcpy(state.voice_feedback.text, "识别文字");
-  pet_p4_build_view_model(&state, &view);
-  assert(view.show_voice_overlay);
-  state.voice_feedback.phase = PET_VOICE_IDLE;
   pet_p4_build_view_model(&state, &view);
   assert(!view.show_voice_overlay && view.show_bubble && view.compact_bubble);
   assert(strcmp(view.body, "休息中") == 0);

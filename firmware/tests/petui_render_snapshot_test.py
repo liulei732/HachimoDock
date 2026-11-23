@@ -195,7 +195,7 @@ def test_app_frame_uses_one_publication_and_no_live_host_reads_after_capture(tmp
 #define MINIAPP_VAR_INT 1
 typedef struct {char name[32],string_value[64];int type;int32_t int_value,int_min,int_max;} miniapp_var_t;
 typedef struct {
- bool active,app_host,side_enabled,media;pet_surface_t surface;pet_form_t form;
+ char widget_id[48];int8_t mic_mode;bool active,app_host,side_enabled,media;pet_surface_t surface;pet_form_t form;
  miniapp_var_t vars[8];int var_count,current_state,current_page,button_count;
 #if PET_FORM_V2_ENABLED
  pet_form_text_config_t form_text;
@@ -205,7 +205,7 @@ typedef struct {
  pet_p4_miniapp_sprite_pack_t sprites;char media_source[48];
 } miniapp_runtime_t;
 static miniapp_runtime_t g_runtime;
-static uint32_t g_image_revision=4;static int g_pressed_node=-1;
+static uint32_t g_hw_owner,g_image_revision=4;static int g_pressed_node=-1;
 static int32_t g_pressed_scroll[PET_SURFACE_VIEWPORTS+1];
 static uint64_t g_pressed_context,g_viewport_epoch;
 #if PET_HOST_COLLECTION_ENABLED
@@ -252,7 +252,6 @@ int main(void){
 '''
     # The harness runtime names are native-owned and only the used production
     # fields are modeled; no parser/renderer is reimplemented.
-    code = code.replace(' bool active,app_host,side_enabled,media;pet_surface_t surface;', ' char widget_id[48];bool active,app_host,side_enabled,media;pet_surface_t surface;')
     code = code.replace(' strcpy(g_runtime.widget_id,"app");\n return 0;', r'''
  strcpy(g_runtime.widget_id,"app");strcpy(g_runtime.view.widget_id,"app");g_runtime.view.active=true;
  strcpy(g_runtime.view.data_source,"snapshot.source");g_runtime.view.data_page=2;

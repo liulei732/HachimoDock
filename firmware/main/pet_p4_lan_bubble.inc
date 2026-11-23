@@ -31,8 +31,8 @@ static cJSON *lan_bubble_run(const cJSON *request, pet_p4_runtime_state_t *state
     cJSON_AddStringToObject(reply, "schema", "p4-text-alpha-v2");
     cJSON_AddStringToObject(reply, "boot", pet_bubble_pixels_boot());
     if (!strcmp(phase, "capabilities")) cJSON_AddBoolToObject(reply, "glyphCells", true);
-    if (!strcmp(phase, "capabilities")) cJSON_AddBoolToObject(reply, "bodyMasks", true);
-    if (!strcmp(phase, "capabilities")) cJSON_AddBoolToObject(reply, "titleMasks", true);
+    if (!strcmp(phase, "capabilities")) cJSON_AddBoolToObject(reply, "bodyMasks", !pet_shared_font_ready());
+    if (!strcmp(phase, "capabilities")) cJSON_AddBoolToObject(reply, "titleMasks", !pet_shared_font_ready());
     pet_bubble_need_t need;
     if (!strcmp(phase, "need") && !blocked && pet_bubble_pixels_next_lan_need(now, &need)) {
       cJSON *n = cJSON_AddObjectToObject(reply, "need");

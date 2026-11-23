@@ -22,7 +22,7 @@ export function localEnabled(runtime,s,action){
 export function localInitial(s,wall){
   // Browser preview uses local civil time; firmware receives it via the heartbeat.
   const now=new Date();s.wall=wall??Math.floor(now.getTime()/1000)-now.getTimezoneOffset()*60;
-  s.local={phase:0,field:0,pending:-1,revealAt:0,draftDay:0,draftMinute:0};return s;
+  s.local={phase:0,field:0,pending:-1,revealAt:0,revealed:[[],[],[]],draftDay:0,draftMinute:0};return s;
 }
 const seconds=s=>s.wall<0?-1:s.wall+Math.floor(s.clock/1000);
 const wide=c=>c.kind==='deck'&&c.groups.some(g=>g.items.length>24);
@@ -42,10 +42,13 @@ export function localAction(runtime,state,action,entropy){
   if(c.kind==='deck'){
     if(op==='previous'||op==='next'){v[0]=mod(at+(op==='next'?1:-1),c.groups.length);l.phase=0;}
     else if(op==='close'){l.phase=0;l.pending=-1;}
-    else if(op==='reset'){clearMask(c,v,at);l.phase=0;}
+    else if(op==='reset'){clearMask(c,v,at);l.revealed[at]=[];l.phase=0;}
     else {
       if(op==='exclude'){if(l.phase!==2||v[b]<0)return state;exclude(v,at,v[b]);l.phase=0;}
-      let candidates=g.items.map((_,i)=>i).filter(i=>!excluded(v,at,i));
+      const available=g.items.map((_,i)=>i).filter(i=>!excluded(v,at,i));
+      const revealed=new Set(l.revealed[at]);
+      let candidates=available.filter(i=>!revealed.has(i));
+      if(!candidates.length){l.revealed[at]=[];candidates=available;}
       if(!candidates.length){l.phase=4;l.pending=-1;}
       else {if(candidates.length>1){const i=candidates.indexOf(v[b]);if(i>=0){candidates[i]=candidates[candidates.length-1];candidates.pop();}}
         const random=entropy??globalThis.crypto.getRandomValues(new Uint32Array(1))[0];
@@ -63,7 +66,7 @@ export function localAction(runtime,state,action,entropy){
   }return assign(s,v);
 }
 export function localAdvance(runtime,s){const c=runtime.local,l=s.local,v=values(s,c);repair(c,v);
-  if(c.kind==='deck'&&l.phase===1&&s.clock>=l.revealAt){v[2+2*v[0]]=l.pending;l.phase=2;l.pending=-1;}
+  if(c.kind==='deck'&&l.phase===1&&s.clock>=l.revealAt){v[2+2*v[0]]=l.pending;l.revealed[v[0]].push(l.pending);l.phase=2;l.pending=-1;}
   if(c.kind==='countdown'&&l.phase===5&&seconds(s)>=0)l.phase=0;
   assign(s,v);s.state=LOCAL_STATES[localView(runtime,s).phase];return s;
 }
@@ -77,7 +80,7 @@ export function localView(runtime,s){const c=runtime.local,l=s.local,v=values(s,
   }
   const day=l.phase===3?l.draftDay:v[a],minute=l.phase===3?l.draftMinute:v[b];
   if(l.phase===3){const[y,m,d]=date(day),f=l.field+(g.kind==='date'?0:3);o.headline=`调整${['年','月','日','小时','分钟'][f]}`;o.metricValue=pad([y,m,d,Math.floor(minute/60),minute%60][f]);o.note=g.kind==='date'?`${y}-${pad(m)}-${pad(d)}  ${pad(Math.floor(minute/60))}:${pad(minute%60)}`:`目标时间  ${pad(Math.floor(minute/60))}:${pad(minute%60)}`;o.metricLabel='左右选项，上下调整';return o;}
-  if(now<0){o.phase=5;o.headline='等待时间校准';o.note='连接新版 Pet Manager 校准时间后可离线使用。';o.metricValue='—';return o;}
+  if(now<0){o.phase=5;o.headline='等待时间校准';o.note='Wi-Fi 机型联网校时，也可连接电脑客户端校时。';o.metricValue='—';return o;}
   const target=localTarget(g.kind,day,minute,now);
   if(target<0){o.headline='给期待定个日子';o.metricValue='—';o.note='点设置时间，保存属于你的小期待。';return o;}
   const left=target-now;

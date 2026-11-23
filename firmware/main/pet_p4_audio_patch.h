@@ -13,9 +13,11 @@
 /* All calls require the existing physical appearance STORAGE_WORK owner, except
  * resolve which runs only under the playback worker's realtime owner. These
  * mutually exclude each other; this module never takes the runtime state lock. */
+bool pet_audio_patch_hex(const char *text,size_t digits);
+bool pet_audio_patch_number(const cJSON *object,const char *key,uint32_t maximum,uint32_t *out);
 bool pet_audio_patch_begin(int slot,const char *pack,const cJSON *files,uint32_t total,bool *attempted);
 bool pet_audio_patch_chunk(const char *path,uint32_t index,uint32_t offset,const uint8_t *bytes,size_t size,bool *attempted);
-bool pet_audio_patch_commit(bool *attempted,uint32_t *generation);
+bool pet_audio_patch_commit(bool *attempted,uint32_t *generation,bool (*current)(void));
 bool pet_audio_patch_abort(bool *attempted);
 void pet_audio_patch_retire(void);
 bool pet_audio_patch_progress(const char *path,uint32_t *index,uint32_t *bytes);

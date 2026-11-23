@@ -108,6 +108,30 @@ def check_database(database, project):
             raise SystemExit("SDK production source/build context is missing")
 
 
+def host_test_environment(project, cores):
+    # The firmware number printer uses IDF's cJSON. The managed cJSON used
+    # by other host fixtures is a separate component with different source.
+    mbedtls = cores["v3"] / "packages/framework-espidf/components/mbedtls/mbedtls"
+    images = project / "assets/builtin-surfaces"
+    packages = project.parent / "pc/builtin-clawpkgs"
+    for path in (
+        cores["v1"] / "packages/framework-espidf/components/json/cJSON/cJSON.c",
+        mbedtls / "CMakeLists.txt",
+        mbedtls / "library/gcm.c",
+        images / "city-radio/background.p4i",
+        packages / "city-radio/runtime/widget.json",
+    ):
+        if not path.is_file():
+            raise SystemExit(f"Missing firmware host test input: {path}")
+    return {
+        "PLATFORMIO_CORE_DIR": str(cores["v1"]),
+        "PETUI_HOST_MBEDTLS_SOURCE": str(mbedtls),
+        "PETUI_TEST_MBEDTLS_SOURCE": str(mbedtls),
+        "PET_APP_ENCODED_DIR": str(images),
+        "PET_APP_PACKAGE_DIR": str(packages),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--v3-core", required=True)
@@ -155,6 +179,8 @@ def main():
     for family in cores:
         database = Path(exports[f"PET_P4_{family.upper()}_COMPILE_COMMANDS"])
         check_database(database, project)
+    exports["P4_CC"] = exports["PET_V1_SDK_CC"]
+    exports.update(host_test_environment(project, cores))
     with open(github_env, "a", encoding="utf-8") as stream:
         for name, value in exports.items():
             if "\n" in value or "\r" in value:

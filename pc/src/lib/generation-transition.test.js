@@ -1,8 +1,8 @@
 /** Offline state-machine regression. Storage is injected; no generation or user data. */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import vm from "node:vm";
+import { loadGenerationTaskFixture } from "../../tests/generation-task-fixture.js";
 
 function deferred() {
   let resolve, reject;
@@ -10,15 +10,13 @@ function deferred() {
   return { promise, resolve, reject };
 }
 function harness(overrides = {}) {
-  const source = readFileSync(new URL("./generation-task.js", import.meta.url), "utf8")
-    .replace(/^import .*;\n/gm, "").replace(/^export /gm, "");
   const context = vm.createContext({ AbortController, Date, crypto: globalThis.crypto,
     clearTimeout, setTimeout, console, recordDiagnostic() {},
     CUSTOM_GENERATION_FAMILIES: [{ family: "welcome" }],
     loadGenerationSession: async () => ({ id: "old", config: { provider: "volcengine" } }),
     saveGenerationSession: async () => {}, beginGenerationSession: () => new Promise(() => {}),
     publicGenerationConfig: () => ({}), ...overrides });
-  vm.runInContext(source + "\nthis.api={startGenerationTask,dismissGenerationSession,resumeGenerationTask,getGenerationTask};", context);
+  loadGenerationTaskFixture(context, "\nglobalThis.api={startGenerationTask,dismissGenerationSession,resumeGenerationTask,getGenerationTask};");
   return context.api;
 }
 const input = { appearanceName: "new", providerConfig: { provider: "volcengine" } };

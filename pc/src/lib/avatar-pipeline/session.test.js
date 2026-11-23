@@ -127,3 +127,54 @@ test('saved-video local failure stays resumable without exposing raw diagnostics
   const cloudReview=summarizeGenerationSession({phase:'failed',manifest:session.manifest,actions:{idle:{videoBytes:new Uint8Array([1]),failed:true,qualityIntent:true}}});
   assert.equal(cloudReview.localInspectionNotice,'');
 });
+
+test('partial job goes to history only when all remaining first frames require individual handling', async () => {
+  const { QUALITY_REVIEW_VERSION } = await import('./quality.js');
+  const rejected = { failed: true, startFrameQualityVersion: QUALITY_REVIEW_VERSION, startFrameQuality: { pass: false } };
+  const unknown = { failed: true, startFrameIntent: true };
+  const session = { phase: 'partial', appearanceId: 'local', distinctStartFrames: true,
+    actions: { saved: { videoBytes: new Uint8Array([1]) }, working: rejected, error: rejected, jump: rejected, touch: unknown } };
+  session.manifest = { entries: Object.keys(session.actions).map(family => ({ family })) };
+  const summary = () => summarizeGenerationSession(session);
+  assert.match(summary().manualNotice, /3 个动作的首帧未通过检查.*1 个动作的首帧请求结果未知/);
+  for (const recoverable of [
+    {}, { ...rejected, startFrameQualityVersion: QUALITY_REVIEW_VERSION - 1 },
+    { ...unknown, startFrameResult: {} }, { ...unknown, taskId: 'pollable' },
+    { videoBytes: new Uint8Array([1]), failed: true },
+  ]) {
+    session.actions.working = recoverable;
+    assert.equal(summary().manualNotice, '');
+  }
+  session.actions.working = rejected;
+  session.phase = 'conversion_failed';
+  assert.equal(summary().manualNotice, '');
+});
+
+test('first-frame replacements exclude accepted videos and unknown submissions', async () => {
+  const { rejectedStartFrames } = await import('./session.js');
+  const verdict = { startFrameQuality: { pass: false, issues: ['姿势未变化'] } };
+  const actions = { redo: verdict, unknown: {startFrameIntent:true}, videoUnknown: {...verdict,intent:true},
+    submitted: {...verdict,taskId:'existing'}, done: {...verdict,videoBytes:new Uint8Array([1])} };
+  const session = { actions, distinctStartFrames:true, appearanceId:'local', trialApproved:true,
+    referenceApproved:true, config:{provider:'volcengine'}, manifest:{entries:Object.keys(actions).map(family=>({family}))} };
+  assert.deepEqual(rejectedStartFrames(session), ['redo']);
+  assert.deepEqual(rejectedStartFrames({...session, referenceApproved:false}), []);
+});
+
+test('selective regeneration never saves existing clips or submits unknown siblings', async () => {
+  const { runAvatarPipeline } = await import('./run.js');
+  const names = ['welcome','error','touch.what'];
+  const existing = {videoBytes:new Uint8Array([1]),validated:true};
+  const unknown = {failed:true,startFrameIntent:true};
+  const session = {actions:{welcome:existing,error:{failed:true,startFrameQuality:{pass:false,issues:['姿势过于接近原图']}},'touch.what':unknown},
+    frameRepair:{families:['error'],started:{}},trialApproved:true,referenceApproved:true};
+  const written=[];
+  const result = await runAvatarPipeline({imageFile:new File(['x'],'sample.png',{type:'image/png'}),
+    providerConfig:{provider:'volcengine',model:'fixture'},dryRun:true,skipProcessing:true,
+    familyIds:names,session,checkpoint:async()=>{},onFamilyDone:async({family})=>written.push(family.family)});
+  assert.deepEqual(written,['error']);
+  assert.equal(session.actions.welcome,existing);
+  assert.equal(session.actions['touch.what'],unknown);
+  assert.deepEqual(session.actions.error.correctionIssues,['姿势过于接近原图']);
+  assert.deepEqual(result.families.map(f=>f.ok),[true,true,false]);
+});

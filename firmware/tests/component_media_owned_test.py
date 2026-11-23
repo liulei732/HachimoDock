@@ -221,6 +221,8 @@ static bool pet_p4_miniapp_dispatch_action(const char *a,uint64_t now){(void)now
 '''
     # Use actual alarm bookkeeping and process, not a stand-in event probe.
     from p4_render_trace_test import function
+    from p4_alarm_utc_test import NO_LOCAL_GRANT_PROCESS
+    process_adapter += NO_LOCAL_GRANT_PROCESS + function(miniapp_source, 'ext_alarm_due') + '\n'
     process_adapter += function(miniapp_source, 'ext_alarms_observe_locked') + '\n'
     process_adapter += function(miniapp_source, 'miniapp_ext_process') + '\n#undef PET_P4_EVENTS\n#define PET_P4_EVENTS 0\n'
     adapter_tests = r'''

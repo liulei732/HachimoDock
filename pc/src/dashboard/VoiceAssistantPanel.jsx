@@ -5,6 +5,7 @@
  * [Sync] If this file changes, update `pc/src/dashboard/.folder.md`.
  */
 
+import { formatModelIssue } from "../lib/model-issue.js";
 import React, { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -196,7 +197,7 @@ export default function VoiceAssistantPanel({
             loading: false,
             configured: status?.configured === true,
             tone: status?.configured ? "success" : "muted",
-            message: status?.message || "请前往 API 配置补充语音识别凭据",
+            message: status?.message || "请前往模型配置补充语音识别凭据",
           });
         })
         .catch((error) => {
@@ -205,7 +206,7 @@ export default function VoiceAssistantPanel({
             loading: false,
             configured: false,
             tone: "error",
-            message: `读取云端识别配置失败: ${error}`,
+            message: formatModelIssue("storage", "本机语音识别配置", error),
           });
         });
     };
@@ -483,7 +484,7 @@ export default function VoiceAssistantPanel({
               )}
               {asrState.loading ? "读取中" : asrState.configured ? "已配置" : "待配置"}
             </span>
-            <span className="voice-panel__api-cta">前往 API 配置</span>
+            <span className="voice-panel__api-cta">前往模型配置</span>
           </span>
         </button>
 

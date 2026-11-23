@@ -5,7 +5,9 @@ const read = (path) => readFileSync(new URL(path, import.meta.url), "utf8");
 test("public builds use per-computer networking, never embedded proxy or credentials", () => {
   const llm = read("../src-tauri/src/persona_llm.rs");
   const network = read("../src-tauri/src/llm_network.rs");
-  assert.match(llm, /crate::llm_network::client/);
+  const errors = read("../src-tauri/src/model_issue.rs");
+  assert.match(llm, /model_issue::client\(LLM, REQUEST_TIMEOUT\)/);
+  assert.match(errors, /crate::llm_network::client\(timeout\)/);
   assert.doesNotMatch(llm + network, /option_env!\("PET_MANAGER_INTERNAL_(?:HTTPS_PROXY|CA_PEM)"\)/);
   assert.doesNotMatch(llm + network, /127\.0\.0\.1:7890|danger_accept_invalid_certs/);
   assert.match(network, /use_native_tls\(\)/);

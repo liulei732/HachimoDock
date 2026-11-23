@@ -1,6 +1,6 @@
 import {chromium} from 'playwright';
 import assert from 'node:assert/strict';
-const browser=await chromium.launch({executablePath:'/Applications/360Chrome.app/Contents/MacOS/360Chrome',headless:true});
+const browser=await chromium.launch({executablePath:process.env.PET_TEST_BROWSER,headless:true});
 try{
   const page=await browser.newPage({viewport:{width:960,height:880}}),errors=[];
   page.on('pageerror',e=>errors.push(e.message));

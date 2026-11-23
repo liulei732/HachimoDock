@@ -1,1 +1,1 @@
-{"id":"xiangqi","name":"中国象棋","kind":"game","version":"1.0.0","author":"PetUI","description":"轮流走子，守住己方将帅并将死或困毙对手。支持本地人机、双人同屏、走子提示和自动续局。"}
+{"id":"xiangqi","name":"中国象棋","kind":"game","version":"1.1.0","author":"PetUI","description":"双人同屏或两档人机对弈，将死或困毙对手。自动续局；光标在棋盘最右再向右，可选择悔棋、提示或菜单。","wasmTouch":true}

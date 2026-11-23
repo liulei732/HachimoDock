@@ -53,6 +53,7 @@ esp_err_t pet_p4_renderer_render_boot(
   bool *pet_visible
 );
 void pet_p4_renderer_finish_boot(void);
+bool pet_p4_renderer_voice_draft_drawn(void);
 esp_err_t pet_p4_renderer_render(
   const pet_p4_runtime_state_t *state,
   const pet_p4_view_model_t *view,

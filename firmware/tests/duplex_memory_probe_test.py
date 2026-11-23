@@ -242,8 +242,8 @@ def test_capture_stop_is_attempted_even_if_playback_flush_write_fails(monkeypatc
     class FakeLink:
         def __init__(self, port):
             self.started = self.stopped = False
-            self.s = SimpleNamespace(close=lambda: sent.append('closed'), in_waiting=1,
-                                     read=self.read)
+            self.s = IncomingPort()
+            self.s.close = lambda: sent.append('closed')
         def request(self, *args):
             return dict(ok=True, boardDeviceId='test-board', bootCount=3, faultResetCount=0,
                         runtime=dict(firmware='candidate', buildId='candidate',
@@ -259,14 +259,14 @@ def test_capture_stop_is_attempted_even_if_playback_flush_write_fails(monkeypatc
             if topic == 'audio/conversation':
                 self.started = True
                 self.stopped = payload['enabled'] is False
+                if not self.stopped:
+                    self.s.feed(message('audio/error'))
+            if topic == 'audio/query' and (not self.started or self.stopped):
+                self.s.feed(message('audio/status', boardDeviceId='test-board',
+                                    active=False, conversation=False, playbackActive=False))
         def resync_before_stop(self):
             sent.append('resync-attempted')
             raise OSError('resync failure must not suppress stop attempts')
-        def read(self, size):
-            if self.started and not self.stopped:
-                raise RuntimeError('simulated capture failure')
-            return (json.dumps(message('audio/status', boardDeviceId='test-board',
-                                       active=False, conversation=False, playbackActive=False)) + '\n').encode()
     monkeypatch.setattr(probe, 'Link', FakeLink)
     output = tmp_path / 'report.json'
     with pytest.raises(RuntimeError):
@@ -280,7 +280,24 @@ def test_capture_stop_is_attempted_even_if_playback_flush_write_fails(monkeypatc
     assert report['complete'] is False
     assert report['stopWriteFailure'] is True
     assert report['stopResyncFailure'] is True
+    assert report['receiverFailure'] == 'device_audio_error'
+    assert len(report['audio']) == 2
     assert 'resync-attempted' in sent
+
+
+def test_full_status_history_still_checks_stop_without_accepting_the_run():
+    e = evidence()
+    e.report['audio'] = [{} for _ in range(4096)]
+    stopped = dict(active=False, conversation=False, playbackActive=False)
+    with pytest.raises(RuntimeError, match='Unexpected audio device'):
+        e.consume(message('audio/status', boardDeviceId='other', **stopped))
+    assert not e.report['stopped']
+    for playing in (False, True):
+        with pytest.raises(RuntimeError, match='Audio status budget exceeded'):
+            e.consume(message('audio/status', boardDeviceId=e.board,
+                              **{**stopped, 'playbackActive': playing}))
+        assert e.report['stopped'] is (not playing)
+    assert len(e.report['audio']) == 4096
 
 
 def test_evidence_survives_driver_close_failure(monkeypatch, tmp_path):

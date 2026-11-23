@@ -35,22 +35,21 @@ test('8.3 caller spelling stays exact; an expanded receipt is never accepted as 
   expanded.item.path = expanded.item.path.replace('RUNNER~1', 'runneradmin')
   assert.throws(() => validateAclReceipt(expanded, 'verify-file', short))
 })
-test('PowerShell invocation is fixed, bounded, NoProfile/NonInteractive; only path/operation enter child env', () => {
+test('Windows ACL uses an absolute bundled executable with no inherited secrets', () => {
   let called = 0
   const result = windowsAcl('verify-file', file, { env: { SystemRoot: 'C:\\Windows', API_TOKEN: 'do-not-inherit' }, spawn(exe, args, opts) {
-    called++; assert.equal(exe, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
-    assert.deepEqual(args.slice(0, -1), ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand'])
-    const script = Buffer.from(args.at(-1), 'base64').toString('utf16le')
-    assert.equal(script, fs.readFileSync(path.join(__dirname, '../windows-acl.ps1'), 'utf8'))
-    assert.ok(script.includes('GetCurrent().User')); assert.ok(script.includes('GetAccessControl($name, $sections)')); assert.ok(script.includes('SetAccessRuleProtection($true, $false)'))
-    assert.equal(opts.timeout, 5000); assert.equal(opts.maxBuffer, 32768); assert.equal(opts.env.API_TOKEN, undefined)
-    assert.equal(opts.env.HACHIMODOCK_DSH_ACL_PATH, file); assert.equal(args.join(' ').includes(file), false)
-    assert.equal(script.includes('ReadAllText'), false); assert.equal(script.includes('Get-Content'), false)
+    called++
+    assert.equal(exe, path.resolve(__dirname, '../windows-acl.exe'))
+    assert.deepEqual(args, ['capability', 'verify-file', file])
+    assert.equal(opts.timeout, 5000)
+    assert.equal(opts.maxBuffer, 32768)
+    assert.deepEqual(Object.keys(opts.env).sort(), ['SystemRoot', 'WINDIR'])
     return { status: 0, stdout: JSON.stringify(receipt()), stderr: '' }
   } })
-  assert.equal(called, 1); assert.equal(result.currentSid, SID)
+  assert.equal(called, 1)
+  assert.equal(result.currentSid, SID)
 })
-test('PowerShell failure, timeout, bad/oversized output and insecure receipt fail closed', () => {
+test('Native verifier failure, timeout, bad/oversized output and insecure receipt fail closed', () => {
   for (const result of [{ error: Error('timeout') }, { status: 1, stdout: '{}', stderr: '' }, { status: 0, signal: 'SIGTERM', stdout: '{}', stderr: '' }, { status: 0, stdout: '{}', stderr: 'warning' }, { status: 0, stdout: 'not-json', stderr: '' }, { status: 0, stdout: 'x'.repeat(32769), stderr: '' }, { status: 0, stdout: JSON.stringify({ ...receipt(), currentSid: SYSTEM }), stderr: '' }]) assert.throws(() => windowsAcl('verify-file', file, { env: { SystemRoot: 'C:\\Windows' }, spawn: () => result }))
 })
 function fakeWriter({ failAcl, failTempAcl = false, foreignOld = false, link = false, tempCollision = false } = {}) {
@@ -64,7 +63,7 @@ function fakeWriter({ failAcl, failTempAcl = false, foreignOld = false, link = f
   const io = { constants: { O_RDONLY: 0 }, lstatSync: stat, fstatSync: n => stat(handles.get(n)), openSync(p, flags) { log.push(['open', p, flags]); if (flags === 'wx') { assert.equal(entries.has(p), false); entries.set(p, { directory: false, data: '' }) } handles.set(++fd, p); return fd },
     readFileSync() { throw Error('old credential bytes must never be read during rotation') },
     writeFileSync(n, data) { log.push(['write', handles.get(n)]); assert.equal(entries.get(handles.get(n)).protected, true); entries.get(handles.get(n)).data = data },
-    fsyncSync() {}, closeSync() {}, renameSync(a, b) { log.push(['rename', a, b]); entries.set(b, entries.get(a)); entries.delete(a) }, unlinkSync(p) { entries.delete(p) }, mkdirSync() { throw Error('PowerShell must prepare Windows directory') } }
+    fsyncSync() {}, closeSync() {}, renameSync(a, b) { log.push(['rename', a, b]); entries.set(b, entries.get(a)); entries.delete(a) }, unlinkSync(p) { entries.delete(p) }, mkdirSync() { throw Error('Native helper must prepare Windows directory') } }
   const store = createCapabilityStore({ platform: 'win32', fs: io, secret: () => { log.push(['mint-temp']); return 'new-tmp' }, acl(op, target) {
     log.push(['acl', op, target])
     if (op === failAcl || foreignOld && target === file || failTempAcl && op === 'create-file' && target !== file) throw Error('ACL rejected')
@@ -101,25 +100,12 @@ test('CreateNew collision preserves existing bytes and never writes credentials'
   assert.equal(x.entries.get('C:\\private\\.capability-new-tmp.tmp').data, 'EXISTING-NOT-OURS')
   assert.equal(x.log.some(e => e[0] === 'write'), false)
 })
-test('Windows creation receives owner/protected ACL at creation and rejects foreign existing entries', () => {
-  const script = fs.readFileSync(path.join(__dirname, '../windows-acl.ps1'), 'utf8')
-  assert.ok(script.includes('[IO.Directory]::CreateDirectory($target, $newAcl)'))
-  assert.ok(script.includes('[IO.FileMode]::CreateNew'))
-  assert.ok(script.includes('[IO.FileOptions]::None, $newAcl)'))
-  assert.ok(script.includes("if ($old.owner -ne $current.Value) { throw 'owner' }"))
+test('Windows receipt for a new file requires explicit current-user ownership', () => {
   const good = receipt('create-file')
   assert.equal(validateAclReceipt(good, 'create-file', file), good)
-  const bad = clone(good); bad.item.owner = 'S-1-5-32-544'
+  const bad = clone(good)
+  bad.item.owner = 'S-1-5-32-544'
   assert.throws(() => validateAclReceipt(bad, 'create-file', file))
-})
-test('existing credential entries persist only access rules without an audit privilege', () => {
-  const script = fs.readFileSync(path.join(__dirname, '../windows-acl.ps1'), 'utf8')
-  assert.doesNotMatch(script, /\bSet-Acl\s+|AccessControlSections\]::(?:Audit|All)\b/i)
-  assert.match(script, /if \(\$creating\) \{ \$acl\.SetOwner\(\$current\)/)
-  assert.ok(script.includes('$acl = New-PrivateAcl $directory $false'))
-  for (const kind of ['Directory', 'File']) {
-    assert.ok(script.includes(`[IO.${kind}]::SetAccessControl($name, $acl)`))
-  }
 })
 test('Windows credential directories and files survive creation and re-protection', { skip: process.platform !== 'win32' }, t => {
   const parent = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'dsh-acl-test-'))
@@ -129,6 +115,8 @@ test('Windows credential directories and files survive creation and re-protectio
   windowsAcl('prepare-directory', dir)
   windowsAcl('create-file', target)
   fs.writeFileSync(target, 'fixture')
+  assert.throws(() => windowsAcl('create-file', target))
+  assert.equal(fs.readFileSync(target, 'utf8'), 'fixture')
   windowsAcl('prepare-directory', dir)
   windowsAcl('protect-file', target)
   windowsAcl('verify-file', target)
@@ -141,11 +129,11 @@ test('actual server secures auth directory before generating epoch/tokens, inclu
   const server = new sandbox.module.exports.BridgeServer({ bootstrapFile: file })
   assert.deepEqual(log, []); await assert.rejects(server.listen(), /ACL denied/); assert.deepEqual(log, ['prepare'])
 })
-test('distributed ACL implementations and native embedded reference have one byte-identical authority', () => {
+test('both Node callers and the desktop process use the same native verifier', () => {
   const base = path.resolve(__dirname, '../../..'), bus = path.join(base, 'pc/src-tauri/bridge/packages/agent-session-bus/src/adapters')
-  for (const name of ['windows-acl.js', 'windows-acl.ps1']) assert.deepEqual(fs.readFileSync(path.join(bus, name)), fs.readFileSync(path.join(__dirname, '..', name)))
+  assert.deepEqual(fs.readFileSync(path.join(bus, 'windows-acl.js')), fs.readFileSync(path.join(__dirname, '../windows-acl.js')))
   const rust = fs.readFileSync(path.join(base, 'pc/src-tauri/src/dsh_windows_acl.rs'), 'utf8')
-  assert.ok(rust.includes('include_str!("../../../integrations/dsh-hachimodock/windows-acl.ps1")'))
+  assert.ok(rust.includes('dsh-bridge/windows-acl.exe'))
 })
 test('public profile metadata accepts trusted owners and private credentials still require the user owner', () => {
   const { createHash } = require('node:crypto')

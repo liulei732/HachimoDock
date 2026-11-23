@@ -13,7 +13,7 @@ import {
   mergeComponentCatalog,
   isComponentVisible,
   legacyAudioInstallBlockedReason,
-  componentUsbInstallBlockedReason,
+  componentInstallBlockedReason,
   isWithdrawnComponent,
   DEFAULT_COMPONENT_ORDER,
   sortComponentsByDefaultOrder,
@@ -55,12 +55,12 @@ test("USB preflight checks the declared service requirements against the current
     widgetServiceBridge:"p4-service-bridge-v1",
     widgetHostCollection:"p4-host-collection-v1",
   }}};
-  assert.match(componentUsbInstallBlockedReason(component, {}), /连接 USB/);
+  assert.match(componentInstallBlockedReason(component, {}), /连接 USB/);
   const board = {connected:true, boardDeviceId:"p4-a", capabilities:{widgetServiceBridge:true}};
-  assert.match(componentUsbInstallBlockedReason(component, board), /widgetServiceBridge=.*widgetHostCollection=/);
+  assert.match(componentInstallBlockedReason(component, board), /widgetServiceBridge=.*widgetHostCollection=/);
   board.capabilities = {...component.syncRequirements.usbCapabilities};
-  assert.equal(componentUsbInstallBlockedReason(component, board), "");
-  assert.equal(componentUsbInstallBlockedReason({id:"ordinary"}, {}), "");
+  assert.equal(componentInstallBlockedReason(component, board), "");
+  assert.equal(componentInstallBlockedReason({id:"ordinary"}, {}), "");
 });
 
 test("PC and firmware share the curated default component order", () => {
@@ -125,7 +125,7 @@ test("recent installs precede curated defaults without losing custom source revi
 });
 
 test("renamed packages preserve identity and synchronize all display titles", () => {
-  for(const [id,name,version]of [['wooden-fish','静心木鱼','1.0.5'],['book-pocket','每天一本书','1.0.2'],['wasm-2046','2048','1.4.2']]){
+  for(const [id,name,version]of [['wooden-fish','静心木鱼','1.0.6'],['book-pocket','每天一本书','1.0.3'],['wasm-2046','2048','1.5.0']]){
     const root=new URL(`../../builtin-clawpkgs/${id}/`,import.meta.url);
     const read=file=>JSON.parse(readFileSync(new URL(file,root)));
     assert.deepEqual([read('component.json').id,read('component.json').name,read('component.json').version],[id,name,version]);
@@ -157,8 +157,6 @@ test("catalog visibility is checked on active, preview, restore and creator UI r
   assert.match(center,/if \(!component \|\| !isComponentVisible\(component\) \|\| localInstallBlockedReason\(component\)\) return false/);
   assert.match(center,/isComponentVisible\(activeComponentRecord\)/);
   assert.match(center,/isComponentVisible\(item\) && !catalogIds.has\(item.id\)/);
-  const sidebar=readFileSync(new URL("../shell/ContextRail.jsx",import.meta.url),"utf8");
-  assert.match(sidebar,/isComponentVisible\(currentComponent\) && currentComponent\?\.name/);
   const removed=readFileSync(new URL("./RemovedComponents.jsx",import.meta.url),"utf8");
   assert.match(removed,/filter\(item=>!isWithdrawnComponent\(item\)\)/);
   const community=readFileSync(new URL("./CommunityCenter.jsx",import.meta.url),"utf8");
@@ -172,4 +170,20 @@ test("current radio catalog stays visible without rewriting saved copies", () =>
   assert.equal(isWithdrawnComponent(cached),false);
   assert.equal(isWithdrawnComponent({componentId:"city-radio"}),false);
   assert.equal(mergeComponentCatalog([cached],[])[0],cached);
+});
+
+test("Wi-Fi checks package byte and memory requirements before transfer", () => {
+  const caps = {widgetWasm:"hachi-wasm-v1", widgetWasmMaxBytes:196608, widgetWasmMemoryPages:4};
+  const target = {boardDeviceId:"p4-123456789abc", bootId:"1234567890abcdef", association:7, capabilities:caps};
+  const wifi = {...target, panelControl:true, controlTrusted:true, wifiConnected:true,
+    componentDelivery:true, componentBundle:true, componentTarget:target};
+  const game = {syncRequirements:{usbCapabilities:{widgetWasm:"hachi-wasm-v1"},
+    minimumLimits:{widgetWasmMaxBytes:191570, widgetWasmMemoryPages:4}}};
+  const reason = () => componentInstallBlockedReason(game, {}, wifi, target);
+  assert.equal(reason(), "");
+  caps.widgetWasmMaxBytes = 65536;
+  assert.match(reason(), /191570.*65536/);
+  caps.widgetWasmMaxBytes = 196608;
+  delete caps.widgetWasmMemoryPages;
+  assert.match(reason(), /未报告有效的 widgetWasmMemoryPages/);
 });

@@ -26,7 +26,16 @@ try {
       if (operation === "authorize") { data.connected = true; return data; }
       if (operation === "sync") { data.devices = [{ did: "speaker-1", name: "小爱音箱", homeId: "h1", home: "我的家", room: "客厅", model: "fixture.speaker", online: true }]; data.scenes = [{ id: "scene-1", name: "观影模式", home: "我的家" }]; data.syncedAt = Date.now() / 1000; return { warnings: [] }; }
       if (operation === "describe") return { properties: [{ siid: 2, piid: 1, name: "音量", service: "音箱", format: "uint8", range: [0, 100, 1], access: ["read", "write"] }], actions: [{ siid: 3, aiid: 1, name: "暂停", service: "音箱", in: [] }] };
-      if (operation === "read") return [{ siid: 2, piid: 1, value: 20, code: 0 }];
+      if (operation === "control") {
+        window.volumeAfterWrite = input.steps[0].value;
+        window.failNextRead = true;
+        return {status:"completed", results:[{result:{status:"accepted"}}]};
+      }
+      if (operation === "read") {
+        if (window.failNextRead) { window.failNextRead=false; throw Error("模拟回读超时"); }
+        if (window.failProperty) {window.failProperty=false;return [{siid:2,piid:1,code:-1}];}
+        return [{ siid: 2, piid: 1, value: window.volumeAfterWrite ?? 20, code: 0 }];
+      }
       if (operation === "plan") { data.pending.push({ ...input, id: "plan-1" }); return { status: "awaiting_confirmation" }; }
       if (operation === "approve") { const p = data.pending.shift(); data.records = [{ id: p.id, title: p.title, at: Date.now() / 1000, status: "completed", results: p.steps.map(step => ({ step, result: { status: "verified" } })) }]; return data.records[0]; }
       if (operation === "save_task") { data.tasks.push({ ...data.pending[0], id: "saved-1" }); return data; }
@@ -51,6 +60,18 @@ try {
   await page.getByRole("button", { name: "查看状态与控制" }).click();
   await page.getByText("当前：20").waitFor();
   await page.getByRole("spinbutton", { name: "音量" }).fill("25");
+  const detail = page.getByRole("dialog");
+  await detail.getByRole("button",{name:"执行本次",exact:true}).first().click();
+  await detail.getByText("上次读取：20").waitFor();
+  await detail.getByText(/操作回执：已受理，状态待确认/).waitFor();
+  await page.evaluate(()=>{window.failProperty=true;});
+  await detail.getByRole("button",{name:"重新读取状态"}).click();
+  await detail.getByText("部分设备状态读取失败，可重新读取。").waitFor();
+  await detail.getByText("上次读取：20").waitFor();
+  await detail.getByRole("button",{name:"重新读取状态"}).click();
+  await detail.getByText("当前：25").waitFor();
+  await detail.getByText(/操作回执：已受理，状态待确认/).waitFor();
+  assert.equal(await page.evaluate(()=>window.homeCalls.filter(c=>c.args.operation==="control").length),1);
   await page.getByRole("button", { name: "加入任务", exact: true }).first().click();
   await page.getByRole("button", { name: "查看任务草稿" }).click();
   await page.getByRole("button", { name: "添加等待 2 秒" }).click();

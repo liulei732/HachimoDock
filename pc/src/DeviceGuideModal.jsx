@@ -8,6 +8,7 @@
  * [Sync] If this component changes, update `pc/src/.folder.md` and
  *        `./lib/device-guide-content.js` headline copy where relevant.
  */
+import { useDialogFocus } from "./component-center/use-dialog-focus.js";
 import React, { useEffect, useState } from "react";
 import {
   ArrowLeftRight,
@@ -23,9 +24,11 @@ import {
 import { CARDS, P4_CARDS, CONTROLS, SCREENS } from "./lib/device-guide-content.js";
 import {
   clearOnboardingSeen,
+  shouldAutoOpenOnboarding,
   markOnboardingSeen,
   ONBOARDING_PAGE_IDS,
 } from "./lib/onboarding-state.js";
+import DeviceGuidePractice from "./DeviceGuidePractice.jsx";
 import Button from "./shell/Button.jsx";
 import Switch from "./shell/Switch.jsx";
 
@@ -183,22 +186,26 @@ function CardBody({ card }) {
   }
 }
 
-export default function DeviceGuideModal({ isOpen, onClose, runtime = "" }) {
-  const [index, setIndex] = useState(0);
+export default function DeviceGuideModal({ isOpen, onClose, runtime = "", usb, wifi, wifiEntry, setGuideOpen }) {
+  const [index, setIndex] = useState(-1);
   const [dontShow, setDontShow] = useState(true);
 
   useEffect(() => {
     if (isOpen) {
-      setIndex(0);
+      setIndex(-1);
       setDontShow(true);
     }
   }, [isOpen, runtime]);
 
-  if (!isOpen) return null;
-
   const cards = String(runtime).toLowerCase() === "esp-p4" ? P4_CARDS : CARDS;
+  const practice = index < 0;
   const card = cards[index];
-  const isFirst = index === 0;
+  const scope = JSON.stringify(usb?.connected
+    ? ["usb", usb.boardDeviceId, usb.connectionId, usb.bootId || usb.capabilities?.debugBootId, !!usb.boardWedged, runtime]
+    : ["wifi", wifi?.boardDeviceId, wifi?.bootId, wifi?.wifiConnected, wifi?.controlTrusted, wifi?.panelControl]);
+  useEffect(() => {
+    if (wifiEntry && shouldAutoOpenOnboarding(ONBOARDING_PAGE_IDS.DEVICE)) setGuideOpen(true);
+  }, [wifiEntry, setGuideOpen]);
   const isLast = index === cards.length - 1;
 
   const handleClose = () => {
@@ -207,9 +214,13 @@ export default function DeviceGuideModal({ isOpen, onClose, runtime = "" }) {
     onClose();
   };
 
+  const dialogRef = useDialogFocus(handleClose, false, isOpen);
+  if (!isOpen) return wifiEntry
+    ? <Button size="small" onClick={() => setGuideOpen(true)}>首次设备体验</Button> : null;
   return (
     <div className="modal-backdrop" onClick={handleClose}>
       <div
+        ref={dialogRef} tabIndex={-1}
         className="modal-card device-guide-modal"
         role="dialog"
         aria-modal="true"
@@ -218,15 +229,15 @@ export default function DeviceGuideModal({ isOpen, onClose, runtime = "" }) {
       >
         <div className="modal-header">
           <div className="device-guide-title-block">
-            <span className="device-guide-step-count">设备操作 · {index + 1}/{cards.length}</span>
-            <h2 id="device-guide-title" className="modal-title">{card.title}</h2>
+            <span className="device-guide-step-count">{practice ? "首次体验" : `设备操作 · ${index + 1}/${cards.length}`}</span>
+            <h2 id="device-guide-title" className="modal-title">{practice ? "试试你的桌宠" : card.title}</h2>
           </div>
           <button type="button" className="icon-btn" onClick={handleClose} aria-label="关闭引导">
             <X size={18} />
           </button>
         </div>
 
-        <div className="device-guide-steps" role="tablist" aria-label="设备操作教程">
+        {!practice && <div className="device-guide-steps" role="tablist" aria-label="设备操作教程">
           {cards.map((candidate, candidateIndex) => (
             <button
               key={candidate.id}
@@ -240,12 +251,17 @@ export default function DeviceGuideModal({ isOpen, onClose, runtime = "" }) {
               {candidate.shortTitle || candidate.title}
             </button>
           ))}
-        </div>
+        </div>}
 
-        <div className="modal-body" role="tabpanel" aria-labelledby="device-guide-title">
-          <div key={card.id} className="device-guide-card-stage">
-            <CardBody card={card} />
+        <div className="modal-body" role={practice ? "region" : "tabpanel"} aria-labelledby="device-guide-title">
+          <div hidden={!practice}>
+            <DeviceGuidePractice key={scope} usb={usb} wifi={wifi} runtime={runtime} />
           </div>
+          {!practice && (
+            <div key={card.id} className="device-guide-card-stage">
+              <CardBody card={card} />
+            </div>
+          )}
         </div>
 
         <div className="device-guide-footer">
@@ -256,15 +272,14 @@ export default function DeviceGuideModal({ isOpen, onClose, runtime = "" }) {
             className="device-guide-dontshow"
           />
           <div className="device-guide-nav">
-            <Button
-              variant="secondary"
-              size="small"
-              onClick={() => setIndex((current) => Math.max(0, current - 1))}
-              disabled={isFirst}
-            >
-              <ChevronLeft size={14} /> 上一页
-            </Button>
-            {isLast ? (
+            {practice ? (
+              <Button variant="secondary" size="small" onClick={() => setIndex(0)}>操作教程</Button>
+            ) : (
+              <Button variant="secondary" size="small" onClick={() => setIndex(index - 1)}>
+                <ChevronLeft size={14} /> 上一页
+              </Button>
+            )}
+            {practice || isLast ? (
               <Button variant="primary" size="small" onClick={handleClose}>
                 完成
               </Button>

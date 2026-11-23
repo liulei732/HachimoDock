@@ -87,9 +87,10 @@ static int64_t esp_timer_get_time(void) { return capture_loop_testing?capture_te
 static void pet_p4_afe_reference(const int16_t *pcm, size_t count) { (void)pcm; (void)count; }
 static void pet_p4_afe_reference_abort(void) {}
 static void pet_p4_afe_reset_stream(void) { resets++; }
-static void send_audio_error(const char *session, const char *error, const char *detail) { (void)session; (void)error; (void)detail; }
+static void send_audio_error(const char *owner, const char *session, const char *error, const char *detail) { (void)owner; (void)session; (void)error; (void)detail; }
 void pet_p4_audio_send_status(void) {assert(!ingress_held);}
 void pet_p4_audio_diagnostic(const char *event, const char *session, size_t bytes, bool ok) { assert(!ingress_held); (void)event; (void)session; (void)bytes; (void)ok; }
+bool pet_p4_audio_stream_playing(void) { return atomic_load(&g_stream_playing); }
 bool pet_p4_audio_ready(void) { return atomic_load(&g_ready); }
 bool pet_p4_audio_enabled(void) { return atomic_load(&g_enabled); }
 bool pet_p4_audio_playback_ready(void) { return atomic_load(&g_playback_ready); }
@@ -129,7 +130,7 @@ static void storage_denied(void) {
 }
 static void capture_aba(void) {
   assert(pet_p4_audio_capture_start_owned(true, "old") == ESP_OK && reservations() == 1);
-  pet_resource_realtime_t old_worker = {0}; assert(capture_worker_take(&old_worker,NULL,NULL));
+  pet_resource_realtime_t old_worker = {0}; assert(capture_worker_take(&old_worker,NULL,NULL,NULL));
   pet_resource_realtime_t stale = old_worker;
   assert(pet_p4_audio_capture_stop_owned("wrong") == ESP_ERR_INVALID_STATE);
   assert(pet_p4_audio_capture_stop_owned("old") == ESP_OK && reservations() == 1);
@@ -138,16 +139,16 @@ static void capture_aba(void) {
   assert(atomic_load(&g_capture_requested)&&g_capture_pending.serial);
   capture_worker_done(); pet_resources_device_realtime_end(&old_worker);
   assert(reservations() == 1); storage_denied();
-  pet_resource_realtime_t new_worker = {0}; assert(capture_worker_take(&new_worker,NULL,NULL));
+  pet_resource_realtime_t new_worker = {0}; assert(capture_worker_take(&new_worker,NULL,NULL,NULL));
   pet_resources_device_realtime_end(&stale); assert(reservations() == 1);
   assert(pet_p4_audio_capture_stop() == ESP_OK && reservations() == 1);
   capture_worker_done(); pet_resources_device_realtime_end(&new_worker); assert(!reservations());
   assert(pet_p4_audio_capture_start(true) == ESP_OK);
   assert(pet_p4_audio_set_enabled(false) == ESP_OK && !reservations());
-  pet_resource_realtime_t disabled = {0}; assert(!capture_worker_take(&disabled,NULL,NULL));
+  pet_resource_realtime_t disabled = {0}; assert(!capture_worker_take(&disabled,NULL,NULL,NULL));
   pet_resources_device_realtime_end(&disabled); assert(pet_p4_audio_set_enabled(true) == ESP_OK);
   assert(pet_p4_audio_capture_start(true)==ESP_OK);
-  pet_resource_realtime_t failed={0};assert(capture_worker_take(&failed,NULL,NULL)&&capture_worker_current(failed));
+  pet_resource_realtime_t failed={0};assert(capture_worker_take(&failed,NULL,NULL,NULL)&&capture_worker_current(failed));
   capture_worker_cancel(failed);assert(!atomic_load(&g_capture_requested)&&!capture_worker_current(failed));
   assert(reservations()==1);capture_worker_done();pet_resources_device_realtime_end(&failed);assert(!reservations());
 }
@@ -157,7 +158,7 @@ static void overlapping_sessions(void) {
   assert(held == 2); /* Conversation intent and capture request. */
   assert(pet_p4_audio_conversation_set(true, false, "conversation") == ESP_OK);
   assert(reservations() == held && resets == old_resets);
-  pet_resource_realtime_t capture = {0}; assert(capture_worker_take(&capture,NULL,NULL));
+  pet_resource_realtime_t capture = {0}; assert(capture_worker_take(&capture,NULL,NULL,NULL));
   assert(pet_p4_audio_stream_begin("voice") == ESP_OK && reservations() == 3);
   assert(pet_p4_audio_music_begin("music-no") == ESP_ERR_INVALID_STATE && reservations() == 3);
   assert(pet_p4_audio_conversation_set(false, false, "") == ESP_OK);
@@ -361,11 +362,16 @@ static void replace_capture_request(void){
   assert(reservations()==2); /* Old physical read plus the new pending request. */
 }
 static int64_t capture_test_time(void){
-  if(capture_fault==4&&!replaced&&capture_begins==0){
-    /* Deterministic take -> stop/new request -> actual begin serialization.
-     * The new request clears the global owner before the old begin is sent. */
-    assert(atomic_load(&g_capture_active)&&!strcmp(g_capture_owner,"old-owner"));
-    assert(pet_p4_audio_capture_stop_owned("old-owner")==ESP_OK);
+  if ((capture_fault == 4 || capture_fault == 5) && !replaced && capture_begins == 0) {
+    /* A replacement can publish after take and before the old Begin. */
+    assert(atomic_load(&g_capture_active));
+    if (capture_fault == 4) {
+      assert(!strcmp(g_capture_owner, "old-owner"));
+      assert(pet_p4_audio_capture_stop_owned("old-owner") == ESP_OK);
+    } else {
+      assert(!g_capture_owner[0] && g_capture_feedback_token == 37);
+      assert(pet_p4_audio_capture_stop() == ESP_OK);
+    }
     assert(pet_p4_audio_capture_start(false)==ESP_OK);
     assert(!g_capture_owner[0]&&reservations()==2);replaced=true;
   }
@@ -383,7 +389,20 @@ static bool pet_p4_afe_ready(void){return false;}
 static bool pet_p4_afe_feed(const int16_t *pcm){(void)pcm;return false;}
 static bool pet_p4_afe_take(int16_t *pcm,bool *speech){(void)pcm;(void)speech;return false;}
 static bool playback_gates_capture(uint64_t now){(void)now;return false;}
+static unsigned meter_reads, meter_fault;
 static int esp_codec_dev_read(int device,void *pcm,int bytes){
+  if (meter_fault) {
+    assert(device == g_microphone && bytes == 640 && reservations() == 1);
+    int16_t *samples = pcm;
+    for (int i = 0; i < bytes / 2; i++) samples[i] = -16384;
+    if (++meter_reads == 2) {
+      assert(pet_p4_audio_meter_read(11) == 50);
+      if (meter_fault == 1) pet_p4_audio_meter_select(12); /* exit during read */
+      else if (meter_fault == 2) atomic_store(&g_capture_requested, true);
+      else return ESP_FAIL;
+    }
+    return ESP_OK;
+  }
   (void)device;assert(bytes==PET_P4_AUDIO_FRAME_BYTES&&reservations()>0);memset(pcm,5,(size_t)bytes);
   if(capture_begins==1&&capture_fault<2){replace_capture_request();return capture_fault==1?ESP_FAIL:ESP_OK;}
   return ESP_OK;
@@ -393,12 +412,19 @@ static uint64_t fnv1a64_update(uint64_t hash,const uint8_t *bytes,size_t length)
 }
 static const char *g_board_device_id="test-board";
 static void add_conversation_metadata(cJSON *payload){(void)payload;}
-static void send_topic(const char *topic,cJSON *payload){
+static bool capture_frame(const char *capture_owner, const char *topic, cJSON *payload, bool live){
+  assert(!live);
   assert(!strcmp(topic,"audio/begin"));
   assert(capture_begins<2&&capture_ends==capture_begins);
   const cJSON *session=cJSON_GetObjectItemCaseSensitive(payload,"sessionId");
   const cJSON *owner=cJSON_GetObjectItemCaseSensitive(payload,"captureOwner");
+  const cJSON *token = cJSON_GetObjectItemCaseSensitive(payload, "voiceFeedbackToken");
+  if (capture_fault == 5 && capture_begins == 0) {
+    assert(replaced && !g_capture_feedback_token);
+    assert(cJSON_IsNumber(token) && token->valueint == 37);
+  } else assert(!token);
   assert(cJSON_IsString(session)&&cJSON_IsString(owner));
+  assert(!strcmp(capture_owner, owner->valuestring));
   assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(payload,"sessionQueueEmpty"))==(capture_begins==0));
   assert(!strcmp(owner->valuestring,capture_fault==4&&capture_begins==0?"old-owner":""));
   if(capture_fault==4&&capture_begins==0){
@@ -407,10 +433,12 @@ static void send_topic(const char *topic,cJSON *payload){
   snprintf(capture_sessions[capture_begins++],64,"%s",session->valuestring);
   if(capture_begins==2)assert(strcmp(capture_sessions[0],capture_sessions[1]));
   cJSON_Delete(payload);
+  return true;
 }
 #include "production_audio_begin.inc"
-static bool send_audio_chunk(const char *session,uint32_t index,const uint8_t *pcm,
+static bool send_audio_chunk(const char *owner, const char *session,uint32_t index,const uint8_t *pcm,
   size_t length,bool processed,bool speech,const char *conversation){
+  assert(owner && !owner[0]);
   (void)pcm;(void)processed;(void)speech;(void)conversation;
   assert(index==0&&length==PET_P4_AUDIO_FRAME_BYTES);
   if(capture_begins==1){
@@ -420,8 +448,9 @@ static bool send_audio_chunk(const char *session,uint32_t index,const uint8_t *p
   assert(capture_begins==2&&!strcmp(session,capture_sessions[1]));
   new_chunks++;assert(pet_p4_audio_capture_stop()==ESP_OK);return true;
 }
-static void send_audio_end(const char *session,const char *reason,uint32_t chunks,
+static void send_audio_end(const char *owner, const char *session,const char *reason,uint32_t chunks,
   uint64_t bytes,uint64_t hash){
+  assert(!strcmp(owner, capture_fault == 4 && capture_ends == 0 ? "old-owner" : ""));
   (void)hash;assert(capture_ends<2&&!strcmp(session,capture_sessions[capture_ends]));
   if(capture_ends==0){
     assert(chunks==0&&bytes==0&&atomic_load(&g_capture_requested)&&g_capture_pending.serial);
@@ -433,10 +462,12 @@ static atomic_uint g_usb_capture_tx_pending;
 #include "production_capture_task.inc"
 static void *run_actual_capture(void *unused){audio_task(unused);return NULL;}
 static void actual_capture_stop_start_sessions(void){
-  for(capture_fault=0;capture_fault<5;capture_fault++){
+  for(capture_fault=0;capture_fault<6;capture_fault++){
     capture_begins=capture_ends=new_chunks=old_chunk_attempts=0;replaced=false;
     capture_loop_testing=true;
-    assert(pet_p4_audio_capture_start_owned(true,capture_fault==4?"old-owner":"")==ESP_OK);
+    assert((capture_fault == 5 ? pet_p4_audio_capture_start_button(true, 37)
+                               : pet_p4_audio_capture_start_owned(true, capture_fault == 4 ? "old-owner" : ""))
+      == ESP_OK);
     pthread_t thread;assert(!pthread_create(&thread,NULL,run_actual_capture,NULL));
     assert(!pthread_join(thread,NULL));
     capture_loop_testing=false;
@@ -445,10 +476,40 @@ static void actual_capture_stop_start_sessions(void){
     assert(!atomic_load(&g_capture_requested)&&!atomic_load(&g_capture_active)&&!g_capture_pending.serial);
   }
 }
+static void actual_meter_consent_and_preemption(void) {
+  for (meter_fault = 1; meter_fault <= 3; ++meter_fault) {
+    meter_reads = 0;
+    pet_p4_audio_meter_select(0);
+    pet_p4_audio_meter_select(11);
+    pet_p4_audio_meter_key(11, true, false, 400);
+    pet_p4_audio_meter_key(11, false, true, 401);
+    meter_work();
+    assert(meter_reads == 0);
+    pet_p4_audio_meter_shown(11, 500);
+    pet_p4_audio_meter_key(11, true, false, 499);
+    pet_p4_audio_meter_key(11, false, true, 900);
+    pet_p4_audio_meter_key(12, true, false, 901);
+    pet_p4_audio_meter_key(11, false, true, 902);
+    meter_work();
+    assert(!meter_reads && pet_p4_audio_meter_read(11) == -1);
+    pet_p4_audio_meter_key(11, true, false, 910);
+    pet_p4_audio_meter_key(11, false, true, 950);
+    meter_work();
+    assert(meter_reads == 2 && reservations() == 0 && !capture_begins && !capture_ends);
+    assert(pet_p4_audio_meter_read(11) == (meter_fault == 1 ? -1 : -2));
+    atomic_store(&g_capture_requested, false);
+    meter_work();
+    assert(meter_reads == 2); /* never resume when competing owner leaves */
+  }
+  meter_fault = 0;
+  pet_p4_audio_meter_select(0);
+}
+
 int main(void) {
   pthread_mutexattr_t attr; assert(!pthread_mutexattr_init(&attr));
   assert(!pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE));
   assert(!pthread_mutex_init(&stream_lock, &attr)); assert(!pthread_mutexattr_destroy(&attr));
+  actual_meter_consent_and_preemption();
   capture_aba(); overlapping_sessions(); actual_write_completion();actual_capture_stop_start_sessions();
   actual_ingress_flush_boundary();actual_wasm_speech();
   puts("PASS production capture, overlapping audio sessions, paused music, and WASM speech ownership and physical write cancellation");

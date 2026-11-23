@@ -27,7 +27,7 @@
     "action": "lab.a",
     "control": "SW1",
     "event": "button.sw1.short_press",
-    "label": "消除本组"
+    "label": "确认消除选中组"
   },
   {
     "action": "lab.b",

@@ -62,29 +62,90 @@ esp_tls_t *pet_live_tls_connect_port(const char *host, uint16_t port, const esp_
 
 #ifdef ESP_PLATFORM
 #include "esp_crt_bundle.h"
-#include "lwip/netdb.h"
+#include <stdatomic.h>
+#include "lwip/dns.h"
+#include "lwip/tcpip.h"
 #include "lwip/inet.h"
+#include "lwip/sockets.h"
 #include "pet_p4_wifi_endpoint.h"
+
+/* lwIP owns the callback until completion. An abandoned slot stays reserved
+ * so a late reply can neither access a caller's stack nor answer a new lookup. */
+enum { DNS_FREE, DNS_PENDING, DNS_ABANDONED, DNS_READY };
+typedef struct {
+  atomic_uint state;
+  char host[sizeof(((pet_wifi_endpoint_t *)0)->host)];
+  uint32_t address;
+} public_dns_slot_t;
+static public_dns_slot_t public_dns_slots[2];
+
+static void public_dns_complete(const char *name, const ip_addr_t *answer, void *context) {
+  (void)name;
+  public_dns_slot_t *slot = context;
+  slot->address = 0;
+  /* ESP lwIP returns DNS_MAX_HOST_IP entries, including for cached answers. */
+  for (unsigned i = 0; answer && i < DNS_MAX_HOST_IP; ++i) {
+    if (!IP_IS_V4(&answer[i])) continue;
+    uint32_t candidate = ip4_addr_get_u32(ip_2_ip4(&answer[i]));
+    if (pet_wifi_endpoint_public_ipv4(ntohl(candidate))) {
+      slot->address = candidate;
+      break;
+    }
+  }
+  unsigned pending = DNS_PENDING;
+  if (!atomic_compare_exchange_strong(&slot->state, &pending, DNS_READY))
+    atomic_store(&slot->state, DNS_FREE);
+}
+
+static void public_dns_start(void *context) {
+  public_dns_slot_t *slot = context;
+  ip_addr_t answer[DNS_MAX_HOST_IP] = {0};
+  if (atomic_load(&slot->state) == DNS_ABANDONED) {
+    atomic_store(&slot->state, DNS_FREE);
+    return;
+  }
+  err_t result = dns_gethostbyname_addrtype(slot->host, answer, public_dns_complete, slot, LWIP_DNS_ADDRTYPE_IPV4);
+  if (result != ERR_INPROGRESS)
+    public_dns_complete(NULL, result == ERR_OK ? answer : NULL, slot);
+}
+
+static bool public_dns_resolve(const char *host, int64_t deadline, pet_live_tls_current_fn current,
+                               void *context, char ip[INET_ADDRSTRLEN]) {
+  const int64_t start = esp_timer_get_time() / 1000;
+  if (!host || strlen(host) >= sizeof(public_dns_slots[0].host) || start >= deadline || !current(context))
+    return false;
+  if (deadline > start + 2000) deadline = start + 2000;
+  for (size_t i = 0; i < sizeof(public_dns_slots)/sizeof(public_dns_slots[0]); i++) {
+    public_dns_slot_t *slot = &public_dns_slots[i];
+    unsigned state = DNS_FREE;
+    if (!atomic_compare_exchange_strong(&slot->state, &state, DNS_PENDING)) continue;
+    strcpy(slot->host, host);
+    if (tcpip_try_callback(public_dns_start, slot) != ERR_OK) {
+      atomic_store(&slot->state, DNS_FREE);
+      return false;
+    }
+    while (current(context) && esp_timer_get_time() / 1000 < deadline) {
+      if (atomic_load(&slot->state) == DNS_READY) {
+        uint32_t address = slot->address;
+        atomic_store(&slot->state, DNS_FREE);
+        return address &&
+               inet_ntop(AF_INET, &address, ip, INET_ADDRSTRLEN) != NULL;
+      }
+      vTaskDelay(pdMS_TO_TICKS(20) + 1);
+    }
+    state = DNS_PENDING;
+    if (!atomic_compare_exchange_strong(&slot->state, &state, DNS_ABANDONED))
+      atomic_store(&slot->state, DNS_FREE); /* Completion won the race. */
+    return false;
+  }
+  return false;
+}
 
 esp_tls_t *pet_live_tls_connect_public_port(const char *host, uint16_t port,
     const esp_tls_cfg_t *config, int64_t deadline, pet_live_tls_current_fn current,
     void *context) {
-  const struct addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_STREAM};
-  struct addrinfo *results = NULL;
-  if (!current(context)) return NULL;
-  if (getaddrinfo(host, NULL, &hints, &results) != 0) {
-    if (current(context)) pet_device_wifi_note_https(PET_WIFI_HTTPS_DNS, 0);
-    return NULL;
-  }
   char ip[INET_ADDRSTRLEN] = {0};
-  for (const struct addrinfo *it = results; it; it = it->ai_next) {
-    if (it->ai_family != AF_INET || it->ai_addrlen < sizeof(struct sockaddr_in)) continue;
-    const struct sockaddr_in *address = (const struct sockaddr_in *)it->ai_addr;
-    if (pet_wifi_endpoint_public_ipv4(ntohl(address->sin_addr.s_addr)) &&
-        inet_ntop(AF_INET, &address->sin_addr, ip, sizeof(ip))) break;
-  }
-  freeaddrinfo(results);
-  if (!ip[0]) {
+  if (!public_dns_resolve(host, deadline, current, context, ip)) {
     if (current(context)) pet_device_wifi_note_https(PET_WIFI_HTTPS_DNS, 0);
     return NULL;
   }

@@ -1,0 +1,7 @@
+{
+  "title": "安静练习",
+  "description": "在设备上练习保持安静，电平达到 20 时提示超过阈值。",
+  "author": "PetUI",
+  "category": "tool",
+  "license": "HachimoDock Project License"
+}

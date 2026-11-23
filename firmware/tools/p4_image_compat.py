@@ -1,5 +1,16 @@
 """Pure ESP image-header validation shared by factory packaging and flashing."""
 
+import re
+
+
+def image_application_version(app: bytes) -> str:
+    if len(app) < 112 or app[32:36] != bytes.fromhex("3254cdab"):
+        raise ValueError("factory application has no valid ESP app descriptor")
+    version = app[48:80].split(b"\0", 1)[0].decode("ascii")
+    if not re.fullmatch(r"[0-9A-Za-z._-]+", version):
+        raise ValueError("invalid factory application version")
+    return version
+
 
 def image_revision_range(data: bytes, offset: int = 0) -> tuple[int, int]:
     header = data[offset:offset + 24]

@@ -10,6 +10,8 @@
  *        `pc/docs/realtime-chat.md`.
  */
 
+use crate::model_issue::{self, TTS};
+
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::time::Duration;
@@ -38,8 +40,13 @@ const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_PCM_BYTES: usize = 32 * 1024 * 1024;
 
 fn retry_safe(emitted: usize, error: &str) -> bool {
+    let detail=error.strip_prefix("[TTS] ").unwrap_or(error);
+    if ["WebSocket HTTP 4", "HTTP 4", "WS 1008 "].iter().any(|prefix| detail.starts_with(prefix)) {
+        return false;
+    }
     let kind=crate::realtime_chat_log::error_kind(error);
-    emitted == 0 && !matches!(kind,"authentication"|"resource_permission"|"tts_resource_mismatch")
+    emitted == 0 && (!error.contains("SessionFailed") || error.contains("speech_rate"))
+        && !error.contains("音色与资源不匹配") && !matches!(kind,"authentication"|"resource_permission"|"tts_resource_mismatch")
         && (kind != "tts_session_rejected" || error.contains("speech_rate"))
 }
 
@@ -65,7 +72,7 @@ const EVENT_SESSION_FAILED: i32 = 153;
 const EVENT_TASK_REQUEST: i32 = 200;
 const EVENT_TTS_RESPONSE: i32 = 352;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DoubaoTtsConfig {
     pub api_key: String,
     pub resource_id: String,
@@ -74,7 +81,7 @@ pub struct DoubaoTtsConfig {
     /// 1.0 = normal; mapped onto the provider's speech_rate (-50..100) when not 1.0.
     pub speed: f32,
     pub ws_url: String,
-    /// "volcengine" (built-in) or "openai" (custom OpenAI-compatible endpoint).
+    /// Speech provider selected in the shared ASR/TTS profile (volcengine, mimo, or openai).
     pub tts_provider: String,
     pub tts_base_url: String,
     pub tts_model: String,
@@ -211,12 +218,15 @@ fn decode_frame(data: &[u8]) -> Result<Frame, String> {
     Ok(frame)
 }
 
-fn redact(text: &str, secret: &str) -> String {
-    let mut out = text.replace('\n', " ");
-    if !secret.is_empty() {
-        out = out.replace(secret, "<redacted>");
-    }
-    out.chars().take(400).collect()
+fn frame_failure(frame: &Frame) -> String {
+    let body: serde_json::Value = serde_json::from_slice(&frame.payload).unwrap_or_default();
+    let code = if frame.error_code != 0 { json!(frame.error_code) } else { body["code"].clone() };
+    let reason = String::from_utf8_lossy(&frame.payload).to_ascii_lowercase();
+    // Preserve the existing rate-hint fallback without exposing provider text.
+    let hint = if reason.contains("mismatched") { "音色与资源不匹配" }
+        else if reason.contains("speech_rate") { "服务不支持 speech_rate" }
+        else { "SessionFailed" };
+    format!("{} {hint}", model_issue::business(TTS, &code))
 }
 
 type Socket = crate::llm_network::CloudSocket;
@@ -255,29 +265,20 @@ impl DoubaoTtsClient {
             .into_client_request()
             .map_err(|error| format!("TTS 地址无效: {error}"))?;
         let headers = request.headers_mut();
-        headers.insert("X-Api-Key", HeaderValue::from_str(&self.cfg.api_key).map_err(|e| e.to_string())?);
-        headers.insert("X-Api-Resource-Id", HeaderValue::from_str(&self.cfg.resource_id).map_err(|e| e.to_string())?);
+        headers.insert("X-Api-Key", HeaderValue::from_str(&self.cfg.api_key).map_err(|_| "[TTS] API Key 格式无效")?);
+        headers.insert("X-Api-Resource-Id", HeaderValue::from_str(&self.cfg.resource_id).map_err(|_| "[TTS] 资源 ID 格式无效")?);
         headers.insert(
             "X-Api-Connect-Id",
             HeaderValue::from_str(&Uuid::new_v4().simple().to_string()).map_err(|e| e.to_string())?,
         );
-        let (mut socket, _) = timeout(CONNECT_TIMEOUT, crate::llm_network::connect_websocket(request))
+        let (mut socket, _) = timeout(CONNECT_TIMEOUT, crate::llm_network::connect_websocket(TTS,request))
             .await
             .map_err(|_| "豆包 TTS 连接超时".to_string())?
-            .map_err(|error| {
-                let text = redact(&error.to_string(), &self.cfg.api_key);
-                if text.contains("401") {
-                    format!("豆包 TTS 鉴权失败（请核对 TTS API Key）: {text}")
-                } else if text.contains("403") {
-                    format!("豆包 TTS 资源未授权（请在火山控制台开通 {}）: {text}", self.cfg.resource_id)
-                } else {
-                    format!("豆包 TTS 连接失败: {text}")
-                }
-            })?;
+            .map_err(|e| model_issue::local(TTS,e))?;
         socket
             .send(WsMessage::Binary(encode_client_event(EVENT_START_CONNECTION, "", b"{}").into()))
             .await
-            .map_err(|error| format!("豆包 TTS StartConnection 发送失败: {error}"))?;
+            .map_err(|e| model_issue::websocket(TTS,e))?;
         let started = timeout(CONNECT_TIMEOUT, Self::wait_for_event(&mut socket, EVENT_CONNECTION_STARTED))
             .await
             .map_err(|_| "豆包 TTS 等待 ConnectionStarted 超时".to_string())?;
@@ -293,14 +294,10 @@ impl DoubaoTtsClient {
         loop {
             let frame = Self::receive(socket).await?;
             if frame.msg_type == MSG_ERROR {
-                return Err(format!(
-                    "豆包 TTS 协议错误 ({}): {}",
-                    frame.error_code,
-                    String::from_utf8_lossy(&frame.payload)
-                ));
+                return Err(frame_failure(&frame));
             }
             if frame.event == EVENT_CONNECTION_FAILED {
-                return Err(format!("豆包 TTS ConnectionFailed: {}", String::from_utf8_lossy(&frame.payload)));
+                return Err(frame_failure(&frame));
             }
             if frame.msg_type == MSG_FULL_SERVER_RESPONSE && frame.event == event {
                 return Ok(frame);
@@ -313,12 +310,12 @@ impl DoubaoTtsClient {
             match socket.next().await {
                 Some(Ok(WsMessage::Binary(data))) => return decode_frame(&data),
                 Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => continue,
-                Some(Ok(WsMessage::Text(text))) => return Err(format!("豆包 TTS 返回了意外的文本帧: {text}")),
+                Some(Ok(WsMessage::Text(_))) => return Err("[TTS] 协议错误：收到意外文本帧".into()),
                 Some(Ok(WsMessage::Close(frame))) => {
-                    return Err(format!("豆包 TTS 连接被关闭: {:?}", frame.map(|f| f.reason.to_string())))
+                    return Err(model_issue::closed(TTS,frame.map(|f| f.code.into())))
                 }
                 Some(Ok(_)) => continue,
-                Some(Err(error)) => return Err(format!("豆包 TTS 接收失败: {error}")),
+                Some(Err(e)) => return Err(model_issue::websocket(TTS,e)),
                 None => return Err("豆包 TTS 连接已结束".to_string()),
             }
         }
@@ -365,8 +362,14 @@ impl DoubaoTtsClient {
     where
         F: FnMut(&[u8]),
     {
-        if self.cfg.tts_provider == "openai" {
-            return crate::openai_tts::synthesize(&self.cfg, text, &mut on_pcm).await;
+        self.synthesize_paced(text, |pcm| { on_pcm(pcm); std::future::ready(Ok(())) }).await
+            .map_err(|e| model_issue::local(TTS,e))
+    }
+
+    pub async fn synthesize_paced<F, Fut>(&mut self, text: &str, mut on_pcm: F) -> Result<usize, String>
+    where F: FnMut(&[u8]) -> Fut, Fut: std::future::Future<Output=Result<(), String>> {
+        if crate::voice_chat_settings::buffered_speech(&self.cfg.tts_provider) {
+            return crate::openai_tts::synthesize_paced(&self.cfg, text, &mut on_pcm).await;
         }
         let clean = text.trim();
         if clean.is_empty() {
@@ -381,13 +384,14 @@ impl DoubaoTtsClient {
         let mut last_error = String::new();
         for _attempt in 0..3 {
             if let Err(error) = self.ensure_ready().await {
+                if !retry_safe(0,&error) { return Err(error); }
                 last_error = error;
                 continue;
             }
             let with_rate_hint = !self.rate_hint_rejected;
             let mut emitted = 0;
             let result = timeout(SESSION_TIMEOUT, self.synthesize_once(clean, with_rate_hint, &mut |pcm| {
-                emitted += pcm.len(); on_pcm(pcm);
+                emitted += pcm.len(); on_pcm(pcm)
             })).await;
             match result {
                 Ok(Ok(total)) => return Ok(total),
@@ -400,8 +404,8 @@ impl DoubaoTtsClient {
                     last_error = error;
                     self.reset().await;
                     // Configuration/permission errors cannot be fixed by repeating the same request.
-                    if last_error.contains("mismatched") {
-                        return Err("音色与语音资源不匹配，请在人设与声音中选择 TTS 2.0 音色（55000000）".into());
+                    if last_error.contains("音色与资源不匹配") {
+                        return Err(last_error);
                     }
                     if !retry_safe(emitted,&last_error) { return Err(last_error); }
                 }
@@ -415,24 +419,22 @@ impl DoubaoTtsClient {
         Err(last_error)
     }
 
-    async fn synthesize_once<F>(&mut self, text: &str, with_rate_hint: bool, on_pcm: &mut F) -> Result<usize, String>
-    where
-        F: FnMut(&[u8]),
+    async fn synthesize_once<F, Fut>(&mut self, text: &str, with_rate_hint: bool, on_pcm: &mut F) -> Result<usize, String>
+    where F: FnMut(&[u8]) -> Fut, Fut: std::future::Future<Output=Result<(), String>>,
     {
         let payload = self.start_session_payload(with_rate_hint);
-        let api_key = self.cfg.api_key.clone();
         let socket = self.socket.as_mut().ok_or_else(|| "豆包 TTS 未连接".to_string())?;
         let session_id = Uuid::new_v4().simple().to_string();
         socket
             .send(WsMessage::Binary(encode_client_event(EVENT_START_SESSION, &session_id, &payload).into()))
             .await
-            .map_err(|error| format!("StartSession 发送失败: {error}"))?;
+            .map_err(|e| model_issue::websocket(TTS,e))?;
         let started = Self::receive(socket).await?;
         if started.msg_type == MSG_ERROR {
-            return Err(format!("协议错误 ({}): {}", started.error_code, redact(&String::from_utf8_lossy(&started.payload), &api_key)));
+            return Err(frame_failure(&started));
         }
         if started.event == EVENT_SESSION_FAILED {
-            return Err(format!("SessionFailed: {}", redact(&String::from_utf8_lossy(&started.payload), &api_key)));
+            return Err(frame_failure(&started));
         }
         if started.event != EVENT_SESSION_STARTED {
             return Err(format!("期望 SessionStarted，收到 event={}", started.event));
@@ -442,20 +444,16 @@ impl DoubaoTtsClient {
         socket
             .send(WsMessage::Binary(encode_client_event(EVENT_TASK_REQUEST, &session_id, &task).into()))
             .await
-            .map_err(|error| format!("TaskRequest 发送失败: {error}"))?;
+            .map_err(|e| model_issue::websocket(TTS,e))?;
         socket
             .send(WsMessage::Binary(encode_client_event(EVENT_FINISH_SESSION, &session_id, b"{}").into()))
             .await
-            .map_err(|error| format!("FinishSession 发送失败: {error}"))?;
+            .map_err(|e| model_issue::websocket(TTS,e))?;
         let mut total = 0usize;
         loop {
             let frame = Self::receive(socket).await?;
             if frame.msg_type == MSG_ERROR {
-                return Err(format!(
-                    "协议错误 ({}): {}",
-                    frame.error_code,
-                    redact(&String::from_utf8_lossy(&frame.payload), &api_key)
-                ));
+                return Err(frame_failure(&frame));
             }
             if frame.msg_type == MSG_AUDIO_ONLY_SERVER && frame.event == EVENT_TTS_RESPONSE {
                 if !frame.payload.is_empty() {
@@ -463,7 +461,7 @@ impl DoubaoTtsClient {
                     if total > MAX_PCM_BYTES {
                         return Err("豆包 TTS 音频超过安全上限".to_string());
                     }
-                    on_pcm(&frame.payload);
+                    on_pcm(&frame.payload).await?;
                 }
                 continue;
             }
@@ -471,7 +469,7 @@ impl DoubaoTtsClient {
                 break;
             }
             if frame.event == EVENT_SESSION_FAILED {
-                return Err(format!("SessionFailed: {}", redact(&String::from_utf8_lossy(&frame.payload), &api_key)));
+                return Err(frame_failure(&frame));
             }
         }
         if total == 0 {
@@ -599,11 +597,36 @@ mod tests {
         assert_eq!(i16::from_le_bytes([pcm[0], pcm[1]]), i16::MAX);
     }
 
+    #[tokio::test]
+    async fn model_issue_tts_websocket_uses_close_code_and_ignores_service_text() {
+        use tokio_tungstenite::tungstenite::protocol::{CloseFrame,frame::coding::CloseCode};
+        let payload=b"private-key https://private.invalid";
+        let mut binary=vec![0x11,MSG_ERROR<<4,0,0];
+        binary.extend_from_slice(&55000000u32.to_be_bytes());
+        binary.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        binary.extend_from_slice(payload);
+        for (message,expected) in [
+            (WsMessage::Binary(binary.into()),"[TTS] code=55000000"),
+            (WsMessage::Text("private-key https://private.invalid".into()),"[TTS] 协议错误"),
+            (WsMessage::Close(Some(CloseFrame{code:CloseCode::Policy,reason:"private-key https://private.invalid".into()})),"[TTS] WS 1008"),
+        ] {
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let request=format!("ws://{}/private",listener.local_addr().unwrap()).into_client_request().unwrap();
+            let server=tokio::spawn(async move {
+                let (stream,_)=listener.accept().await.unwrap();
+                let mut socket=tokio_tungstenite::accept_async(stream).await.unwrap();
+                socket.send(message).await.unwrap();
+            });
+            let (mut socket,_)=crate::llm_network::connect_websocket(TTS,request).await.unwrap();
+            let error=DoubaoTtsClient::wait_for_event(&mut socket,EVENT_CONNECTION_STARTED).await.unwrap_err();
+            assert!(error.starts_with(expected));assert!(!error.contains("private"));server.await.unwrap();
+        }
+    }
+
     #[test]
-    fn legacy_default_migrates_and_utf8_error_redaction_is_safe() {
+    fn legacy_default_migrates() {
         let cfg = DoubaoTtsConfig::new("k", "zh_male_naiqimengwa_mars_bigtts", "", 1.0, "seed-tts-1.0");
         assert_eq!(cfg.speaker, "zh_female_vv_uranus_bigtts");
         assert_eq!(cfg.resource_id, "seed-tts-2.0");
-        assert_eq!(redact(&"中文".repeat(500), "").chars().count(), 400);
     }
 }

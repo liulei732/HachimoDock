@@ -10,6 +10,7 @@ pub(crate) struct AudioTarget {
     boot: String,
     board_id: String,
     hud: bool,
+    timed_captions: bool,
 }
 
 impl AudioTarget {
@@ -34,6 +35,7 @@ impl AudioTarget {
             boot: status.boot_id,
             board_id: status.board_device_id,
             hud: status.rtc_key & 4 != 0,
+            timed_captions: status.rtc_key & 12 == 12,
         })
     }
 
@@ -72,6 +74,8 @@ impl AudioTarget {
     pub(crate) fn boot_matches(&self, boot: &str) -> bool { self.boot == boot }
 
     pub(crate) fn hud_supported(&self) -> bool { self.hud }
+
+    pub(crate) fn timed_captions(&self) -> bool { self.timed_captions }
 
     pub(crate) fn board_id(&self) -> &str {
         &self.board_id
@@ -132,7 +136,7 @@ mod bound_identity_tests {
     #[test]
     fn same_boot_repair_cannot_retarget_captured_audio_peer() {
         let old = Peer { address: "127.0.0.1:42000".parse().unwrap(), key: Zeroizing::new([17;16]) };
-        let target = AudioTarget { peer: old.clone(), boot: "0123456789abcdef".into(), board_id: "p4-0123456789ab".into(), hud: true };
+        let target = AudioTarget { peer: old.clone(), boot: "0123456789abcdef".into(), board_id: "p4-0123456789ab".into(), hud: true, timed_captions: true };
         assert!(target.matches_peer(Some(&old)));
         let repaired = Peer { key: Zeroizing::new([18;16]), ..old.clone() };
         assert!(!target.matches_peer(Some(&repaired)));

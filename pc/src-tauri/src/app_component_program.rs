@@ -30,6 +30,9 @@ pub fn image(p:&Value)->Result<(),String>{
 pub fn require_capability(runtime:&Value,caps:&Value)->Result<(),String>{
     require_cells_texts_capability(runtime,caps)?;
     crate::app_variable_owners::require_capability(runtime,caps)?;
+    if runtime["program"].get("background").is_some() && caps["widgetLocalProgramResume"]!="p4-local-program-v1" {
+        return Err("设备未声明本机后台程序授权".into());
+    }
     if runtime.get("program").is_some()&&!((caps["widgetProgram"]==runtime["program"]["engine"])||(runtime["program"]["engine"]==ENGINE&&caps["widgetProgram"]=="p4-component-program-v2")||caps["widgetPrograms"].as_array().is_some_and(|a|a.contains(&runtime["program"]["engine"]))){return Err("设备未开放受限组件程序；未安装不兼容资源".into());}Ok(())
 }
 /// Call for every runtime, including packages without a program declaration.
@@ -42,7 +45,10 @@ pub fn require_cells_texts_capability(runtime:&Value,caps:&Value)->Result<(),Str
 pub fn validate(r:&Value)->Result<(),String>{
     let Some(p)=r.get("program")else{return Ok(());};
     let owners=crate::app_variable_owners::parse(r)?;
-    if !exact(p,&["engine","image","outputs","actions","timers"])||(p["engine"]!=ENGINE&&p["engine"]!="p4-component-program-v2")||r["engine"]!="p4-bounded-runtime-v4"
+    let fields=&["engine","image","outputs","actions","timers","background"];
+    let background=p.get("background").is_some();
+    if background && (p["background"]!=true || !p["timers"].as_array().is_some_and(|v|!v.is_empty())) {return Err(bad());}
+    if !exact(p,&fields[..if background {6} else {5}])||(p["engine"]!=ENGINE&&p["engine"]!="p4-component-program-v2")||r["engine"]!="p4-bounded-runtime-v4"
         ||r["surface"]["engine"]!="p4-app-surface-v1"||r["input"]["engine"]!="p4-input-v1"
         ||r.get("host").is_some()&&!owners.mixed
         ||["local","scene","game","media","instrument","data"].iter().any(|k|r.get(*k).is_some()){return Err(bad());}
@@ -91,6 +97,20 @@ pub fn validate(r:&Value)->Result<(),String>{
 }
 #[cfg(test)]mod tests{
     use super::*;
+    #[test] fn local_background_requires_a_timer_and_distinct_device_capability() {
+        let suite:Value=serde_json::from_str(include_str!("../../skills/petui/contracts/component-program-v1.json")).unwrap();
+        let mut runtime=suite["runtime"].clone();
+        runtime["program"]["background"]=serde_json::json!(true);
+        assert!(validate(&runtime).is_err());
+        runtime["program"]["timers"]=serde_json::json!([{"id":1,"delayMs":100,"intervalMs":100,"words":[1]}]);
+        validate(&runtime).unwrap();
+        let mut caps=serde_json::json!({"widgetProgram":ENGINE});
+        assert!(require_capability(&runtime,&caps).is_err());
+        caps["widgetLocalProgramResume"]=serde_json::json!("p4-local-program-v1");
+        require_capability(&runtime,&caps).unwrap();
+        runtime["program"]["background"]=serde_json::json!("true");
+        assert!(validate(&runtime).is_err());
+    }
     #[test]fn v2_descriptor_vectors_and_v1_image_ceilings(){
         let s:Value=serde_json::from_str(include_str!("../../skills/petui/contracts/component-program-v2.json")).unwrap();
         validate(&s["runtime"]).unwrap();

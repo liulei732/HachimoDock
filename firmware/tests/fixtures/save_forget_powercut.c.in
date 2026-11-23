@@ -1,0 +1,147 @@
+#include <dirent.h>
+#include <setjmp.h>
+#include <strings.h>
+#include "spiffs_nucleus.h"
+#include "pet_p4_file_cleanup.h"
+#undef PET_WIDGET_TRACE_SCOPE
+#define PET_COMPONENT_PROGRAM_ENABLED 1
+#define PET_PROGRAM_SAVE_DOMAIN 1
+static spiffs fs;
+static spiffs_config cfg;
+static unsigned char seed[N];
+static bool observed=true, read_fault, counting;
+static unsigned misses, hits, completed_writes, cut_at;
+static uint64_t activity;
+static jmp_buf power_loss;
+
+static void cut_after_write(void){
+  if(cut_at && ++completed_writes==cut_at)longjmp(power_loss,1);
+}
+s32_t tracked_lookup(spiffs *f,const u8_t name[SPIFFS_OBJ_NAME_LEN],spiffs_page_ix *pix){
+  s32_t rc=spiffs_object_find_object_index_header_by_name(f,name,pix);
+  if(counting){
+    if(rc==SPIFFS_ERR_NOT_FOUND)++misses;
+    else {assert(rc==SPIFFS_OK);++hits;}
+  }
+  return rc;
+}
+typedef struct {spiffs_DIR d;struct dirent e;char path[SPIFFS_OBJ_NAME_LEN];unsigned offset;} vfs_spiffs_dir_t;
+static size_t copy_root(char *out,const char *in,size_t cap){
+  assert(strlen(in)<cap);strcpy(out,in);return strlen(in);
+}
+#define strlcpy copy_root
+/* DIRECTORY */
+static DIR *scan_open(const char *path){
+  assert(!strcmp(path,PET_APP_SAVE_ROOT));return vfs_spiffs_opendir(&ctx,"/");
+}
+static struct dirent *scan_read(DIR *dir){
+  if(read_fault){errno=EIO;return NULL;}
+  return vfs_spiffs_readdir(&ctx,dir);
+}
+#define opendir scan_open
+#define readdir scan_read
+#define closedir(d) vfs_spiffs_closedir(&ctx,d)
+#include "pet_p4_file_cleanup.c"
+static bool pet_fs_activity_idle_epoch(uint64_t *out){*out=activity;return observed;}
+static int64_t esp_timer_get_time(void){return 1;}
+/* SCAN */
+
+static void cold_boot(void){
+  /* A power cut drops the descriptor cache and any open FILE without a close. */
+  depth=0;stream=(Stream){0};cut_at=0;
+  memset(fds,0,sizeof(fds));memset(cache,0,sizeof(cache));
+  mount_new(&fs,&cfg);ctx.fs=&fs;
+}
+static void reset_seed(void){memcpy(image,seed,N);cold_boot();}
+static void slot_path(unsigned domain,unsigned slot,unsigned epoch,char path[64]){
+  epoch_path_for(identities[0].id,domain,slot,epoch,path);
+}
+static void write_pair(unsigned absent){
+  uint32_t epoch;
+  assert(write_forget_epoch(identities[0].id,1,&epoch,true,absent>>FORGET_NAMES_PER_DOMAIN));
+  assert(write_forget_epoch(identities[0].id,0,&epoch,true,absent));
+}
+static void empty_counts(bool eligible){
+  reset_seed();observed=eligible;
+  unsigned bits=forget_absent_names(identities[0].id,true);
+  assert(bits==(eligible?4095u:0u));
+  misses=hits=0;counting=true;write_pair(bits);counting=false;
+  printf("two fresh journals, snapshot=%d misses=%u hits=%u\n",eligible,misses,hits);
+  assert(misses==(eligible?6u:18u)&&hits==2);
+}
+static void other_id_intact(void){
+  char path[64];uint32_t epoch;unsigned slot;
+  for(unsigned domain=0;domain<=1;domain++){
+    assert(read_epoch(identities[1].id,domain,&epoch,&slot,true,false,0)&&epoch==1);
+    epoch_path_for(identities[1].id,domain,1,epoch,path);assert(contains(path,700+domain));
+  }
+}
+/* 0 = old generation, 1 = clear committed, 2 = corrupt/incomplete marker
+ * quarantined by normal restore. No stale future bytes may ever be exposed. */
+static unsigned recovery(unsigned domain){
+  uint32_t epoch;unsigned slot;char path[64];
+  if(!read_epoch(identities[0].id,domain,&epoch,&slot,true,false,0))return 2;
+  assert(epoch<=1);
+  slot_path(domain,0,epoch,path);
+  if(epoch==0)assert(contains(path,40+domain));
+  else {
+    spiffs_stat st;
+    assert(SPIFFS_stat(ctx.fs,mounted(path),&st)==SPIFFS_ERR_NOT_FOUND);
+    SPIFFS_clearerr(ctx.fs);
+  }
+  return epoch;
+}
+static unsigned exercise_cut(unsigned cut,bool optimized,bool *completed){
+  reset_seed();
+  unsigned bits=optimized?forget_absent_names(identities[0].id,true):0;
+  if(optimized)assert(bits==(46u|(46u<<6))); /* snapshots 0 and 4 exist in both domains */
+  completed_writes=0;
+  if(setjmp(power_loss)==0){
+    cut_at=cut;
+    write_pair(bits);
+    *completed=true;
+  }else *completed=false;
+  cold_boot();
+  unsigned program=recovery(1),ordinary=recovery(0);
+  other_id_intact();
+  if(*completed)assert(program==1 && ordinary==1);
+  if(program!=1)assert(ordinary==0);
+  return program*3+ordinary;
+}
+int main(void){
+  ctx.fs=&fs;format_new(&fs,&cfg);SPIFFS_unmount(&fs);memcpy(seed,image,N);
+  empty_counts(false);empty_counts(true);
+  reset_seed();observed=true;
+  char path[64];uint32_t epoch;
+  for(unsigned domain=0;domain<=1;domain++){
+    slot_path(domain,0,0,path);put(path,40+domain);
+    slot_path(domain,0,1,path);put(path,90+domain);
+    assert(write_forget_epoch(identities[1].id,domain,&epoch,true,0)&&epoch==1);
+    epoch_path_for(identities[1].id,domain,1,epoch,path);put(path,700+domain);
+  }
+  SPIFFS_unmount(&fs);memcpy(seed,image,N);cold_boot();
+  read_fault=true;assert(!forget_absent_names(identities[0].id,true));read_fault=false;
+  assert(!forget_absent_names(identities[0].id,false));
+  /* Test every physical program/erase boundary during the two journals,
+   * comparing optimized recovery with the original exact-probe behavior. */
+  unsigned cuts=0;
+  for(unsigned cut=1;cut<512;cut++){
+    bool finished_ref=false,finished_opt=false;
+    unsigned reference=exercise_cut(cut,false,&finished_ref);
+    unsigned optimized=exercise_cut(cut,true,&finished_opt);
+    assert(reference==optimized && finished_ref==finished_opt);
+    if(finished_opt)break;
+    ++cuts;
+  }
+  assert(cuts>8 && cuts<511);
+  printf("%u NOR power-cut boundaries matched, unrelated A/B journals survived\n",cuts);
+  /* A present but unreadable newer peer must prevent clear even though its
+   * slot and the other domain were enumerated successfully. */
+  reset_seed();write_pair(forget_absent_names(identities[0].id,true));
+  cold_boot();slot_path(0,1,1,path);put(path,321);
+  unsigned bits=forget_absent_names(identities[0].id,true);
+  char marker[64];scoped_path_for(identities[0].id,0,3,marker);
+  unreadable=marker;assert(!write_forget_epoch(identities[0].id,0,&epoch,true,bits));
+  unreadable=NULL;cold_boot();assert(contains(path,321));other_id_intact();
+  SPIFFS_unmount(&fs);return 0;
+}

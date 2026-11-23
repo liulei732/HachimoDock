@@ -125,16 +125,18 @@ pub(super) enum MacosAgent {
     Claude,
     WorkBuddy,
     DeepSeekHarness,
+    Antigravity,
 }
 
 impl MacosAgent {
-    fn current_electron(self) -> bool { matches!(self, Self::WorkBuddy | Self::DeepSeekHarness) }
+    fn current_electron(self) -> bool { matches!(self, Self::WorkBuddy | Self::DeepSeekHarness | Self::Antigravity) }
     fn label(self) -> &'static str {
         match self {
             Self::Codex => "ChatGPT（Codex）",
             Self::Claude => "Claude",
             Self::WorkBuddy => "WorkBuddy",
             Self::DeepSeekHarness => "DeepSeek Harness",
+            Self::Antigravity => "Antigravity",
         }
     }
 }
@@ -178,6 +180,7 @@ fn agent_bundle_identifiers(agent: MacosAgent) -> &'static [&'static str] {
         MacosAgent::Claude => &["com.anthropic.claudefordesktop", "com.anthropic.claude"],
         MacosAgent::WorkBuddy => &["com.tencent.workbuddy.mac"],
         MacosAgent::DeepSeekHarness => &["com.deepseek.dsh"],
+        MacosAgent::Antigravity => &["com.google.antigravity"],
     }
 }
 
@@ -187,6 +190,7 @@ fn agent_application_names(agent: MacosAgent) -> &'static [&'static str] {
         MacosAgent::Claude => &["Claude"],
         MacosAgent::WorkBuddy => &["WorkBuddy"],
         MacosAgent::DeepSeekHarness => &["DeepSeek Harness"],
+        MacosAgent::Antigravity => &["Antigravity"],
     }
 }
 
@@ -1542,6 +1546,7 @@ fn is_agent_primary_window_title(agent: MacosAgent, title: &str) -> bool {
         MacosAgent::Claude => title == "claude",
         MacosAgent::WorkBuddy => title == "workbuddy",
         MacosAgent::DeepSeekHarness => title == "deepseek harness",
+        MacosAgent::Antigravity => title == "antigravity",
     }
 }
 
@@ -2177,7 +2182,72 @@ fn unique_composer(agent: MacosAgent, mut composers: Vec<(AXUIElement, String)>)
     Ok(composers.remove(0))
 }
 
+fn antigravity_editor_label(role: &str, labels: &[String]) -> bool {
+    role == "AXTextArea" && labels.iter().any(|label|
+        label.trim().eq_ignore_ascii_case("Message input") || label.trim() == "消息输入")
+}
+
+fn read_antigravity_draft(editor: &AXUIElement) -> Result<String, String> {
+    match current_electron_raw_value(editor) {
+        Ok(text) => Ok(text),
+        Err(error) => {
+            // Chromium can expose an untouched blank field without AXValue.
+            // Require a separate affirmative AX signal before treating it as empty.
+            let characters = editor.attribute(&AXAttribute::new(&CFString::new("AXNumberOfCharacters")))
+                .ok().and_then(|value: CFType| value.downcast::<CFNumber>())
+                .and_then(|value| value.to_i64());
+            if characters == Some(0) { Ok(String::new()) } else { Err(error) }
+        }
+    }
+}
+
+fn find_antigravity_composer(window: &CodexWindow) -> Result<(AXUIElement, String), String> {
+    let mut editors = walk_elements(&window.window, |element| {
+        antigravity_editor_label(&element_role(element), &composer_metadata(element))
+            && element_is_enabled(element) && composer_is_visible(element, window)
+    });
+    if editors.len() != 1 {
+        return Err("需要一个可见的 Antigravity 消息输入框，请关闭搜索或弹窗后重新长按。".into());
+    }
+    let editor = editors.remove(0);
+    let draft = read_antigravity_draft(&editor)?;
+    Ok((editor, draft))
+}
+
+fn valid_antigravity_conversation_url(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else { return false; };
+    if !matches!(url.scheme(), "http" | "https")
+        || !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+        || url.port().is_none() {
+        return false;
+    }
+    url.path() == "/" || url.path().strip_prefix("/c/")
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+}
+
+fn antigravity_conversation(editor: &AXUIElement) -> Option<String> {
+    let web = ancestors(editor).into_iter().find(|element| element_role(element) == "AXWebArea")?;
+    let attribute = AXAttribute::new(&CFString::new("AXURL"));
+    let value: CFType = web.attribute(&attribute).ok()?;
+    let url = value.downcast::<core_foundation::url::CFURL>().map(|url| url.get_string().to_string())
+        .or_else(|| value.downcast::<CFString>().map(|url| url.to_string()))?;
+    valid_antigravity_conversation_url(&url).then_some(url)
+}
+
+fn assert_antigravity_target(target: &ComposerTarget, conversation: &str) -> Result<(), String> {
+    if !agent_is_frontmost(MacosAgent::Antigravity)
+        || task_window_is_blocked(&target.window)
+        || ax_element_attribute(&target.app, "AXFocusedWindow").as_ref() != Some(&target.window)
+        || ax_element_attribute(&target.composer, "AXWindow").as_ref() != Some(&target.window)
+        || antigravity_conversation(&target.composer).as_deref() != Some(conversation)
+    {
+        return Err("Antigravity 当前会话已变化，请回到目标对话重新长按。".into());
+    }
+    Ok(())
+}
+
 fn find_composer(agent: MacosAgent, window: &CodexWindow) -> Result<(AXUIElement, String), String> {
+    if agent == MacosAgent::Antigravity { return find_antigravity_composer(window); }
     if let Some(focused) = focused_codex_composer(agent, window) { return Ok(focused); }
     select_window_composer(agent, window, composer_candidates(window))
 }
@@ -2501,7 +2571,7 @@ pub(super) fn diagnose_current_composer(agent: MacosAgent) -> Result<serde_json:
 }
 
 fn find_stable_current_target(agent: MacosAgent, current_task: bool) -> Result<ComposerTarget, String> {
-    let current_task = current_task || agent == MacosAgent::DeepSeekHarness;
+    let current_task = current_task || matches!(agent, MacosAgent::DeepSeekHarness | MacosAgent::Antigravity);
     let _evidence_scope = ComposerEvidenceScope::begin(agent == MacosAgent::Codex);
     // Tasks share voice input's cold-webview recovery, but must never launch,
     // select another window, or bypass a modal while waiting for the editor.
@@ -2537,7 +2607,9 @@ fn find_stable_current_target(agent: MacosAgent, current_task: bool) -> Result<C
             // chat composer. Task window/modal and pinned-target checks remain
             // independent of editor selection and must not be bypassed.
             let focused = focused_codex_composer(agent, &target);
-            let (composer, value) = if let Some(focused) = focused {
+            let (composer, value) = if agent == MacosAgent::Antigravity {
+                find_antigravity_composer(&target)?
+            } else if let Some(focused) = focused {
                 focused
             } else {
               let candidates = composer_candidates(&target);
@@ -2689,6 +2761,15 @@ fn find_voice_target(state: &mut MacosComposerState) -> Result<ComposerTarget, S
     let Some(pinned) = state.current_visible_target.as_ref() else {
         return find_target(state.agent, &state.session_id, &state.session_title);
     };
+    if state.agent == MacosAgent::Antigravity {
+        let conversation = state.task_identity.as_ref().and_then(|items| items.first())
+            .ok_or("Antigravity 当前会话身份不可用。")?;
+        assert_antigravity_target(pinned, conversation)?;
+        return Ok(ComposerTarget {
+            agent: pinned.agent, app: pinned.app.clone(), window: pinned.window.clone(),
+            composer: pinned.composer.clone(), value: read_antigravity_draft(&pinned.composer)?,
+        });
+    }
     let pinned_window = pinned.window.clone();
     let pinned_composer = pinned.composer.clone();
     if let Some(identity) = &state.task_identity {
@@ -3424,7 +3505,7 @@ pub(super) fn begin_voice(
 // Only explicit dictation Begin may reopen the already selected app. If AX
 // had no window to pin, a fresh press must confirm the restored conversation.
 fn recover_window_after_failed_voice_begin(agent: MacosAgent) -> Option<String> {
-    if !agent.current_electron() || !unsafe { AXIsProcessTrusted() } {
+    if agent == MacosAgent::Antigravity || !agent.current_electron() || !unsafe { AXIsProcessTrusted() } {
         return None;
     }
     let bundle = agent_bundle_identifiers(agent)[0];
@@ -3466,7 +3547,14 @@ pub(super) fn begin_current_voice(agent: MacosAgent) -> Result<MacosComposerStat
     prepare_existing_workbuddy_for_voice_begin(agent).map_err(recover)?;
     let target = find_current_visible_target(agent).map_err(recover)?;
     focus_composer(&target)?;
-    let identity = (agent == MacosAgent::DeepSeekHarness).then(|| task_window_identity(&target.window));
+    let identity = if agent == MacosAgent::Antigravity {
+        let conversation = antigravity_conversation(&target.composer)
+            .ok_or("请打开可见的 Antigravity 对话后重新长按。")?;
+        assert_antigravity_target(&target, &conversation)?;
+        Some(vec![conversation])
+    } else {
+        (agent == MacosAgent::DeepSeekHarness).then(|| task_window_identity(&target.window))
+    };
     Ok(MacosComposerState {
         last_written_value: None,
         agent,
@@ -3549,7 +3637,72 @@ fn rebase_voice_draft(state: &mut MacosComposerState, current: &str, transcript:
     Some(desired)
 }
 
+fn append_antigravity_voice(state: &mut MacosComposerState, transcript: &str) -> Result<String, String> {
+    let target = find_voice_target(state)?;
+    let conversation = state.task_identity.as_ref().and_then(|items| items.first())
+        .ok_or("Antigravity 会话身份不可用。")?;
+    let draft = state.draft.desired(transcript);
+    let suffix = current_electron_append_suffix(&state.draft.last, &draft)
+        .filter(|suffix| !suffix.is_empty() && target.value == state.draft.last)
+        .ok_or("Antigravity 输入框已变化，语音草稿未追加。")?;
+    focus_composer(&target)?;
+    if !target.value.is_empty() {
+        let end = isize::try_from(target.value.encode_utf16().count())
+            .map_err(|_| "Antigravity 光标范围无效。")?;
+        let range = CFRange::init(end, 0);
+        let raw = unsafe { AXValueCreate(kAXValueTypeCFRange, &range as *const CFRange as *const c_void) };
+        if raw.is_null() { return Err("无法定位 Antigravity 草稿末尾。".into()); }
+        let selection = unsafe { CFType::wrap_under_create_rule(raw as _) };
+        target.composer.set_attribute(&AXAttribute::new(&CFString::new("AXSelectedTextRange")), selection)
+            .map_err(|_| "无法设置 Antigravity 草稿末尾光标。")?;
+        let deadline = Instant::now() + CARET_READBACK_TIMEOUT;
+        loop {
+            assert_antigravity_target(&target, conversation)?;
+            assert_submission_focus(&target)?;
+            if read_antigravity_draft(&target.composer)? != target.value {
+                return Err("Antigravity 输入框已变化，语音草稿未追加。".into());
+            }
+            if current_composer_selection(&target.composer) == Some((end, 0)) { break; }
+            if Instant::now() >= deadline { return Err("无法确认 Antigravity 草稿末尾光标。".into()); }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+    // This editor accepts native paste. Writing AXValue alone does not advance
+    // its UI state. Paste only the new text and restore the user's clipboard.
+    let mut snapshot = PasteboardSnapshot::capture()?;
+    let result = (|| -> Result<(), String> {
+        snapshot.set_text(suffix)?;
+        assert_antigravity_target(&target, conversation)?;
+        assert_submission_focus(&target)?;
+        if read_antigravity_draft(&target.composer)? != target.value
+            || (!target.value.is_empty() && !current_electron_append_guard(
+                &target.value, &target.value, current_composer_selection(&target.composer),
+                target.value.encode_utf16().count(),
+            )) {
+            return Err("Antigravity 草稿或光标已变化，语音草稿未追加。".into());
+        }
+        snapshot.verify_written()?;
+        post_workbuddy_key(&target.app, MAC_KEYCODE_V, CGEventFlags::CGEventFlagCommand)
+            .map_err(|_| "Antigravity 定向粘贴失败，未重试。".to_owned())?;
+        let deadline = Instant::now() + COMPOSER_READBACK_TIMEOUT;
+        loop {
+            assert_antigravity_target(&target, conversation)?;
+            let current = read_antigravity_draft(&target.composer)?;
+            if current == draft { return Ok(()); }
+            if current != target.value || Instant::now() >= deadline {
+                return Err("Antigravity 草稿写入未确认，未重复粘贴。".into());
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    })();
+    snapshot.restore();
+    result?;
+    state.draft.last = draft.clone();
+    Ok(draft)
+}
+
 pub(super) fn update_voice(state: &mut MacosComposerState, text: &str) -> Result<String, String> {
+    if state.agent == MacosAgent::Antigravity { return append_antigravity_voice(state, text); }
     if state.agent == MacosAgent::Codex && state.draft.caret_after(text).is_some() {
         return insert_codex_voice_once(state, text);
     }
@@ -4156,7 +4309,50 @@ pub(super) fn confirm_voice(
     confirm_voice_inner(state, None)
 }
 
+fn antigravity_send_label(label: &str) -> bool {
+    label.trim().eq_ignore_ascii_case("Send message") || label.trim() == "发送消息"
+}
+
+fn confirm_antigravity_voice(state: &mut MacosComposerState) -> Result<String, String> {
+    let target = find_voice_target(state)?;
+    if target.value.is_empty() || target.value != state.draft.last || state.draft.last == state.draft.base {
+        return Err("Antigravity 语音草稿已变化，未执行发送。".into());
+    }
+    let conversation = state.task_identity.as_ref().and_then(|items| items.first())
+        .ok_or("Antigravity 会话身份不可用。")?;
+    focus_composer(&target)?;
+    let buttons = walk_elements(&target.window, |element| {
+        element_role(element) == "AXButton" && element_is_enabled(element)
+            && element_supports_press(element) && send_button_matches_composer(element, &target.composer)
+            && element_labels(element).iter().any(|label| antigravity_send_label(label))
+    });
+    let [button] = buttons.as_slice() else {
+        return Err("未找到唯一的 Antigravity 发送消息按钮，草稿已保留。".into());
+    };
+    assert_antigravity_target(&target, conversation)?;
+    assert_submission_focus(&target)?;
+    if read_antigravity_draft(&target.composer)? != target.value {
+        return Err("Antigravity 草稿已变化，未执行发送。".into());
+    }
+    // Retire this draft before the one native attempt, even if its ACK is lost.
+    state.draft.last.clear();
+    button.press().map_err(|_| "COMPOSER_SUBMIT_UNCONFIRMED: Antigravity 未确认按钮操作，未重试。".to_owned())?;
+    let deadline = Instant::now() + SUBMIT_CONFIRM_TIMEOUT;
+    while Instant::now() < deadline {
+        if assert_antigravity_target(&target, conversation).is_err() { break; }
+        if read_antigravity_draft(&target.composer).is_ok_and(|value| value.is_empty()) {
+            return Ok(String::new());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err("COMPOSER_SUBMIT_UNCONFIRMED: Antigravity 提交结果未确认，请查看当前对话。".into())
+}
+
 fn confirm_voice_inner(state: &mut MacosComposerState, expected: Option<&str>) -> Result<String, String> {
+    if state.agent == MacosAgent::Antigravity {
+        if expected.is_some() { return Err("Antigravity 语音确认仅适用于当前草稿。".into()); }
+        return confirm_antigravity_voice(state);
+    }
     // Only explicit Confirm may return from this client's result UI. Shared
     // lookup, append, cancellation and submit-readback never gain this permit.
     if state.agent.current_electron() && expected.is_none()
@@ -4265,6 +4461,7 @@ fn confirm_voice_inner(state: &mut MacosComposerState, expected: Option<&str>) -
 }
 
 pub(super) fn cancel_voice(state: &mut MacosComposerState) {
+    if state.agent == MacosAgent::Antigravity { return; }
     if let Ok(target) = find_voice_target(state) {
         if let Some(base) = state.draft.rollback(&target.value) {
             let _ = replace_composer_text(&target, base);
@@ -4361,6 +4558,35 @@ pub(super) fn debug_dump_codex_tree() -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn antigravity_voice_selects_only_the_owned_message_input_and_exact_send_control() {
+        use super::{antigravity_editor_label, antigravity_send_label};
+        assert!(antigravity_editor_label("AXTextArea", &["Message input".into()]));
+        assert!(!antigravity_editor_label("AXTextArea", &["Search conversations".into()]));
+        assert!(!antigravity_editor_label("AXTextField", &["Message input".into()]));
+        assert!(antigravity_send_label("Send message"));
+        assert!(!antigravity_send_label("Start Voice mode"));
+        assert!(!antigravity_send_label("Stop"));
+        assert!(!antigravity_send_label("Resend message"));
+    }
+
+    #[test]
+    fn antigravity_voice_accepts_the_local_blank_and_pinned_conversation_routes() {
+        use super::valid_antigravity_conversation_url;
+        assert!(valid_antigravity_conversation_url("http://127.0.0.1:61190/"));
+        assert!(valid_antigravity_conversation_url(
+            "http://127.0.0.1:61190/c/01234567-89ab-cdef-0123-456789abcdef?project=outside-of-project"
+        ));
+        for url in [
+            "https://example.com:61190/c/01234567-89ab-cdef-0123-456789abcdef",
+            "http://127.0.0.1:61190/settings",
+            "http://127.0.0.1:61190/c/abc",
+            "http://127.0.0.1:61190/c/01234567-89ab-cdef-0123-456789abcdef/extra",
+        ] {
+            assert!(!valid_antigravity_conversation_url(url));
+        }
+    }
     #[test]
     fn deepseek_client_focus_return_requires_self_pid_and_explicit_entry() {
         for agent in [MacosAgent::WorkBuddy, MacosAgent::DeepSeekHarness] {

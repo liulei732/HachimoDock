@@ -4,16 +4,40 @@ use serde::{Deserialize,Serialize};
 use std::sync::{Mutex,OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::lan_agent::widget_data::Route;
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum VoiceRoute {
+    Usb(String),
+    Wifi(String),
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PetVoice {
     board_device_id: String,
     appearance_id: String,
+    #[serde(default, skip_serializing)]
+    route: Option<VoiceRoute>,
     speaker: String,
     clone_speaker_id: String,
     speed: f32,
+    #[serde(default, skip_serializing_if = "crate::persona_tts::VoiceOverrides::is_empty")]
+    tts_overrides: crate::persona_tts::VoiceOverrides,
 }
 impl PetVoice {
+    fn matches(&self, target: &Route) -> bool {
+        match (target, &self.route) {
+            (Route::Wifi { board, boot }, Some(VoiceRoute::Wifi(origin))) =>
+                board == &self.board_device_id && boot == origin,
+            (Route::Usb { board, connection }, Some(VoiceRoute::Usb(origin))) =>
+                board == &self.board_device_id && origin.parse::<u64>() == Ok(*connection),
+            (Route::Usb { board, .. }, None) => board == &self.board_device_id,
+            _ => false,
+        }
+    }
+
     fn validate(&self) -> Result<(), String> {
         let identifier = |s: &str, max: usize| !s.is_empty() && s.len() <= max
             && s.bytes().all(|c| c.is_ascii_alphanumeric() || b"_-.".contains(&c));
@@ -24,7 +48,13 @@ impl PetVoice {
         {
             return Err("宠物朗读音色配置无效".into());
         }
-        Ok(())
+        let valid_route = match &self.route {
+            Some(VoiceRoute::Usb(id)) => id.parse::<u64>().is_ok_and(|n| n != 0 && n.to_string() == *id),
+            Some(VoiceRoute::Wifi(boot)) => boot.len() == 16 && boot.bytes().all(|v| v.is_ascii_hexdigit()),
+            None => true,
+        };
+        if !valid_route { return Err("宠物音色连接标识无效".into()); }
+        self.tts_overrides.validate()
     }
 }
 #[derive(Default)]
@@ -40,20 +70,29 @@ static PREVIOUS:Mutex<Option<PetVoice>>=Mutex::new(None);
 static PREPARATION_FILE:OnceLock<std::path::PathBuf>=OnceLock::new();
 pub(crate) fn configure_preparation(path:std::path::PathBuf){
     if PREPARATION_FILE.set(path.clone()).is_err(){return;}
-    if let Ok(bytes)=std::fs::read(path){if bytes.len()<4096{if let Ok(v)=serde_json::from_slice::<PetVoice>(&bytes){if v.validate().is_ok(){*PREVIOUS.lock().unwrap()=Some(v);}}}}
+    use std::io::Read;
+    const MAX_VOICE_BYTES: u64 = 32 * 1024;
+    let Ok(file) = std::fs::File::open(path) else { return; };
+    let mut bytes = Vec::new();
+    if file.take(MAX_VOICE_BYTES + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > MAX_VOICE_BYTES { return; }
+    if let Ok(voice) = serde_json::from_slice::<PetVoice>(&bytes) {
+        if voice.validate().is_ok() { *PREVIOUS.lock().unwrap() = Some(voice); }
+    }
 }
 /// Last known voice can prepare disk audio before USB connects; it can NEVER
 /// authorize playback. Playback still requires the live CURRENT heartbeat.
 pub(crate) fn preparation_config(board:&str)->Result<crate::doubao_tts::DoubaoTtsConfig,String>{
     if !board.is_empty(){return config(board);}
     let voice=PREVIOUS.lock().map_err(|_|"音色缓存不可用")?.clone().ok_or("等待首次选择宠物音色")?;
-    crate::voice_chat_settings::tts_config(&voice.speaker,&voice.clone_speaker_id,voice.speed)
+    voice.tts_overrides.config(&voice.speaker, &voice.clone_speaker_id, voice.speed)
 }
 
 #[tauri::command]
 pub fn component_speech_set_pet_voice(input: Option<PetVoice>) -> Result<(), String> {
     if let Some(v) = &input { v.validate()?; }
-    if let Some(v)=&input{
+    if let Some(mut saved) = input.clone() {
+        saved.route = None;
+        let v = &saved;
         let mut previous=PREVIOUS.lock().map_err(|_|"音色缓存不可用")?;
         if previous.as_ref()!=Some(v){
             if let Some(path)=PREPARATION_FILE.get(){
@@ -66,13 +105,24 @@ pub fn component_speech_set_pet_voice(input: Option<PetVoice>) -> Result<(), Str
     CURRENT.lock().map_err(|_| "宠物音色暂不可用")?.0 = input.map(|v| (v, Instant::now()));
     Ok(())
 }
+pub(crate) fn ready_for(board: &str, target: Option<&Route>) -> bool {
+    CURRENT.lock().ok().and_then(|v| v.voice(board, Instant::now()))
+        .is_some_and(|voice| target.map_or(voice.route.is_none(), |target| voice.matches(target)))
+}
+
+#[cfg(test)]
 pub fn ready(board: &str) -> bool {
     CURRENT.lock().ok().and_then(|v| v.voice(board, Instant::now())).is_some()
 }
 pub fn config(board: &str) -> Result<crate::doubao_tts::DoubaoTtsConfig, String> {
+    config_for(board, None)
+}
+
+pub(crate) fn config_for(board: &str, target: Option<&Route>) -> Result<crate::doubao_tts::DoubaoTtsConfig, String> {
     let voice = CURRENT.lock().map_err(|_| "宠物音色暂不可用")?
-        .voice(board, Instant::now()).ok_or("正在等待当前宠物音色，请保持客户端运行")?;
-    crate::voice_chat_settings::tts_config(&voice.speaker, &voice.clone_speaker_id, voice.speed)
+        .voice(board, Instant::now()).filter(|voice| target.is_none_or(|t|voice.matches(t)))
+        .ok_or("正在等待当前宠物音色，请保持客户端运行")?;
+    voice.tts_overrides.config(&voice.speaker, &voice.clone_speaker_id, voice.speed)
 }
 
 #[cfg(test)]
@@ -92,8 +142,25 @@ pub(crate) fn acceptance_persona(root:&std::path::Path,id:&str)->serde_json::Val
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn pet() -> PetVoice { PetVoice { board_device_id:"board-a".into(), appearance_id:"terrier".into(),
-        speaker:"zh_female_vv_uranus_bigtts".into(), clone_speaker_id:String::new(), speed:1.15 } }
+    fn pet() -> PetVoice { PetVoice { board_device_id:"board-a".into(), route:None, appearance_id:"terrier".into(),
+        speaker:"zh_female_vv_uranus_bigtts".into(), clone_speaker_id:String::new(), speed:1.15, tts_overrides: Default::default() } }
+    #[test]
+    fn voice_heartbeat_is_scoped_to_transport_and_generation() {
+        let mut v = pet();
+        let route = |boot: &str| Route::Wifi { board: v.board_device_id.clone(), boot: boot.into() };
+        let a = route("0000000000000001");
+        let b = route("0000000000000002");
+        let usb = Route::Usb { board: v.board_device_id.clone(), connection: 7 };
+        assert!(v.matches(&usb));
+        assert!(!v.matches(&a));
+        v.route = Some(VoiceRoute::Wifi("0000000000000001".into()));
+        assert!(v.validate().is_ok() && v.matches(&a));
+        assert!(!v.matches(&b) && !v.matches(&usb));
+        assert!(serde_json::to_value(&v).unwrap().get("route").is_none());
+        v.route = Some(VoiceRoute::Usb("7".into()));
+        assert!(v.validate().is_ok() && v.matches(&usb));
+        assert!(!v.matches(&Route::Usb { board: v.board_device_id.clone(), connection: 8 }));
+    }
     #[test]
     fn current_pet_follows_switch_and_rejects_stale_or_other_board() {
         let now = Instant::now();

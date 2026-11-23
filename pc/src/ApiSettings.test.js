@@ -23,7 +23,7 @@ test("API settings exposes video and prompt models independently using shared se
   assert.match(page, /model: config.model \|\| ""/);
   const selector = readSource("VideoGenerationSettings.jsx");
   assert.match(selector, /onReady\?\.\(valid\)/);
-  assert.match(selector, /\[apiKey, baseUrl, revision\]/);
+  assert.match(selector, /\[apiKey, baseUrl, revision, requested\]/);
 });
 
 test("fresh configuration selects Doubao and search toggle is saved", () => {
@@ -42,7 +42,7 @@ test("loading API defaults cannot synthesize an unsaved edit; wizard still initi
   assert.match(selector,/if \(!autoSelectDefault \|\| state.loading/);
   assert.match(selector,/disabled=\{autoSelectDefault\}/);
   assert.match(page,/useExitProtection\(saving/);
-  assert.match(page,/JSON.stringify\(videoConfigs\) !== JSON.stringify\(savedVideoConfigs\)/);
+  assert.match(page,/const dirty = videoDirty \|\| speechDirty/);
 });
 
 test("switching chat providers clears draft, masked key and configured state", () => {
@@ -61,7 +61,8 @@ test("switching chat providers clears draft, masked key and configured state", (
 
 test("custom endpoint changes invalidate credentials, formatting changes do not", () => {
   const current = { llmProvider: "custom", llmBaseUrl: "https://example.invalid/v1",
-    llmApiKey: "test-draft", llmApiKeyMasked: "tes…mask", llmConfigured: true };
+    llmApiKey: "test-draft", llmApiKeyMasked: "tes…mask", llmConfigured: true,
+    llmApiKeyMasks: { "custom:https://api.deepseek.com": "old…mask" } };
   for (const url of ["https://another.invalid/v1", "https://example.invalid/v2", ""]) {
     const next = changeLlmEndpoint(current, url);
     assert.equal(next.llmApiKey, ""); assert.equal(next.llmApiKeyMasked, "");
@@ -120,36 +121,39 @@ test("API settings owns voice and generation credential inputs", () => {
 
   assert.match(source, /title="模型配置"/);
   assert.match(source, /load_device_asr_settings/);
-  assert.match(source, /save_device_asr_settings/);
+  assert.match(source, /save_speech_settings/);
   assert.match(source, /test_device_asr_settings/);
   assert.match(source, /VIDEO_PROVIDERS\.map/);
   assert.doesNotMatch(source, /Access Key|Secret Key/);
   assert.match(source, /KlingVideoSettings/);
   assert.match(source, /href=\{KLING_KEY_URL\}/);
-  assert.match(source, /type=\{showSecrets \? "text" : "password"\}/);
+  assert.doesNotMatch(source, /showSecrets|显示密钥|隐藏密钥/);
+  assert.match(source, /secretInputProps/);
   assert.match(source, /saveProviderConfig/);
   assert.match(source, /emitApiConfigurationUpdated/);
   assert.doesNotMatch(source, /macOS 不使用钥匙串|仅由当前用户读取，不额外加密|无需选择模型版本|火山引擎豆包语音（识别 \+ 合成）/);
   assert.doesNotMatch(source, /2628951/);
-  assert.match(source, /title="语音识别与合成"\s+subtitle=\{\([\s\S]*?识别与合成共用一个 API Key[\s\S]*?href="https:\/\/docs\.volcengine\.com\/docs\/DoubaoVoice\/APIKeyUsage\?lang=zh"[\s\S]*?Key 获取方式[\s\S]*?actions=\{/);
-  assert.match(source, /<details>[\s\S]*ASR 2\.0 和 TTS 2\.0/);
-  assert.match(source, /https:\/\/ark\.volcengine\.com\/model\/detail\?name=doubao-seedance-2-0-mini/);
-  assert.match(source, /provider\.id === "volcengine"/);
-  assert.equal((source.match(/Key 获取方式/g) || []).length, 2);
-  assert.equal((source.match(/target="_blank"/g) || []).length, 3);
-  assert.equal((source.match(/rel="noreferrer"/g) || []).length, 3);
+  assert.match(source, /豆包语音控制台为同一项目开通流式语音识别 2\.0（小时版）和语音合成 2\.0/);
+  assert.match(source, /方舟 Key 与豆包语音 Key 分别创建/);
+  assert.match(source, /无需单独开通语音/);
+  const guide = source.slice(source.indexOf("function GuideLink"), source.indexOf("const cleanEndpoint"));
+  assert.match(guide, /href=\{href\} target="_blank" rel="noreferrer"/);
+  for (const fragment of ["doubao-voice/console-guidance", "ark/quick-start-beginner", "Speech-Recognition",
+    "speech-synthesis-v2.5", "quick-start/faq/token-plan", "api-docs.deepseek.com"]) assert.ok(source.includes(fragment));
   assert.doesNotMatch(source, /devin_cloud_|Devin 云端会话/);
 });
 
 test("saved ASR credentials are broadcast before the optional cloud probe", () => {
   const source = readSource("ApiSettings.jsx");
-  const saveAndTest = source.match(/const saveAndTestAsr = async \(\) => \{[\s\S]*?\n  \};/);
+  const saveAndTest = source.match(/const saveAndTestAsr = async \(probe = true\) => \{[\s\S]*?\n  \};/);
   assert.ok(saveAndTest, "expected saveAndTestAsr");
 
-  const saveIndex = saveAndTest[0].indexOf('invoke("save_device_asr_settings"');
+  const saveIndex = saveAndTest[0].indexOf('invoke("save_speech_settings"');
   const broadcastIndex = saveAndTest[0].indexOf("emitApiConfigurationUpdated({");
   const probeIndex = saveAndTest[0].indexOf('invoke("test_device_asr_settings"');
   assert.ok(saveIndex !== -1 && broadcastIndex !== -1 && probeIndex !== -1);
+  assert.doesNotMatch(saveAndTest[0], /invoke\("(save_voice_chat_settings|save_device_asr_settings)"/);
+  assert.match(saveAndTest[0], /invoke\("test_device_tts_settings"\)/);
   assert.ok(saveIndex < broadcastIndex, "persist credentials before broadcasting");
   assert.ok(broadcastIndex < probeIndex, "broadcast must not wait for the probe");
   assert.match(saveAndTest[0], /providerId: "volcengine-asr"/);
@@ -174,8 +178,8 @@ test("feature pages no longer render API-key inputs", () => {
   assert.doesNotMatch(wizard, /type="password"/);
   assert.doesNotMatch(detail, /type="password"/);
   assert.doesNotMatch(voice, /type="password"/);
-  assert.match(wizard, /打开 API 配置/);
-  assert.match(voice, /前往 API 配置/);
+  assert.match(wizard, /打开模型配置/);
+  assert.match(voice, /前往模型配置/);
 });
 
 test("API settings uses a responsive provider grid", () => {

@@ -3,9 +3,10 @@
     "title": "成语笺",
     "headline": "依释义选字，填全四字成语",
     "note": "简单二十题，中等与困难各三十题。",
-    "footer": "开始闯关",
+    "footer": "确认键开始或填字 · 左右选字 · 全局键退出",
     "visualStyle": "clean",
     "visualPalette": "ember",
-    "visualLayout": "scoreboard"
+    "visualLayout": "scoreboard",
+    "visualSprite": "star"
   }
 }

@@ -167,7 +167,7 @@ test("An unverified runtime does not fall back to the Linux hardware illustratio
   assert.match(dashboard, /if \(runtimeId === P4_RUNTIME_ID\) return P4_BUTTON_CONTROL_ROWS/);
   assert.match(dashboard, /return \[\]/);
   assert.match(source, /controlRows\.length === 0/);
-  assert.match(source, /等待设备协议握手/);
+  assert.match(source, /连接设备以配置按键/);
   assert.match(source, /board-button-panel__unverified/);
 });
 

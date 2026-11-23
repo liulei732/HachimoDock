@@ -1,7 +1,12 @@
 /* Deferred, checksummed A/B snapshots. No filesystem work in runtime critical sections. */
 #include "pet_p4_app_store.h"
+#if PET_COMPONENT_PROGRAM_ENABLED
+#include "pet_p4_program_persistence.h"
+#include <sys/stat.h>
+#endif
 #include "pet_p4_task_policy.h"
 #include "pet_p4_file_read.h"
+#include "pet_p4_file_cleanup.h"
 #include "pet_p4_audio.h"
 #include "pet_p4_widget_trace.h"
 #include "pet_p4_fs_activity.h"
@@ -19,6 +24,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
 
@@ -159,18 +165,26 @@ static void scoped_path_for(const char *id,uint32_t domain,unsigned slot,char ou
  * new snapshot, so a concurrent reinstall cannot resurrect a high legacy seq.
  * Existing epoch-zero filenames/headers remain readable without migration. */
 typedef struct {uint32_t magic,epoch,check;char id[48];} save_epoch_t;
-static bool read_epoch(const char *id,uint32_t domain,uint32_t *epoch,unsigned *slot,pet_resource_lease_t lease,bool explicit_forget){
+static bool read_epoch(const char *id,uint32_t domain,uint32_t *epoch,unsigned *slot,pet_resource_lease_t lease,bool explicit_forget,unsigned absent){
   PET_FS_ACTIVITY_SCOPE(epoch_read);
   PET_WIDGET_TRACE_SCOPE(epoch_read_trace,PET_WTRACE_SAVE_READ);
   *epoch=0;*slot=4;bool valid=false,corrupt=false;
   for(unsigned i=2;i<4;i++){
     if(!pet_resources_device_current(lease))return false;
+    if(absent & (1u << i))continue;
     char path[64];scoped_path_for(id,domain,i,path);FILE *f;int open_error=0;
     {PET_WIDGET_TRACE_SCOPE(epoch_open,PET_WTRACE_FS_OPEN);f=fopen(path,"rb");if(!f)open_error=errno;}
     if(!f){if(open_error!=ENOENT)return false;continue;}
-    save_epoch_t e={0};bool ok;
-    {PET_WIDGET_TRACE_SCOPE(epoch_data,PET_WTRACE_FS_DATA);ok=fread(&e,1,sizeof(e),f)==sizeof(e)&&fgetc(f)==EOF&&!ferror(f);}
-    {PET_WIDGET_TRACE_SCOPE(epoch_close,PET_WTRACE_FS_CLOSE);if(fclose(f)!=0)return false;}
+    save_epoch_t e={0};bool ok,io_failed;
+    {PET_WIDGET_TRACE_SCOPE(epoch_data,PET_WTRACE_FS_DATA);
+      size_t bytes=0;
+      pet_file_size_result_t size=pet_file_read_extent(f,sizeof(e),&bytes);
+      ok=size==PET_FILE_SIZE_OK&&bytes==sizeof(e)&&fread(&e,1,sizeof(e),f)==sizeof(e);
+      io_failed=size==PET_FILE_SIZE_IO||ferror(f);
+    }
+    /* An unreadable peer could be newer. Only known malformed bytes can be
+     * repaired by explicit forget using the other valid generation. */
+    {PET_WIDGET_TRACE_SCOPE(epoch_close,PET_WTRACE_FS_CLOSE);if(fclose(f)!=0||io_failed)return false;}
     uint32_t check=e.check;e.check=0;
     ok=ok&&e.magic==0x41534531&&memchr(e.id,0,sizeof(e.id))&&!strcmp(e.id,id)&&checksum((const char*)&e,sizeof(e))==check;
     if(!ok){corrupt=true;continue;}
@@ -179,8 +193,28 @@ static bool read_epoch(const char *id,uint32_t domain,uint32_t *epoch,unsigned *
   return !corrupt||(explicit_forget&&valid);
 }
 static void epoch_path_for(const char *id,uint32_t domain,unsigned slot,uint32_t epoch,char out[64]){
-  scoped_path_for(id,domain,slot,out);
-  if(epoch){size_t n=strlen(out);snprintf(out+n,64-n,"-e%08lx",(unsigned long)epoch);}
+  if(!epoch){scoped_path_for(id,domain,slot,out);return;}
+#if defined(CONFIG_SPIFFS_OBJ_NAME_LEN) && CONFIG_SPIFFS_OBJ_NAME_LEN >= 33
+  /* Keep earlier writable layouts on filesystems that actually admit them.
+   * The VFS strips the mount point but passes the leading slash to SPIFFS. */
+  if(!domain || CONFIG_SPIFFS_OBJ_NAME_LEN >= 42){
+    scoped_path_for(id,domain,slot,out);
+    size_t n=strlen(out);snprintf(out+n,64-n,"-e%08lx",(unsigned long)epoch);
+    return;
+  }
+#endif
+  /* 31 bytes including '/': slot, full domain, full epoch, and 72 bits of
+   * SHA-256 over the complete component ID. The save header checks the full
+   * ID again. Keep epoch zero and all marker/temp names byte-for-byte stable. */
+  static const char digits[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  unsigned char hash[32];
+  mbedtls_sha256((const unsigned char*)id,strlen(id),hash,0);
+  size_t n=(size_t)snprintf(out,64,PET_APP_SAVE_ROOT "/e%u%08lx%08lx",slot,(unsigned long)domain,(unsigned long)epoch);
+  for(unsigned i=0;i<9;i+=3){
+    uint32_t word=((uint32_t)hash[i]<<16)|((uint32_t)hash[i+1]<<8)|hash[i+2];
+    for(int shift=18;shift>=0;shift-=6)out[n++]=digits[(word>>shift)&63];
+  }
+  out[n]=0;
 }
 static bool write_epoch_record(const char *id,uint32_t domain,unsigned slot,const save_epoch_t *e,pet_resource_lease_t lease){
   if(!pet_resources_device_current(lease))return false;
@@ -191,11 +225,18 @@ static bool write_epoch_record(const char *id,uint32_t domain,unsigned slot,cons
   {PET_WIDGET_TRACE_SCOPE(epoch_close,PET_WTRACE_FS_CLOSE);if(fclose(f)!=0)ok=false;}
   return ok;
 }
-static bool write_forget_epoch(const char *id,uint32_t domain,uint32_t *epoch,pet_resource_lease_t lease){
+/* Six bits per domain: epoch-zero snapshots 0/1, markers 2/3,
+ * epoch-one snapshots 4/5. Uncovered epochs always take the physical path. */
+enum { FORGET_NAMES_PER_DOMAIN = 6 };
+static bool snapshot_proven_absent(unsigned absent,uint32_t epoch,unsigned slot){
+  return epoch<=1 && (absent & (1u << (4*epoch+slot)));
+}
+
+static bool write_forget_epoch(const char *id,uint32_t domain,uint32_t *epoch,pet_resource_lease_t lease,unsigned absent){
   PET_FS_ACTIVITY_SCOPE(epoch_write);
   PET_WIDGET_TRACE_SCOPE(epoch_write_trace,PET_WTRACE_SAVE_WRITE);
   uint32_t old;unsigned slot;
-  if(!pet_resources_device_current(lease)||!read_epoch(id,domain,&old,&slot,lease,true)||!pet_resources_device_current(lease)||old==UINT32_MAX)return false;
+  if(!pet_resources_device_current(lease)||!read_epoch(id,domain,&old,&slot,lease,true,absent)||!pet_resources_device_current(lease)||old==UINT32_MAX)return false;
   save_epoch_t e={.magic=0x41534531,.epoch=old};snprintf(e.id,sizeof(e.id),"%s",id);
   if(slot==4){
     /* First deletion needs a durable epoch-zero fallback. Publish that anchor
@@ -214,6 +255,7 @@ static bool write_forget_epoch(const char *id,uint32_t domain,uint32_t *epoch,pe
   char target[64];
   for(unsigned i=0;i<2;i++){
     if(!pet_resources_device_current(lease))return false;
+    if(snapshot_proven_absent(absent,e.epoch,i))continue;
     epoch_path_for(id,domain,i,e.epoch,target);
     PET_WIDGET_TRACE_SCOPE(epoch_target_remove,PET_WTRACE_FS_REMOVE);
     if(unlink(target)!=0&&errno!=ENOENT)return false;
@@ -223,11 +265,16 @@ static bool write_forget_epoch(const char *id,uint32_t domain,uint32_t *epoch,pe
   /* Old bytes belong to an explicit forget only. The committed epoch already
    * makes them ineligible even if removal is interrupted or fails. */
   char path[64];
-  for(unsigned i=0;i<2&&pet_resources_device_current(lease);i++){epoch_path_for(id,domain,i,old,path);PET_WIDGET_TRACE_SCOPE(epoch_remove,PET_WTRACE_FS_REMOVE);(void)unlink(path);}
+  for(unsigned i=0;i<2 && pet_resources_device_current(lease);i++){
+    if(snapshot_proven_absent(absent,old,i))continue;
+    epoch_path_for(id,domain,i,old,path);
+    PET_WIDGET_TRACE_SCOPE(epoch_remove,PET_WTRACE_FS_REMOVE);
+    (void)unlink(path);
+  }
   return true;
 }
 static bool commit_forget_epoch(save_t *save,pet_resource_lease_t lease){
-  if(!write_forget_epoch(save->id,save->domain,&save->epoch,lease))return false;
+  if(!write_forget_epoch(save->id,save->domain,&save->epoch,lease,0))return false;
   save->epoch_pending=false;return true;
 }
 typedef enum { SAVE_MISSING=0,SAVE_VALID=1,SAVE_CORRUPT=2,SAVE_UNAVAILABLE=3 } save_read_t;
@@ -260,29 +307,16 @@ static save_read_t read_slot(const char *id,uint32_t domain,unsigned slot,save_t
   if(ok){snprintf(out->id,sizeof(out->id),"%s",id);out->domain=domain;out->seq=h.seq;out->file_slot=slot;out->loaded=true;}
   return ok?SAVE_VALID:SAVE_CORRUPT;
 }
-static bool write_slot(const save_t *save,pet_resource_lease_t lease){
+static bool write_slot_data(const save_t *save,pet_resource_lease_t lease,char path[64],header_t *h){
 #if PET_P4_RESET_PHASE_TRACE
   PET_RESET_PHASE_SCOPE(save_phase,PET_PHASE_SAVE);
 #endif
   if(!pet_resources_device_current(lease))return false;
   PET_FS_ACTIVITY_SCOPE(storage_write);
   PET_WIDGET_TRACE_SCOPE(save_write,PET_WTRACE_SAVE_WRITE);
-#if PET_P4_SAVE_TRACE_DETACHED
-  if(!save_pending_scope||save_pending_scope->self!=save_pending_scope
-      ||save_pending_scope->task!=xTaskGetCurrentTaskHandle())return false;
-  char *path=save_write_scratch.path;
-#else
-  char path[64];
-#endif
   epoch_path_for(save->id,save->domain,save->file_slot,save->epoch,path);
   if(save->deleted){bool ok=true;for(unsigned i=0;i<2;i++){if(!pet_resources_device_current(lease))return false;epoch_path_for(save->id,save->domain,i,save->epoch,path);PET_WIDGET_TRACE_SCOPE(remove_save,PET_WTRACE_FS_REMOVE);if(unlink(path)!=0&&errno!=ENOENT)ok=false;}return ok;}
-#if PET_P4_SAVE_TRACE_DETACHED
-  header_t *h=&save_write_scratch.header;
   *h=(header_t){.magic=0x41535631,.seq=save->seq,.size=(uint32_t)strlen(save->json)};
-#else
-  header_t local_header={.magic=0x41535631,.seq=save->seq,.size=(uint32_t)strlen(save->json)};
-  header_t *h=&local_header;
-#endif
   memcpy(h->id,save->id,sizeof(h->id));h->checksum=checksum(save->json,h->size);
   FILE *f;
   {PET_WIDGET_TRACE_SCOPE(open_write,PET_WTRACE_FS_OPEN);f=fopen(path,"wb");}
@@ -312,11 +346,43 @@ static bool write_slot(const save_t *save,pet_resource_lease_t lease){
   }
   return ok; // prior generation is never overwritten until a new full snapshot exists
 }
+static bool write_slot(const save_t *save,pet_resource_lease_t lease){
+#if PET_P4_SAVE_TRACE_DETACHED
+  if(!save_pending_scope||save_pending_scope->self!=save_pending_scope
+      ||save_pending_scope->task!=xTaskGetCurrentTaskHandle())return false;
+  return write_slot_data(save,lease,save_write_scratch.path,&save_write_scratch.header);
+#else
+  char path[64];header_t header;
+  return write_slot_data(save,lease,path,&header);
+#endif
+}
 /* Observation/update paths must never reserve or evict a different key. */
 static int lookup_slot(uint32_t domain,const char *id){
   int first=domain?SLOTS:0,last=domain?SLOTS+SCOPED_SLOTS:SLOTS;
   for(int i=first;i<last;i++)if(saves[i].domain==domain&&!strcmp(saves[i].id,id))return i;
   return -1;
+}
+const char *pet_app_store_cached_state(const char *id,uint64_t *oldest_edit_ms){
+  if(!oldest_edit_ms)return "unknown";
+  *oldest_edit_ms=0;
+  if(!lock||!valid_id(id))return "unknown";
+  bool cached=false,pending=false,blocked=false;
+  xSemaphoreTake(lock,portMAX_DELAY);
+  uint64_t now=now_ms();
+  for(int i=0;i<SLOTS+SCOPED_SLOTS;i++){
+    const save_t *s=&saves[i];
+    if(strcmp(s->id,id))continue;
+    cached=true;
+    blocked|=s->loading||s->load_failed||!s->loaded;
+    if(!s->dirty)continue;
+    pending=true;
+    if(!s->deleted&&now>=s->dirty_since){
+      uint64_t age=now-s->dirty_since;
+      if(age>*oldest_edit_ms)*oldest_edit_ms=age;
+    }
+  }
+  xSemaphoreGive(lock);
+  return blocked?"blocked":pending?"pending":cached?"clean":"unknown";
 }
 static int reserve_slot(uint32_t domain,const char *id){
   int present=lookup_slot(domain,id);if(present>=0)return present;
@@ -329,6 +395,53 @@ static int reserve_slot(uint32_t domain,const char *id){
   return -1;
 }
 static int find_slot(const char *id){return reserve_slot(0,id);}
+/* STORAGE_WORK serializes file generations. A newer RAM revision stays dirty. */
+static bool finish_write(int i,const save_t *pending,bool epoch_ok,bool written){
+  xSemaphoreTake(lock,portMAX_DELAY);
+  save_t *slot=&saves[i];
+  bool same=slot->domain==pending->domain&&!strcmp(slot->id,pending->id);
+  if(same&&epoch_ok&&slot->forget_serial==pending->forget_serial){
+    slot->epoch=pending->epoch;slot->epoch_pending=false;
+  }
+  bool current=false;
+  if(same&&written){
+    slot->file_slot=pending->file_slot;slot->dirty_since=now_ms();
+    current=slot->seq==pending->seq&&slot->forget_serial==pending->forget_serial;
+    if(current){slot->dirty=false;if(pending->deleted)memset(slot,0,sizeof(*slot));}
+  }
+  xSemaphoreGive(lock);return current;
+}
+
+/* Package removal holds the storage lease. Flush only its own dirty keys,
+ * using private scratch, and refuse an ACK for a superseded checkpoint. */
+bool pet_app_store_preserve_with_lease(const char *id,pet_resource_lease_t lease){
+  if(!lock||!valid_id(id)||lease.kind!=PET_RESOURCE_STORAGE_WORK||!pet_resources_device_current(lease))return false;
+  const uint32_t domains[]={0,
+#if PET_COMPONENT_PROGRAM_ENABLED
+    PET_PROGRAM_SAVE_DOMAIN,
+#endif
+  };
+  for(unsigned d=0;d<sizeof(domains)/sizeof(domains[0]);d++){
+    xSemaphoreTake(lock,portMAX_DELAY);
+    int i=lookup_slot(domains[d],id);
+    bool busy=i>=0&&(saves[i].loading||saves[i].load_failed);
+    bool dirty=i>=0&&saves[i].dirty;
+    xSemaphoreGive(lock);
+    if(busy)return false;
+    if(!dirty)continue;
+    save_load_workspace_t *workspace __attribute__((cleanup(save_load_workspace_finish)))=save_load_workspace_acquire();
+    if(!workspace)return false;
+    save_t *pending=&workspace->a;
+    xSemaphoreTake(lock,portMAX_DELAY);
+    *pending=saves[i];pending->file_slot^=1;
+    xSemaphoreGive(lock);
+    bool epoch_ok=!pending->epoch_pending||commit_forget_epoch(pending,lease);
+    char path[64];header_t header;
+    bool written=epoch_ok&&write_slot_data(pending,lease,path,&header);
+    if(!finish_write(i,pending,epoch_ok,written))return false;
+  }
+  return true;
+}
 #if PET_P4_SAVE_TRACE_DETACHED
 static __attribute__((noinline)) void flush_one(pet_widget_trace_operation_t *completed,bool *completed_ok){
 #else
@@ -352,10 +465,17 @@ static void flush_one(void){
       /* A cold load owns this slot until its disk sequence is reconciled.
        * Concurrent updates may proceed, but cannot flush a guessed sequence. */
       bool ready=saves[i].dirty&&!saves[i].loading&&!saves[i].load_failed&&now_ms()-saves[i].dirty_since>=30000;
-      if(ready){pending=saves[i];pending.file_slot^=1;}xSemaphoreGive(lock);
+      xSemaphoreGive(lock);
       if(!ready)continue;
       save_io_t io __attribute__((cleanup(save_io_end)))={0};
       if(!save_io_begin(&io,NULL))return;
+      /* Uninstall can retire this key between the scan and IO admission.
+       * Capture only while holding the same storage lease as the write. */
+      xSemaphoreTake(lock,portMAX_DELAY);
+      ready=saves[i].dirty&&!saves[i].loading&&!saves[i].load_failed&&now_ms()-saves[i].dirty_since>=30000;
+      if(ready){pending=saves[i];pending.file_slot^=1;}
+      xSemaphoreGive(lock);
+      if(!ready)continue;
 #if PET_APP_SAVE_OWNED_PENDING_ENABLED
       save_stack_sample_due=true;
 #endif
@@ -368,15 +488,7 @@ static void flush_one(void){
 #endif
       bool epoch_ok=!pending.epoch_pending||commit_forget_epoch(&pending,io.lease);
       bool ok=epoch_ok&&write_slot(&pending,io.lease);
-      xSemaphoreTake(lock,portMAX_DELAY);
-      if(epoch_ok&&saves[i].domain==pending.domain&&!strcmp(saves[i].id,pending.id)
-          &&saves[i].forget_serial==pending.forget_serial){saves[i].epoch=pending.epoch;saves[i].epoch_pending=false;}
-
-      if(ok&&saves[i].domain==pending.domain&&!strcmp(saves[i].id,pending.id)){
-        saves[i].file_slot=pending.file_slot;saves[i].dirty_since=now_ms();
-        if(saves[i].seq==pending.seq){saves[i].dirty=false;if(pending.deleted)memset(&saves[i],0,sizeof(save_t));}
-      }
-      xSemaphoreGive(lock);
+      finish_write(i,&pending,epoch_ok,ok);
 #if PET_P4_SAVE_TRACE_DETACHED
       *completed_ok=ok;
 #else
@@ -465,7 +577,7 @@ static pet_app_store_status_t load_with_authority(uint32_t domain,const char *id
   }
   save_io_cache_begin(&io);
   save_t *a=&workspace->a,*b=&workspace->b;uint32_t epoch=0;unsigned epoch_slot;
-  bool epoch_ok=read_epoch(id,domain,&epoch,&epoch_slot,io.lease,false);
+  bool epoch_ok=read_epoch(id,domain,&epoch,&epoch_slot,io.lease,false,0);
   a->epoch=b->epoch=epoch;
   save_read_t ar=epoch_ok?read_slot(id,domain,0,a,io.lease):SAVE_UNAVAILABLE;
   save_read_t br=epoch_ok?read_slot(id,domain,1,b,io.lease):SAVE_UNAVAILABLE;
@@ -605,6 +717,93 @@ void pet_app_store_forget(const char *id){
   xSemaphoreGive(lock);
 }
 
+typedef struct {
+  pet_resource_lease_t lease;
+  int64_t deadline;
+} forget_scan_t;
+
+static bool forget_owner_current(void *context){
+  forget_scan_t *scan=context;
+  return pet_resources_device_current(scan->lease);
+}
+static bool forget_scan_idle(void *context,uint64_t *epoch){
+  forget_scan_t *scan=context;
+  return esp_timer_get_time()<scan->deadline && pet_fs_activity_idle_epoch(epoch);
+}
+
+/* Called once under the exclusive save-storage lease, before our own
+ * journal IO enters the activity observer. Only exact *absences* survive
+ * this scan. Marker bits are consumed before their domain writes any marker;
+ * neither domain creates snapshots during forget. No proof survives return. */
+static unsigned forget_absent_names(const char *id,pet_resource_lease_t lease){
+  const uint32_t domains[]={0,
+#if PET_COMPONENT_PROGRAM_ENABLED
+    PET_PROGRAM_SAVE_DOMAIN,
+#endif
+  };
+  enum { count = sizeof(domains)/sizeof(domains[0])*FORGET_NAMES_PER_DOMAIN };
+  _Static_assert(count<=PET_FILE_CLEANUP_MAX_TARGETS && count<32,"bounded journal scan");
+  pet_file_cleanup_target_t *targets=calloc(count,sizeof(*targets));
+  if(!targets)return 0;
+  unsigned absent=0;
+  for(unsigned d=0;d<sizeof(domains)/sizeof(domains[0]);d++){
+    for(unsigned i=0;i<FORGET_NAMES_PER_DOMAIN;i++){
+      char path[64];
+      if(i<4)scoped_path_for(id,domains[d],i,path);
+      else epoch_path_for(id,domains[d],i-4,1,path);
+      size_t length=strlen(path);
+      if(length>=sizeof(targets[0].path))goto done;
+      memcpy(targets[d*FORGET_NAMES_PER_DOMAIN+i].path,path,length+1);
+    }
+  }
+  forget_scan_t scan={lease,esp_timer_get_time()+5000000};
+  pet_file_cleanup_guard_t guard={.owner_current=forget_owner_current,.idle_epoch=forget_scan_idle,.context=&scan};
+  pet_file_cleanup_plan_t plan;
+  if(pet_file_cleanup_prepare(&plan,PET_APP_SAVE_ROOT,targets,count,guard) && plan.snapshot_used)
+    absent=((1u<<count)-1u) & ~plan.present;
+done:
+  free(targets);
+  return absent;
+}
+
+#if PET_COMPONENT_PROGRAM_ENABLED
+/* The package owner has retired the program and holds STORAGE_WORK.
+ * A cold delete must also work when every scoped cache slot is occupied. */
+static bool forget_program_records(const char *id, pet_resource_lease_t lease,unsigned absent){
+  xSemaphoreTake(lock,portMAX_DELAY);
+  int i=lookup_slot(PET_PROGRAM_SAVE_DOMAIN,id);
+  if(i>=0&&(saves[i].pin_serial||saves[i].loading)){
+    xSemaphoreGive(lock);return false;
+  }
+  if(i>=0)saves[i].loading=true;
+  xSemaphoreGive(lock);
+
+  if(i<0){
+    /* Epoch zero has two snapshots. Any later epoch has a marker in 2/3. */
+    unsigned slot;
+    for(slot=0;slot<4;slot++){
+      if(!pet_resources_device_current(lease))return false;
+      if(absent & (1u<<slot))continue;
+      char path[64];struct stat st;
+      scoped_path_for(id,PET_PROGRAM_SAVE_DOMAIN,slot,path);
+      if(stat(path,&st)==0)break;
+      if(errno!=ENOENT)return false;
+    }
+    if(slot==4)return pet_resources_device_current(lease);
+  }
+  uint32_t epoch;
+  bool ok=write_forget_epoch(id,PET_PROGRAM_SAVE_DOMAIN,&epoch,lease,absent);
+  if(i>=0){
+    xSemaphoreTake(lock,portMAX_DELAY);
+    /* Even a failed close can follow a durable epoch. Force an authoritative
+     * disk reload; a stale dirty checkpoint must never enter the new epoch. */
+    memset(&saves[i],0,sizeof(saves[i]));
+    xSemaphoreGive(lock);
+  }
+  return ok;
+}
+#endif
+
 /* This authority belongs to the already admitted storage worker, never an
  * input/render callback. Keep the independent deletion intent durable even
  * when physical old-save reclamation or later new snapshots are interrupted. */
@@ -616,7 +815,12 @@ bool pet_app_store_forget_with_lease(const char *id,pet_resource_lease_t lease){
   xSemaphoreGive(lock);if(!valid)return false;
   save_io_t io __attribute__((cleanup(save_io_end)))={0};if(!save_io_begin(&io,&lease))return false;
   save_io_cache_begin(&io);uint32_t epoch=0;
-  if(!write_forget_epoch(id,0,&epoch,lease))return false;
+  unsigned absent=forget_absent_names(id,lease);
+  if(!pet_resources_device_current(lease))return false;
+  #if PET_COMPONENT_PROGRAM_ENABLED
+  if(!forget_program_records(id,lease,absent >> FORGET_NAMES_PER_DOMAIN))return false;
+#endif
+  if(!write_forget_epoch(id,0,&epoch,lease,absent))return false;
   xSemaphoreTake(lock,portMAX_DELAY);
   valid=saves[i].domain==0&&!strcmp(saves[i].id,id)&&saves[i].forget_serial==serial;
   if(valid){saves[i].epoch=epoch;saves[i].epoch_pending=false;}

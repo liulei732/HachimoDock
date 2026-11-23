@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>
+#include <errno.h>
 #include <time.h>
 #include <dirent.h>
 #include <stdio.h>
@@ -19,12 +20,25 @@ static int local_rename(const char *old, const char *new) {
   assert(access(local_path(new), F_OK) != 0);
   return rename(local_path(old), local_path(new));
 }
-static int local_unlink(const char *path) { return unlink(local_path(path)); }
+static unsigned unlink_calls, scan_calls;
+static unsigned fail_after_unlinks;
+static int local_unlink(const char *path) {
+  ++unlink_calls;
+  if (fail_after_unlinks && unlink_calls > fail_after_unlinks) { errno=EIO; return -1; }
+  return unlink(local_path(path));
+}
 static int local_stat(const char *path, struct stat *out) { return stat(local_path(path), out); }
 static DIR *local_opendir(const char *path) {
   assert(!strcmp(path, "/spiffs"));
+  ++scan_calls;
   return opendir(".");
 }
+static unsigned fail_scans;
+static struct dirent *local_readdir(DIR *dir) {
+  if (fail_scans && scan_calls <= fail_scans) { errno=EIO; return NULL; }
+  return readdir(dir);
+}
+#define readdir local_readdir
 #define opendir local_opendir
 #define fopen local_open
 #define rename local_rename
@@ -32,6 +46,7 @@ static DIR *local_opendir(const char *path) {
 #define stat(path, out) local_stat(path, out)
 #include "pet_p4_component_media.c"
 #undef opendir
+#undef readdir
 #undef fopen
 #undef rename
 #undef unlink
@@ -89,7 +104,69 @@ static void stage(const uint8_t *bank) {
   }
 }
 
+static void touch(const char *name) {
+  FILE *file = fopen(name, "wb");
+  assert(file && fclose(file) == 0);
+}
+
+static void test_remove_slot(void) {
+  const char *keep[] = {"p4m08-0-s0.bin", "p4m07-1-b4.tmp", "p4m07-1-a1.bin",
+                        "p4m07-1-c1.bin.old", "as-private-0"};
+  for (unsigned i=0; i<sizeof(keep)/sizeof(keep[0]); ++i) touch(keep[i]);
+  scan_calls=unlink_calls=0;
+  pet_cmedia_remove(7);
+  assert(scan_calls==1 && unlink_calls==0);
+
+  /* Populate the full historical sweep, including unused clip/image indices. */
+  for (unsigned gen=0; gen<2; ++gen) {
+    for (const char *kind="scba"; *kind; ++kind) {
+      unsigned count = *kind=='a' ? 1 : 4;
+      for (unsigned index=0; index<count; ++index) {
+        for (unsigned tmp=0; tmp<2; ++tmp) {
+          char name[32];
+          snprintf(name,sizeof(name),"p4m07-%u-%c%u.%s",gen,*kind,index,tmp?"tmp":"bin");
+          touch(name);
+        }
+      }
+    }
+  }
+  scan_calls=unlink_calls=0;
+  g_pending.serial=1;
+  pet_cmedia_remove(7);
+  assert(scan_calls==0 && unlink_calls==0);
+  g_pending.serial=0;
+
+  /* Interrupt physical reclamation. The following call rebuilds its bitmap
+   * from disk, including a file recreated in the already-cleared subset. */
+  fail_after_unlinks=11;
+  pet_cmedia_remove(7);
+  assert(scan_calls==1 && unlink_calls==52 && access("p4m07-0-s0.bin", F_OK)!=0);
+  assert(access("p4m07-1-a0.tmp", F_OK)==0);
+  touch("p4m07-0-s0.bin");
+  fail_after_unlinks=0;
+  scan_calls=unlink_calls=0;
+  pet_cmedia_remove(7);
+  assert(scan_calls==1 && unlink_calls==42);
+  scan_calls=unlink_calls=0;
+  pet_cmedia_remove(7);
+  assert(scan_calls==1 && unlink_calls==0);
+
+  touch("p4m07-1-c3.tmp");
+  scan_calls=unlink_calls=0; fail_scans=1;
+  pet_cmedia_remove(7);
+  assert(scan_calls==2 && unlink_calls==1 && access("p4m07-1-c3.tmp",F_OK)!=0);
+  touch("p4m07-0-b3.bin");
+  scan_calls=unlink_calls=0; fail_scans=2;
+  pet_cmedia_remove(7);
+  assert(scan_calls==2 && unlink_calls==52 && access("p4m07-0-b3.bin",F_OK)!=0);
+  fail_scans=0;
+  for (unsigned i=0; i<sizeof(keep)/sizeof(keep[0]); ++i) {
+    assert(access(keep[i],F_OK)==0 && unlink(keep[i])==0);
+  }
+}
+
 int main(void) {
+  test_remove_slot();
   uint8_t *a = make_bank(17), *b = make_bank(42);
   pet_cext_runtime_t original = {0}, replacement = {0}, empty = {0};
   set_hash(&original, a);

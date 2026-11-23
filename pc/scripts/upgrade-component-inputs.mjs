@@ -69,7 +69,7 @@ for(const id of fs.readdirSync(source).sort()){
     nodes.push({type:"panel",x:v.x,y:v.y,w:v.w,h:v.h,color:0,opacity:0,action:"flappy.flap"});
     notes.push("点游戏区或按下 SW1 即拍翅，释放不重复，保持半速");
   }
-  if(id==="wooden-fish"){r.input.press=["instrument.strike"];notes.push("触屏按下与 SW1 即时敲击，一次按下仅一次");}
+  if(id==="wooden-fish"){c.description="轻点屏幕或按主操作敲击木鱼。设备本地合成敲击和伴奏，连敲时伴奏随落槌减弱，退出或进入语音时停止。";r.input.press=["instrument.strike"];notes.push("触屏按下与 SW1 即时敲击，一次按下仅一次");}
   if(id==="two-key-pong"){r.input.repeat=["shift_left","shift_right"];r.input.drag={entity:"bat",axis:"x"};notes.push("摇杆长按连续移动；触屏横向拖动球拍");}
   if(id==="hachimi-learn")swipe("host.next","host.previous");
   if(id==="hachimi-travel"){
@@ -82,6 +82,9 @@ for(const id of fs.readdirSync(source).sort()){
     notes.push("普通天气页隐藏选城切换键；仅在选城时显示");
   }
   if(id==="hachimi-sounds"){
+    c.description="通过 PC 与 USB 播放四种原创合成自然声景。可调音量，选择本轮 15、30 或 60 分钟总时长；缩短到已过时长时渐止，退出或开始语音即停止。";
+    map("host.primary","button.sw1.short_press","播放 / 停止");
+    map("host.secondary","button.sw2.short_press","切换定时");
     r.input.repeat=["host.up","host.down"];
     const profile=read(path.join(root,"pc/application.json"));
     ["rain","sea","fire","insects"].forEach((op,index)=>{
@@ -108,7 +111,7 @@ for(const id of fs.readdirSync(source).sort()){
     notes.push("移除摇杆转待办/删除快捷操作，改为屏幕确认");
   }
   if(id==="tomato-clock"){
-    c.description="开始前选择 5–60 分钟专注时长，结束后休息 5 分钟；可暂停、跳过或确认重计时。只有完整专注结束才增加完成轮次。";
+    c.description="选择 5–60 分钟专注时长，完成后休息 5 分钟。暂停时可重新选时长，已完成轮次保留；只有完整专注才增加轮次。";
     r.states.push("ready");r.initial_state="ready";
     add("ready","tomato.start_pause",{to:"focus"});
     for(const value of Object.values(r.dashboard))if(value?.switch_state)value.switch_state.ready=value.switch_state.focus_paused??value.switch_state.focus;
@@ -140,10 +143,18 @@ for(const id of fs.readdirSync(source).sort()){
     for(const n of nodes)if(n.text==="下重计时"){n.text="开始前上下调时长";n.font_size=12;}
     b=b.filter(x=>x.action!=="tomato.reset_phase");
     r.input.confirm={"tomato.reset_phase":"重置本轮计时？已完成的轮数会保留。","tomato.skip_phase":"跳过本轮，进入下一阶段？"};
+    r.dashboard.headline=r.dashboard.eyebrow;
+    delete r.dashboard.eyebrow;
+    r.dashboard.note="专注 5–60 分钟 · 休息 5 分钟";
+    r.surface.elements=r.surface.elements.filter(n=>n.bind!=="eyebrow"&&!(n.type==="panel"&&n.y===330));
+    for(const state of ["focus_paused","rest_paused"])add(state,"tomato.configure",{to:"ready"});
+    map("tomato.configure","button.encoder.short_press","暂停时重新选时长");
+    r.surface.elements.push({...button("tomato.configure","改时长",514,378,100),padding:8});
+    r.input.confirm["tomato.configure"]="结束本轮并重新选时长？已完成轮次会保留。";
     notes.push("首次进入不自动计时；开始前可调 5–60 分钟；跳过和重计时必须确认；取消摇杆重置");
   }
   if(id==="drink-reminder"){
-    c.description="每隔 15–120 分钟提醒喝水，默认 60 分钟，可暂停或恢复；新间隔在下一次确认喝水后生效。累计实际确认次数，不推算饮水量。";
+    c.description="打开组件时倒计时，可暂停或恢复。下次提醒间隔可调 15–120 分钟，确认喝水后生效。记录显示累计确认次数。";
     map("reminder.switch_previous","knob.rotate_ccw","切换倒计时/记录");
     add("*","reminder.switch_previous",{page:"prev"});
     swipe("reminder.switch_view","reminder.switch_previous");
@@ -154,9 +165,17 @@ for(const id of fs.readdirSync(source).sort()){
     map("reminder.more","joystick.up","提醒间隔增加 15 分钟");
     nodes.push(button("reminder.less","间隔 −",392,378,104),button("reminder.more","间隔 +",506,378,106));
     r.dashboard.note={switch_page:{countdown:"间隔调整在下次确认喝水后生效。",records:"累计确认次数，不会按自然日清零。"}};
+    r.dashboard.badge={var:"interval_min"};
+    delete r.dashboard.progress;
+    for(const [index,node] of nodes.entries())if(node.y===330){
+      const label=node.type==="panel";
+      nodes[index]={type:"text",x:label?30:194,y:318,w:label?162:60,h:24,color:19342,font_size:16,
+        ...(label?{text:"下次间隔（分钟）"}:{bind:"badge"})};
+    }
     notes.push("左右切换对称；支持 15–120 分钟提醒间隔");
   }
   if(id==="token-usage"){
+    for(const node of r.surface.elements)if(node.text==="摇杆右输出")node.text="左右翻页";
     b=b.filter(x=>x.event!=="knob.rotate_cw");
     add("*","stats.previous",{page:"prev"});add("*","stats.next",{page:"next"});
     map("stats.previous","knob.rotate_ccw","上一统计页");map("stats.next","knob.rotate_cw","下一统计页");
@@ -199,7 +218,11 @@ for(const id of fs.readdirSync(source).sort()){
     swipe(next,previous);
   }
   if(id==="hachimi-break")swipe("next","previous");
-  if(id==="city-radio")r.input.repeat=["media.up","media.down"];
+  if(id==="city-radio"){
+    c.description="兼容的 Wi-Fi 6 设备可直连支持的 HTTPS MP3 电台，其他电台由 PC 经 USB 代播。在设备打开列表选台、播停或调音量。电脑收听记录在设备确认播放后更新。";
+    r.input.repeat=["media.up","media.down"];
+    nodes.find(n=>n.action==="media.queue"&&n.page===0).text="打开电台列表";
+  }
   if(id==="tomato-clock")Object.assign(r.surface.elements.find(n=>n.bind==="metricValue"),{y:232,h:78,font_size:48});
   for(const n of r.surface?.elements||[]){
     if(!n.action||!r.surface.graphics)continue;
@@ -209,9 +232,11 @@ for(const id of fs.readdirSync(source).sort()){
   if(r.surface?.elements.length>32)throw Error(`${id}: surface budget`);
   if(r.transitions.length>24||b.length>8)throw Error(`${id}: input budget`);
   write(path.join(root,"runtime/widget.json"),r);write(path.join(root,"buttons.json"),b);write(path.join(root,"component.json"),c);
-  const share=read(path.join(root,"share.json"));share.summary=c.description;write(path.join(root,"share.json"),share);
+  const share=read(path.join(root,"share.json"));share.summary=c.description;if(id==="city-radio")share.description="设备直连受支持电台，或通过 PC 与 USB 收听。";write(path.join(root,"share.json"),share);
   const n=read(path.join(root,"negative-screen.json")),dashboard=appDashboard(r,initialApp(r));
   for(const [k,v] of Object.entries(dashboard))if(k!=="progress")n.dashboard[k]=v;
+  if(id==="drink-reminder")delete n.dashboard.progress;
+  if(id==="tomato-clock")delete n.dashboard.eyebrow;
   write(path.join(root,"negative-screen.json"),n);
   report.push({id,version:c.version,notes,status:"generated-not-validated"});
 }

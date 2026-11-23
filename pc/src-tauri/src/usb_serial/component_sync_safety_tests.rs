@@ -15,7 +15,7 @@ const WIDGET: &str = "sync-safety-fixture";
 enum Mode {
     Audio { playback: bool, state: &'static str },
     MissingChunkAck,
-    Resumable { chunk_received: bool },
+    Resumable { chunk_received: bool, expected_chunks: u64 },
     InvalidChunkAck(u8),
     DeleteAck,
     DeleteUnconfirmed { present: bool, complete: bool },
@@ -81,7 +81,7 @@ impl Write for MemoryWriter {
                         "transferId":payload["transferId"],"phase":"begin","ok":true
                     }));
                 }
-                (Mode::Resumable { chunk_received }, "widget/chunk") => {
+                (Mode::Resumable { chunk_received, .. }, "widget/chunk") => {
                     assert_eq!(payload["sequence"], self.next_sequence);
                     assert_eq!(payload["offset"].as_u64().unwrap() % 4096, 0);
                     assert!(payload["decodedSize"].as_u64().unwrap() <= 4096);
@@ -104,8 +104,8 @@ impl Write for MemoryWriter {
                         "nextSequence":self.next_sequence
                     }));
                 }
-                (Mode::Resumable { .. }, "widget/commit") => {
-                    assert_eq!(self.next_sequence, 7);
+                (Mode::Resumable { expected_chunks, .. }, "widget/commit") => {
+                    assert_eq!(self.next_sequence, expected_chunks);
                     assert!(!self.committed);
                     self.committed = true;
                     self.widget_waiters.lock().unwrap().clear();
@@ -265,6 +265,22 @@ fn minimal_widget() -> tempfile::TempDir {
     directory
 }
 #[test]
+fn component_network_install_rejects_a_declaration_without_a_module_before_writing() {
+    let directory = minimal_widget();
+    let runtime = directory.path().join("runtime/widget.json");
+    let mut widget: Value = serde_json::from_slice(&std::fs::read(&runtime).unwrap()).unwrap();
+    widget["hachiNetwork"] = json!({
+        "profile":"component-network-v1","https":[{"origin":"https://api.example.org","methods":["GET"]}]
+    });
+    std::fs::write(runtime, serde_json::to_vec(&widget).unwrap()).unwrap();
+    let (manager, trace, _) = manager(Mode::MissingChunkAck, None, true);
+    let error = manager.install_widget_clawpkg_on_board(BOARD, WIDGET, directory.path(),
+        &HashMap::new(), |_,_,_| {}).unwrap_err();
+    assert!(error.contains("网络能力声明与模块不匹配"), "{error}");
+    assert!(topics(&trace).is_empty());
+}
+
+#[test]
 fn production_install_lost_chunk_ack_waits_two_seconds_without_replay_commit_or_abort() {
     assert_eq!(WIDGET_CHUNK_ACK_TIMEOUT,Duration::from_secs(2));
     assert_eq!(WIDGET_CHUNK_MAX_ATTEMPTS,3,"exercise normal production policy, not a one-attempt fixture");
@@ -409,9 +425,30 @@ fn production_autostart_suppression_occurs_only_after_bound_identity_admission()
 
 
 #[test]
+fn center_thumb_usb_repair_recovers_ack_without_package_or_second_commit() {
+    let (manager, trace, _) = manager(Mode::Resumable { chunk_received: true, expected_chunks: 2 }, None, true);
+    let files = vec![(center_thumb::MATCH.into(), vec![1; 32]), (center_thumb::PATH.into(), vec![2; 1568])];
+    assert!(manager.repair_center_thumb(BOARD, WIDGET, &files).is_err());
+    assert!(topics(&trace).is_empty());
+    {
+        let mut guard = manager.connection.lock().unwrap();
+        let caps = &mut guard.as_mut().unwrap().capabilities;
+        caps["widgetTransfer"] = widget_transaction::WIDGET_FILE_TRANSFER.into();
+        caps["widgetCenterThumb"] = center_thumb::PROFILE.into();
+    }
+    manager.repair_center_thumb(BOARD, WIDGET, &files).unwrap();
+    assert_eq!(topics(&trace), ["widget/begin", "widget/chunk", "widget/status", "widget/chunk", "widget/commit", "widget/status"]);
+    let trace = trace.lock().unwrap();
+    let chunks: Vec<_> = trace.requests.iter().filter(|r| r["topic"] == "widget/chunk")
+        .map(|r| (r["payload"]["path"].as_str().unwrap(), r["payload"]["decodedSize"].as_u64().unwrap())).collect();
+    assert_eq!(chunks, [(center_thumb::MATCH, 32), (center_thumb::PATH, 1568)]);
+    assert!(manager.widget_resume.lock().unwrap().is_none());
+}
+
+#[test]
 fn widget_v2_recovers_missing_chunk_and_commit_ack_using_device_progress() {
     for chunk_received in [true, false] {
-        let (manager, trace, _) = manager(Mode::Resumable { chunk_received }, None, true);
+        let (manager, trace, _) = manager(Mode::Resumable { chunk_received, expected_chunks: 7 }, None, true);
         let data = vec![0x81; 8 + 64 * 64 * 2 * 3];
         let entries = vec![("runtime/sprites/letter.p4s".into(), data.clone())];
         let result = manager.install_widget_file_transfer(BOARD, WIDGET, 101, &Value::Null, &entries, |_, _, _| {});

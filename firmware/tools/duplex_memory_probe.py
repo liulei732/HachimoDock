@@ -170,13 +170,14 @@ class Evidence:
         elif topic == 'audio/status':
             if p.get('boardDeviceId') != self.board:
                 raise RuntimeError('Unexpected audio device')
+            # Cleanup still needs the current device state after history fills.
+            self.report['stopped'] = all(p.get(k) is False for k in
+                                        ('active', 'conversation', 'playbackActive'))
             # The board emits a small bounded set of status messages per query.
             if len(self.report['audio']) >= 4096:
                 raise RuntimeError('Audio status budget exceeded')
             self.report['audio'].append({k: p[k] for k in FIELDS
                                          if type(p.get(k)) in (bool, int, float)})
-            self.report['stopped'] = all(p.get(k) is False for k in
-                                        ('active', 'conversation', 'playbackActive'))
             if self._current_aec_fault(p):
                 raise RuntimeError('AEC fault reported')
             if p.get('active') is True:

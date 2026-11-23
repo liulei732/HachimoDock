@@ -4,7 +4,7 @@ import {mkdirSync,writeFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {chromium} from 'playwright';
 const output=process.env.PET_UI_REPORT_DIR;assert(output);mkdirSync(output,{recursive:true});
-const browser=await chromium.launch({executablePath:'/Applications/360Chrome.app/Contents/MacOS/360Chrome',headless:true});
+const browser=await chromium.launch({executablePath:process.env.PET_TEST_BROWSER,headless:true});
 try{
  const page=await browser.newPage({viewport:{width:1280,height:1000}}),errors=[];page.on('pageerror',e=>errors.push(e.message));
  await page.goto('http://127.0.0.1:4215/tests/component-center-review.html');
@@ -22,10 +22,11 @@ try{
  assert.equal((await calls()).find(x=>x.action==='comment').name,'橘子汽水');
  await page.evaluate(()=>window.__failCommentOnce=true);await form.getByLabel('评论内容').fill('模拟回执中断重试');await form.getByRole('button',{name:'发表评论'}).click();await form.getByRole('alert').filter({hasText:'模拟回执中断'}).waitFor();assert.equal(await form.getByLabel('评论内容').inputValue(),'模拟回执中断重试');
  await form.getByRole('button',{name:'发表评论'}).click();await frame.locator('.comments article').nth(1).waitFor();const sent=(await calls()).filter(x=>x.action==='comment');assert.equal(sent.at(-1).requestId,sent.at(-2).requestId);assert.equal(await frame.locator('.comments article').count(),2);
- await frame.getByRole('button',{name:'收藏',exact:true}).click();await frame.getByRole('button',{name:'已收藏',exact:true}).waitFor();
- await frame.getByRole('button',{name:'下载到我的组件',exact:true}).click();await page.getByRole('alertdialog',{name:'下载社区组件'}).waitFor();assert.equal((await calls()).filter(x=>x.action==='download').length,0);await page.getByRole('button',{name:'取消下载'}).click();
- await frame.getByRole('button',{name:'下载到我的组件',exact:true}).click();await page.getByRole('alertdialog',{name:'下载社区组件'}).waitFor();await page.getByRole('button',{name:'确认下载'}).click();await frame.getByRole('status').filter({hasText:'已校验'}).waitFor();assert.equal((await calls()).filter(x=>x.action==='download').length,1);
  await form.screenshot({path:join(output,'server-comment-nickname.png')});await page.screenshot({path:join(output,'client-server-detail.png'),fullPage:true});
+ await frame.getByRole('button',{name:'收藏',exact:true}).click();await frame.getByRole('button',{name:'已收藏',exact:true}).waitFor();
+ await frame.getByRole('button',{name:'下载到我的组件',exact:true}).click();await page.getByRole('alertdialog',{name:'下载社区组件'}).waitFor();assert.equal((await calls()).filter(x=>x.action==='download').length,0);await page.getByRole('alertdialog',{name:'下载社区组件'}).getByRole('button',{name:'取消',exact:true}).click();
+ await frame.getByRole('button',{name:'下载到我的组件',exact:true}).click();await page.getByRole('alertdialog',{name:'下载社区组件'}).waitFor();await page.getByRole('alertdialog',{name:'下载社区组件'}).getByRole('button',{name:/^(确认下载|仅下载)$/}).click();await page.getByRole('tab',{name:'我的组件',selected:true}).waitFor();assert.equal((await calls()).filter(x=>x.action==='download').length,1);
+
  await page.reload();frame=await detail();assert.equal(await frame.getByLabel('评论身份').innerText(),'橘子汽水');
  await page.getByRole('tab',{name:'我的收藏',exact:true}).click();await page.frameLocator('iframe').getByRole('button',{name:/社区回归样例/}).first().waitFor();
  await page.setViewportSize({width:900,height:780});await page.screenshot({path:join(output,'client-server-favorites.png')});

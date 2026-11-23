@@ -41,9 +41,8 @@ VIEW_CASES = '\n#include <assert.h>\n#include <stdio.h>\n#include <string.h>\n#i
 
 def test_main_compact_roi_handoff_uses_real_renderer_functions(tmp_path):
     source = (ROOT / "main/pet_p4_renderer.c").read_text()
-    names = ["draw_bubble_large_line", "draw_bubble_card_title", "draw_home_white_panel",
-             "main_compact_underlay_prepare", "draw_bubble", "scan_session_overlay_cache_runs",
-             "copy_session_overlay_cache"]
+    names = ["draw_bubble_large_line", "draw_bubble_card_title", "draw_home_white_panel", "main_compact_underlay_prepare", "draw_bubble",
+             "scan_session_overlay_cache_runs", "copy_session_overlay_cache"]
     prelude = PRELUDE.replace(
         'static int text_y_in_box(const char *s,int scale,int y,int h){(void)s;(void)scale;(void)h;return y+4;}',
         'static const pet_bubble_text_view_t *g_bubble_glyph_view;static unsigned g_bubble_glyph_style;',

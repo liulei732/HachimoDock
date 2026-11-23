@@ -68,7 +68,7 @@ impl UsbSerialManager {
         let request_id=format!("autostart-{}",uuid::Uuid::new_v4());payload["requestId"]=request_id.clone().into();
         let (sender,receiver)=mpsc::channel();
         self.device_response_waiters.lock().map_err(|_|"autostart response unavailable")?.push(DeviceResponseWaiter{request_id:request_id.clone(),response_topic:response_topic.into(),sender});
-        if let Err(e)=self.send_inner_admitted(topic,&payload,true,Some(board),Some(generation),None,epoch){self.remove_device_response_waiter(&request_id,response_topic);return Err(e);}
+        if let Err(e)=self.send_inner_admitted(topic,&payload,true,Some(board),Some(generation),None,epoch,false){self.remove_device_response_waiter(&request_id,response_topic);return Err(e);}
         let response=receiver.recv_timeout(P4_DEVICE_RESPONSE_TIMEOUT);
         self.remove_device_response_waiter(&request_id,response_topic);
         let response=response.map_err(|_|"autostart response unavailable")?;

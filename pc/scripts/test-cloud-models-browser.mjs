@@ -45,7 +45,7 @@ try {
   assert.equal(await select.inputValue(), 'doubao-seedance-2-5-260628');
   await page.evaluate(() => { window.failCatalog = true; });
   await page.getByRole('button', { name: '刷新可用模型' }).click();
-  await page.getByRole('alert').filter({ hasText: '证书校验失败' }).waitFor();
+  await page.getByRole('alert').filter({ hasText: /火山方舟.*读取模型列表.*证书/ }).waitFor();
   await page.getByRole('checkbox').check();
   await page.getByRole('textbox', { name: '模型或接入点 ID' }).fill('ep-fixture');
   await page.waitForFunction(() => window.modelReady === true);

@@ -144,7 +144,7 @@ test('one-click UI defaults to automatic cleaning, with review only in advanced 
 async function videoFixture(options, run) {
  const old={document:globalThis.document,create:URL.createObjectURL,revoke:URL.revokeObjectURL,
    raf:globalThis.requestAnimationFrame,caf:globalThis.cancelAnimationFrame,setTimeout:globalThis.setTimeout,clearTimeout:globalThis.clearTimeout};
- const trace=[],timers=new Set(),stats={attached:0,removed:0,revoked:0,draws:0,raf:0,cancelled:0};let blob;
+ const trace=[],timers=new Set(),stats={attached:0,removed:0,revoked:0,draws:0,raf:0,cancelled:0};let blob, lateFrame;
  globalThis.setTimeout=(fn,ms,...args)=>{if(ms===20000)stats.operationTimers=(stats.operationTimers||0)+1;let id;id=old.setTimeout(()=>{timers.delete(id);fn(...args);},ms===20000?10:ms);timers.add(id);return id;};
  globalThis.clearTimeout=id=>{timers.delete(id);return old.clearTimeout(id);};
  class Video extends EventTarget {
@@ -153,13 +153,23 @@ async function videoFixture(options, run) {
   setAttribute(){}removeAttribute(){this.src='';}pause(){stats.paused=true;}
   remove(){stats.removed++;stats.attached--;}
   requestVideoFrameCallback(cb){trace.push('request');const id=++this.next;this.callbacks.set(id,cb);return id;}
-  cancelVideoFrameCallback(id){stats.cancelled++;this.callbacks.delete(id);}
+  cancelVideoFrameCallback(id){
+   if(options.deliverOldFrame && this===video && this.callbacks.has(id))lateFrame=this.callbacks.get(id);
+   stats.cancelled++;this.callbacks.delete(id);
+  }
   present(){trace.push('present');const callbacks=[...this.callbacks.values()];this.callbacks.clear();for(const cb of callbacks)cb(0,{mediaTime:this._time});}
   transition(event,missing=false){queueMicrotask(()=>{
+   if(options.deliverOldFrame && this!==video && event==='seeked'){
+    assert.ok(lateFrame);
+    lateFrame(0,{mediaTime:video.currentTime});video.dispatchEvent(new Event('seeked'));
+    trace.push('late-frame-from-first');
+   }
    if(options.frameFirst){if(!missing)this.present();this.dispatchEvent(new Event(event));}
    else{this.dispatchEvent(new Event(event));if(!missing)this.present();}
   });}
-  load(){if(this.src){trace.push('load');if(options.loadError)queueMicrotask(()=>this.dispatchEvent(new Event('error')));else this.transition('loadeddata');}}
+  load(){if(this.src){trace.push('load');
+   if(this===video && options.firstTimeout==='event')return;
+   if(options.loadError)queueMicrotask(()=>this.dispatchEvent(new Event('error')));else this.transition('loadeddata');}}
   set currentTime(value){
    this._time=value;trace.push('seek');options.onSeek?.();
    if(options.staleWhileSeeking){
@@ -171,17 +181,21 @@ async function videoFixture(options, run) {
      if(options.freshBeforeSeeked){if(!options.missingFresh)this.present();this.dispatchEvent(new Event('seeked'));}
      else{this.dispatchEvent(new Event('seeked'));if(!options.missingFresh)this.present();}
     });
-   }else this.transition('seeked',options.missingFrame);
+   }else this.transition('seeked',options.missingFrame || this===video && options.firstTimeout==='frame');
   }
   get currentTime(){return this._time;}
  }
  const video=new Video();if(options.noRvfc){video.requestVideoFrameCallback=undefined;video.cancelVideoFrameCallback=undefined;}
- const canvas={width:0,height:0,getContext:()=>({drawImage(){stats.draws++;assert.equal(video.callbacks.size,0);assert.equal(stats.attached,1);},
+ const videos=[],blobs=[];
+ const canvas={width:0,height:0,getContext:()=>({drawImage(){stats.draws++;assert.equal(videos.at(-1).callbacks.size,0);assert.equal(stats.attached,1);},
    getImageData(){if(options.canvasError)throw Error('fixture private URL must not escape');return {data:new Uint8ClampedArray(options.black?[0,0,0,255]:[21,0,0,255])};}}),toDataURL:()=> 'data:image/jpeg;base64,AQID'};
- globalThis.document={body:{appendChild(node){assert.equal(node,video);stats.attached++;}},createElement:kind=>kind==='video'?video:canvas};
- URL.createObjectURL=value=>{blob=value;return 'blob:local-fixture';};URL.revokeObjectURL=()=>{stats.revoked++;};
+ globalThis.document={body:{appendChild(node){assert.equal(node,videos.at(-1));assert.equal(stats.attached++,0);}},createElement(kind){
+  if(kind!=='video')return canvas;
+  const node=videos.length?new Video():video;videos.push(node);return node;
+ }};
+ URL.createObjectURL=value=>{blob=value;blobs.push(value);return 'blob:local-fixture-'+blobs.length;};URL.revokeObjectURL=()=>{stats.revoked++;};
  globalThis.requestAnimationFrame=cb=>{stats.raf++;queueMicrotask(cb);return stats.raf;};globalThis.cancelAnimationFrame=()=>{};
- try{return await run({video,stats,trace,timers,blob:()=>blob});}
+ try{return await run({video,videos,blobs,stats,trace,timers,blob:()=>blob});}
  finally{globalThis.document=old.document;URL.createObjectURL=old.create;URL.revokeObjectURL=old.revoke;
   globalThis.requestAnimationFrame=old.raf;globalThis.cancelAnimationFrame=old.caf;globalThis.setTimeout=old.setTimeout;globalThis.clearTimeout=old.clearTimeout;
   for(const id of timers)old.clearTimeout(id);
@@ -197,12 +211,14 @@ for(const frameFirst of [false,true])test(`video waits for both seeked and prese
   assert.equal(stats.removed,1);assert.equal(stats.attached,0);assert.equal(stats.revoked,1);assert.equal(timers.size,0);
  });
 });
-test('advertised rVFC missing after seek fails bounded and never falls back to RAF',async()=>{
- await videoFixture({missingFrame:true},async({video,stats,timers})=>{
+test('missing rVFC retries once with a fresh decoder and rejects a late frame from the disposed decoder',async()=>{
+ await videoFixture({missingFrame:true,deliverOldFrame:true},async({video,videos,stats,timers,trace})=>{
   await assert.rejects(inspectVideo(new Uint8Array([1])),error=>{
    assert.deepEqual(videoInspectionFailure(error),{code:'VIDEO_INSPECTION_FRAME_TIMEOUT',stage:'frame'});return true;
-  });assert.equal(stats.draws,0);assert.equal(stats.raf,0);assert.equal(video.callbacks.size,0);
-  assert.equal(stats.removed,1);assert.equal(stats.revoked,1);assert.equal(timers.size,0);
+  });assert.equal(new Set(videos).size,2);
+  assert.equal(trace.filter(e=>e==='late-frame-from-first').length,1);
+  assert.equal(stats.draws,0);assert.equal(stats.raf,0);assert.equal(video.callbacks.size,0);
+  assert.equal(stats.removed,2);assert.equal(stats.revoked,2);assert.equal(timers.size,0);
  });
 });
 test('video cancellation clears presentation callbacks, timers and DOM without sampling',async()=>{
@@ -255,8 +271,8 @@ for(const freshBeforeSeeked of [false,true])test(`stale seeking callback waits f
 test('stale seeking callback without a fresh presentation times out on the original operation',async()=>{
  await videoFixture({staleWhileSeeking:true,missingFresh:true},async({stats,video,trace,timers})=>{
   await assert.rejects(inspectVideo(new Uint8Array([1])),error=>error.code==='VIDEO_INSPECTION_FRAME_TIMEOUT'&&error.inspectionStage==='frame');
-  assert.equal(trace.filter(t=>t==='seek').length,1);assert.equal(stats.draws,0);assert.equal(stats.operationTimers,2);
-  assert.equal(video.callbacks.size,0);assert.equal(timers.size,0);assert.equal(stats.removed,1);
+  assert.equal(trace.filter(t=>t==='seek').length,2);assert.equal(stats.draws,0);assert.equal(stats.operationTimers,4);
+  assert.equal(video.callbacks.size,0);assert.equal(timers.size,0);assert.equal(stats.removed,2);
  });
 });
 test('abort after stale presentation cancels the latest re-registered callback',async()=>{
@@ -265,4 +281,35 @@ test('abort after stale presentation cancels the latest re-registered callback',
   assert.equal(video.callbacks.size,0);assert.equal(stats.draws,0);assert.equal(timers.size,0);
   assert.equal(stats.removed,1);assert.equal(stats.revoked,1);
  });
+});
+
+for (const timeout of ['frame', 'event']) test(`one fresh local decoder recovers a first ${timeout} timeout before the next queued clip`, async () => {
+  await videoFixture({firstTimeout:timeout}, async ({videos, blobs, stats, timers}) => {
+    const first = inspectVideo(new Uint8Array([1]));
+    const second = inspectVideo(new Uint8Array([2]));
+    const results = await Promise.all([first, second]);
+    assert.deepEqual(results.map(r => r.frames.length), [3, 3]);
+    assert.equal(new Set(videos).size, 3);
+    assert.equal(blobs[0], blobs[1]);
+    assert.notEqual(blobs[1], blobs[2]);
+    assert.deepEqual(await Promise.all(blobs.map(async blob => [...new Uint8Array(await blob.arrayBuffer())])), [[1],[1],[2]]);
+    assert.equal(stats.attached, 0);
+    assert.equal(stats.removed, 3);
+    assert.equal(stats.revoked, 3);
+    assert.equal(timers.size, 0);
+  });
+});
+
+test('queued cancellation rejects immediately without allocating a decoder or blocking its successor', async () => {
+  await videoFixture({firstTimeout:'event'}, async ({videos, stats}) => {
+    const first = inspectVideo(new Uint8Array([1]));
+    const controller = new AbortController();
+    const cancelled = inspectVideo(new Uint8Array([2]), controller.signal);
+    const third = inspectVideo(new Uint8Array([3]));
+    controller.abort();
+    await assert.rejects(cancelled, e => e.name === 'AbortError' && !videoInspectionFailure(e));
+    assert.equal(videos.length, 1);
+    await Promise.all([first, third]);
+    assert.equal(stats.removed, 3);
+  });
 });

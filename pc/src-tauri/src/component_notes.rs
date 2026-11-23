@@ -67,7 +67,7 @@ fn owns_audio(data:&CaptureData,token:&str,topic:&str,payload:&Value)->bool{
     if topic=="audio/begin"{return payload["captureOwner"]==token&&(data.session.is_empty()||payload["sessionId"]==data.session);}
     !data.session.is_empty()&&payload["sessionId"]==data.session
 }
-struct Capture{generation:u64,control:control::Ticket,owner:crate::component_app::MediaAuthority,id:String,board:String,connection:String,boot:String,token:String,data:Mutex<CaptureData>,asr:Mutex<Option<StreamingSpeechRecognizer>>,relay:Mutex<crate::usb_audio::UsbAudioRelay>,usb:UsbSerialManager,started:Instant}
+struct Capture{wifi:Option<crate::lan_agent::component_av::Binding>,generation:u64,control:control::Ticket,owner:crate::component_app::MediaAuthority,id:String,board:String,connection:String,boot:String,token:String,data:Mutex<CaptureData>,asr:Mutex<Option<StreamingSpeechRecognizer>>,relay:Mutex<crate::usb_audio::UsbAudioRelay>,usb:UsbSerialManager,started:Instant}
 static ACTIVE:OnceLock<Mutex<Option<Arc<Capture>>>>=OnceLock::new();
 fn active()->&'static Mutex<Option<Arc<Capture>>>{ACTIVE.get_or_init(Default::default)}
 fn current(id:&str)->Option<Arc<Capture>>{active().lock().ok()?.as_ref().filter(|c|c.id==id).cloned()}
@@ -75,6 +75,9 @@ static CONTROL:OnceLock<control::Slot<Capture>>=OnceLock::new();
 fn control_slot()->&'static control::Slot<Capture>{CONTROL.get_or_init(Default::default)}
 fn wake_control(){crate::program_autostart::native::notes_control();}
 fn send_capture_control(c:&Capture,action:&str)->Result<(),String>{
+    if let Some(b)=&c.wifi {
+        return b.request(&c.usb,&format!("notes/{action}"),json!({"captureOwner":c.token})).map(|_|());
+    }
     let status=c.usb.status();
     if !status.connected||status.board_device_id!=c.board||status.connection_id!=c.connection||status.boot_id!=c.boot{
         return Err("录音连接身份已变化，未向其他连接发送控制".into());
@@ -181,18 +184,23 @@ fn prepare_and_start(c:&Arc<Capture>,factory:impl FnOnce()->Result<StreamingSpee
 }
 fn start(id:&str,usb:&UsbSerialManager)->Result<(),String>{
     let owner=crate::component_app::media_authority(id)?;
-    let board=usb.status();if !board.connected{return Err("请先连接设备".into());}
+    let binding=crate::lan_agent::component_av::Binding::open(id,usb)?;
     if crate::realtime_chat::status().active{return Err("请先结束实时对话，再录制笔记".into());}
     if crate::active_device_voice_context().lock().map_err(|_|"语音正在使用")?.is_some(){return Err("按键语音输入尚未结束，请先完成或取消".into());}
     {let a=active().lock().unwrap();capture_admission(a.as_ref().map(|c|c.data.lock().unwrap().phase.clone()).as_deref())?;}
     if !owner.is_current(){return Err("组件已退出，未启动录音".into());}
     if !crate::program_autostart::native::notes_worker_ready(){return Err("录音控制工作者不可用，未启动录音".into());}
-    let (connection,generation)=usb.autostart_connection().filter(|(status,_)|status.board_device_id==board.board_device_id).ok_or("设备连接已变化，未启动录音")?;
-    let token=uuid::Uuid::new_v4().to_string();
+    let board=binding.board().to_string();
+    let generation=binding.generation();
+    let connection=generation.to_string();
+    let boot=binding.boot.clone();
+    let wifi=binding.is_wifi().then_some(binding);
+    let token=format!("{}{}",if wifi.is_some(){"lan-note-"}else{""},uuid::Uuid::new_v4());
     let mut relay=crate::usb_audio::UsbAudioRelay::default();
-    let configured=relay.configure_owned_scoped(true,crate::usb_audio::DEFAULT_PCM_RELAY_PORT,false,&connection.board_device_id,&connection.connection_id,&connection.boot_id,&token);
-    if connection.runtime!="esp-p4"||configured["ok"]!=true{return Err("设备录音连接身份尚未准备完成；未启动录音".into());}
-    let c=Arc::new(Capture{generation,control:Default::default(),owner,id:id.into(),board:connection.board_device_id,connection:connection.connection_id,boot:connection.boot_id,token,data:Mutex::new(CaptureData{phase:"starting".into(),..Default::default()}),asr:Mutex::new(None),relay:Mutex::new(relay),usb:usb.clone(),started:Instant::now()});
+    if relay.configure_owned_scoped(true,crate::usb_audio::DEFAULT_PCM_RELAY_PORT,false,&board,&connection,&boot,&token)["ok"]!=true {
+        return Err("设备录音连接身份尚未准备完成".into());
+    }
+    let c=Arc::new(Capture{wifi,generation,control:Default::default(),owner,id:id.into(),board,connection,boot,token,data:Mutex::new(CaptureData{phase:"starting".into(),..Default::default()}),asr:Mutex::new(None),relay:Mutex::new(relay),usb:usb.clone(),started:Instant::now()});
     control_slot().reserve(&c).map_err(str::to_owned)?;
     let preparation=(||{
         if !crate::volcengine_asr::settings_status()?.configured{return Err("请先配置语音识别服务；未启动录音".into());}
@@ -208,6 +216,7 @@ fn start(id:&str,usb:&UsbSerialManager)->Result<(),String>{
     prepare_and_start(&c,||StreamingSpeechRecognizer::start(move|event|{
         handle_speech_event(&callback,event);
     }).map_err(|_|"云端语音识别未配置或不可用".to_string()),&|action|control(&c,action))?;
+    if c.wifi.is_some(){let reader=c.clone();std::thread::spawn(move||poll_note(reader));}
     let timer=c.clone();std::thread::spawn(move||{
         for _ in 0..180{
             std::thread::sleep(Duration::from_millis(250));
@@ -216,7 +225,7 @@ fn start(id:&str,usb:&UsbSerialManager)->Result<(),String>{
             let phase=timer.data.lock().unwrap().phase.clone();
             if matches!(phase.as_str(),"draft"|"error"|"empty"){let _=control(&timer,"stop");return;}
             let status=timer.usb.status();
-            if !status.connected||status.board_device_id!=timer.board||status.connection_id!=timer.connection||status.boot_id!=timer.boot{capture_error(&timer,"设备录音连接已断开或变化，未保存录音");return;}
+            if !timer.wifi.as_ref().map_or_else(||status.connected&&status.board_device_id==timer.board&&status.connection_id==timer.connection&&status.boot_id==timer.boot,|b|b.local(&timer.usb)){capture_error(&timer,"设备录音连接已断开或变化，未保存录音");return;}
             if phase=="starting"&&timer.started.elapsed()>Duration::from_secs(5){capture_error(&timer,"设备麦克风未开始录音，请检查设备状态后重试");return;}
             if timer.started.elapsed()>Duration::from_secs(28)&&matches!(phase.as_str(),"recording"|"starting"){
                 timer.data.lock().unwrap().phase="recognizing".into();let _=control(&timer,"stop");
@@ -225,6 +234,34 @@ fn start(id:&str,usb:&UsbSerialManager)->Result<(),String>{
         capture_error(&timer,"识别超时，未保存笔记");
     });Ok(())
 }
+fn poll_note(c:Arc<Capture>){
+    let Some(b)=&c.wifi else{return;};
+    let mut cursor=0u32;
+    let mut retried=false;
+    while c.owner.is_current() && current(&c.id).is_some_and(|live|Arc::ptr_eq(&live,&c)) {
+        {let d=c.data.lock().unwrap();if d.diagnostics.ended || !accepting_audio(&d.phase){break;}}
+        let reply=b.request(&c.usb,"notes/read",json!({"captureOwner":c.token,"cursor":cursor}));
+        let batch=match reply{
+            Ok(v)=>{retried=false;v},
+            Err(_) if !retried && b.local(&c.usb)=>{retried=true;continue;},
+            Err(_)=>{capture_error(&c,"无线录音丢失回执或缓存已满，已停止录音");break;}
+        };
+        let Some(frames)=batch["frames"].as_array().filter(|f|f.len()<=8 && batch["cursor"]==cursor)else{
+            capture_error(&c,"无线录音游标无效，已停止录音");break;
+        };
+        for f in frames {
+            let topic=f["topic"].as_str().unwrap_or("");
+            if !matches!(topic,"audio/begin"|"audio/chunk"|"audio/end"|"audio/error") || !route_capture(&c,topic,&f["payload"]) {
+                capture_error(&c,"无线录音的组件或会话不匹配");break;
+            }
+            cursor+=1;
+        }
+        if frames.is_empty(){std::thread::sleep(Duration::from_millis(20));}
+    }
+    if b.request(&c.usb,"notes/close",json!({"captureOwner":c.token})).is_ok(){
+        control_slot().release(&c);
+    }
+}
 fn capture_scope_matches(c:&Capture,payload:&Value)->bool{
     let scope=&payload["_nativeUsbScope"];
     scope["runtime"]=="esp-p4"&&scope["boardDeviceId"]==c.board&&scope["connectionId"]==c.connection&&scope["bootId"]==c.boot
@@ -232,15 +269,19 @@ fn capture_scope_matches(c:&Capture,payload:&Value)->bool{
 /// Own the complete audio session before the generic PTT route sees it.
 pub fn route(topic:&str,payload:&Value)->bool{
     let Some(c)=active().lock().ok().and_then(|a|a.clone())else{return false;};
+    if c.wifi.is_some()||!capture_scope_matches(&c,payload){return false;}
+    route_capture(&c,topic,payload)
+}
+fn route_capture(c:&Arc<Capture>,topic:&str,payload:&Value)->bool{
     if topic=="protocol/ack"&&payload["requestTopic"]=="audio/control"{
-        if !capture_scope_matches(&c,payload){return false;}
+
         if payload["requestId"]==format!("notes-{}-start",c.token){if payload["ok"]==false{capture_error(&c,"设备未接受录音，请结束其他语音后重试");}return true;}
         if payload["requestId"]==format!("notes-{}-stop",c.token){return true;}
         return false;
     }
     if payload["boardDeviceId"]!=c.board||!topic.starts_with("audio/"){return false;}
     if !matches!(topic,"audio/begin"|"audio/chunk"|"audio/end"|"audio/error"){return false;}
-    if !capture_scope_matches(&c,payload){return false;}
+
     {let mut d=c.data.lock().unwrap();
     if topic=="audio/begin"&&payload["captureOwner"]==c.token&&!d.session.is_empty()&&payload["sessionId"]!=d.session{return true;}
     if !owns_audio(&d,&c.token,topic,payload){return false;}
@@ -318,7 +359,7 @@ pub fn execute(id:&str,op:&str,input:&Value,dir:&Path,usb:&UsbSerialManager)->Re
                 n.items[index].todo=Some(crate::todos::create_component_note_once(&format!("{id}:{}",n.items[index].id),&title)?);
             }save(dir,&n)?;if draft.is_some(){cancel(Some(id));}
         },
-        "previous"|"next"=>{if draft.is_some(){return Err("请先保存当前转写，再浏览笔记".into());}if !n.items.is_empty(){n.selected=(n.selected%n.items.len()+n.items.len()+if op=="previous"{n.items.len()-1}else{1})%n.items.len();save(dir,&n)?;}},
+        "previous"|"next"=>{if draft.is_some(){return Err("请先保存当前转写，再浏览笔记".into());}if n.items.len()>1{n.selected=(n.selected%n.items.len()+n.items.len()+if op=="previous"{n.items.len()-1}else{1})%n.items.len();save(dir,&n)?;}},
         "edit"=>{
             let target=input["noteId"].as_str().ok_or("请选择笔记")?;
             let text=input["text"].as_str().ok_or("请输入笔记内容")?.trim();
@@ -328,7 +369,12 @@ pub fn execute(id:&str,op:&str,input:&Value,dir:&Path,usb:&UsbSerialManager)->Re
         },
         "delete"=>{
             if input["confirm"]!=true{return Ok(json!({"headline":"删除需要确认","metricValue":"","note":"请在 PC 笔记列表确认删除；不会删除关联待办"}));}
-            let target=if contextual{n.items.get(n.selected).map(|v|v.id.clone()).ok_or("请选择笔记")?}else{input["noteId"].as_str().ok_or("请选择笔记")?.to_string()};n.items.retain(|v|v.id!=target);n.selected=0;save(dir,&n)?;
+            let target=if contextual{n.items.get(n.selected).map(|v|v.id.as_str()).ok_or("请选择笔记")?}else{input["noteId"].as_str().ok_or("请选择笔记")?};
+            let removed=n.items.iter().position(|note|note.id==target).ok_or("笔记不存在，请刷新列表")?;
+            n.items.remove(removed);
+            if removed<n.selected { n.selected-=1; }
+            n.selected=n.selected.min(n.items.len().saturating_sub(1));
+            save(dir,&n)?;
         },_=>{}
     }
     let mut result=json!({"eyebrow":"笔记仅保存在这台电脑","headline":"接住一个想法","metricValue":"","metricLabel":"开始录制","metricUnit":"保存笔记","note":"录音转写后，由你确认保存或转为待办"});
@@ -348,7 +394,7 @@ pub fn stop_recording_all(){let c=active().lock().ok().and_then(|v|v.clone());if
         control_slot().release(&self.capture);
     }}
     let serial=tests::CAPTURE_TEST.lock().unwrap();
-    let c=Arc::new(Capture{generation,control:Default::default(),owner:crate::component_app::MediaAuthority{request:crate::component_runtime_lifecycle::ResourceOwner::fresh(),view:None},id:id.into(),board:board.into(),connection:usb.status().connection_id,boot:usb.status().boot_id,token:uuid::Uuid::new_v4().to_string(),data:Mutex::new(CaptureData{phase:"recording".into(),..Default::default()}),asr:Mutex::new(None),relay:Mutex::new(Default::default()),usb,started:Instant::now()});
+    let c=Arc::new(Capture{wifi:None,generation,control:Default::default(),owner:crate::component_app::MediaAuthority{request:crate::component_runtime_lifecycle::ResourceOwner::fresh(),view:None},id:id.into(),board:board.into(),connection:usb.status().connection_id,boot:usb.status().boot_id,token:uuid::Uuid::new_v4().to_string(),data:Mutex::new(CaptureData{phase:"recording".into(),..Default::default()}),asr:Mutex::new(None),relay:Mutex::new(Default::default()),usb,started:Instant::now()});
     c.control.prepared();assert!(c.control.admit_start());c.control.start_returned();
     control_slot().reserve(&c).unwrap();*active().lock().unwrap()=Some(c.clone());
     c.relay.lock().unwrap().configure_owned_scoped(true,crate::usb_audio::DEFAULT_PCM_RELAY_PORT,false,&c.board,&c.connection,&c.boot,&c.token);
@@ -359,7 +405,7 @@ pub fn stop_recording_all(){let c=active().lock().ok().and_then(|v|v.clone());if
     use super::*;
     pub(super) static CAPTURE_TEST:Mutex<()>=Mutex::new(());
     fn fake_capture(id:&str,phase:&str)->Arc<Capture>{
-        Arc::new(Capture{generation:1,control:Default::default(),owner:crate::component_app::MediaAuthority{request:crate::component_runtime_lifecycle::ResourceOwner::fresh(),view:None},id:id.into(),board:"test".into(),connection:"test-connection".into(),boot:"test-boot".into(),token:uuid::Uuid::new_v4().to_string(),data:Mutex::new(CaptureData{phase:phase.into(),text:"未保存的想法".into(),..Default::default()}),asr:Mutex::new(None),relay:Mutex::new(Default::default()),usb:UsbSerialManager::new(),started:Instant::now()})
+        Arc::new(Capture{wifi:None,generation:1,control:Default::default(),owner:crate::component_app::MediaAuthority{request:crate::component_runtime_lifecycle::ResourceOwner::fresh(),view:None},id:id.into(),board:"test".into(),connection:"test-connection".into(),boot:"test-boot".into(),token:uuid::Uuid::new_v4().to_string(),data:Mutex::new(CaptureData{phase:phase.into(),text:"未保存的想法".into(),..Default::default()}),asr:Mutex::new(None),relay:Mutex::new(Default::default()),usb:UsbSerialManager::new(),started:Instant::now()})
     }
     #[test]fn phase2_exit_during_asr_preparation_never_sends_start_and_cancels_new_asr(){
         let _serial=CAPTURE_TEST.lock().unwrap();

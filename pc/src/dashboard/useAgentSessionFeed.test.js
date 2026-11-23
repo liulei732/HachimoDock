@@ -10,6 +10,9 @@ import assert from "node:assert/strict";
 import {
   AGENT_SESSION_FEED_INITIAL_STATE,
   agentSessionFeedReducer,
+  P4_PENDING_EVENT_LIMIT,
+  dispatchSessionTurn,
+  queueSessionEvents,
 } from "./useAgentSessionFeed.js";
 import { deviceSessionTerminalUntilMs } from "../lib/session-display.js";
 
@@ -21,6 +24,62 @@ function reduce(state, action) {
     ...action,
   });
 }
+
+test("a tail completion and user attention bypass unrelated events, preserving their prerequisites", () => {
+  const pending = [], applied = [];
+  const event = (id, state, statusUpdatedAt) => ({ session: { id, state, name: id, statusUpdatedAt } });
+  const events = Array.from({length: 96}, (_, i) => event(String(i), "thinking", 1));
+  let state = AGENT_SESSION_FEED_INITIAL_STATE;
+  const apply = item => {
+    applied.push([item.session.id, item.session.state, item.session.statusUpdatedAt]);
+    state = reduce(state, {type: "apply_event", value: item.session, nowMs: item.session.statusUpdatedAt});
+  };
+  queueSessionEvents(pending, [...events.slice(1), event("a","working",1), event("a","working",2),
+    event("b","working",1), event("b","waiting_user",2), event("a","done",3), event("a","working",4)], apply);
+  dispatchSessionTurn(pending, apply);
+  assert.deepEqual(applied, [["a","working",2],["b","working",1],["b","waiting_user",2],["a","done",3]]);
+  assert.equal(pending.length, 96);
+  assert.equal(deviceSessionTerminalUntilMs(state.sessions.find(s => s.id === "a")), 60003);
+  while (pending.length) dispatchSessionTurn(pending, apply);
+  assert.equal(applied.findLast(([id]) => id === "a")[1], "working");
+});
+
+test("sustained saturation bounds retained events and preserves distinct and implicit transitions", () => {
+  const pending = [], applied = [];
+  const apply = item => applied.push(item.session.id);
+  for (let i = 0; i < 800; i++) {
+    queueSessionEvents(pending, [{session:{id:String(i),state:"working"}}], apply);
+    assert.ok(pending.length <= P4_PENDING_EVENT_LIMIT);
+  }
+  queueSessionEvents(pending, [{session:{id:"799",state:"idle"}}], apply);
+  dispatchSessionTurn(pending, apply);
+  assert.deepEqual(applied.slice(-2), ["799","799"]);
+  pending.forEach(apply);
+  assert.equal(new Set(applied).size,800);
+  assert.equal(applied.length,801);
+});
+
+test("a racing snapshot retains concurrent events and accepts a strictly newer lifecycle", () => {
+  let state = AGENT_SESSION_FEED_INITIAL_STATE;
+  for (const id of ["omitted", "newer", "older", "previous"]) {
+    state = reduce(state,{type:"apply_event",value:{id,name:id,state:"working",statusUpdatedAt:20},nowMs:20});
+  }
+  const result = reduce(state,{type:"replace_snapshot",concurrentIds:new Set(["omitted","newer","older"]),
+    value:[{id:"newer",state:"done",statusUpdatedAt:25},{id:"older",name:"snapshot title",state:"idle",statusUpdatedAt:10,cwd:"/fixture"}],nowMs:30});
+  assert.deepEqual(Object.fromEntries(result.routingSessions.map(s=>[s.id,s.state])),
+    {omitted:"working",newer:"done",older:"working"});
+  assert.equal(result.routingSessions.find(s=>s.id==="older").cwd,"/fixture");
+  assert.equal(result.routingSessions.find(s=>s.id==="older").name,"snapshot title");
+});
+
+test("equal clock times use the sequence from the same lifecycle epoch", () => {
+  const session = { id: "dsh-task", name: "task", epoch: "run", statusUpdatedAt: 15, state: "working", sourceSeq: 2 };
+  const initial = reduce(AGENT_SESSION_FEED_INITIAL_STATE, { type: "apply_event", value: session, nowMs: 15 });
+  const snapshot = sourceSeq => reduce(initial, { type: "replace_snapshot",
+    value: [{ ...session, state: "done", sourceSeq }], concurrentIds: new Set([session.id]), nowMs: 16 });
+  assert.equal(snapshot(1).routingSessions[0].state, "working");
+  assert.equal(snapshot(3).routingSessions[0].state, "done");
+});
 
 test("Session feed admits active work and deduplicates an unchanged authoritative snapshot", () => {
   const working = {

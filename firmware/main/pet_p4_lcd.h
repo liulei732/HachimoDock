@@ -14,6 +14,19 @@
 #include "esp_err.h"
 #include "pet_p4_lcd_profile.h"
 
+typedef enum {
+  PET_LCD_PANEL_UNKNOWN,
+  PET_LCD_PANEL_ST7701,
+  PET_LCD_PANEL_NV3049,
+} pet_lcd_panel_model_t;
+
+pet_lcd_panel_model_t pet_p4_lcd_panel_model(void);
+#if BSP_LCD_PANEL_AUTO
+bool pet_p4_lcd_no_touch_profile(void);
+bool pet_p4_lcd_nv3049_ppa_active(void);
+unsigned pet_p4_lcd_nv3049_max_refresh_gap(void);
+esp_err_t pet_p4_lcd_save_no_touch_profile(bool enabled);
+#endif
 esp_err_t pet_p4_lcd_prepare_boot(void);
 esp_err_t pet_p4_lcd_init(void);
 esp_err_t pet_p4_lcd_reveal(void);
@@ -27,6 +40,8 @@ esp_err_t pet_p4_lcd_draw_rgb565_observed(int x,int y,int width,int height,const
 int pet_p4_lcd_scan_i2c(char *buffer, size_t buffer_size);
 
 #if PET_P4_SYSTEM_WIFI
+int pet_p4_lcd_brightness(void); /* -1 for fixed or unavailable backlights */
+bool pet_p4_lcd_save_brightness(int value);
 enum pet_lcd_phase {
   PET_LCD_BETWEEN_FRAMES, PET_LCD_COMPOSE, PET_LCD_ROTATE, PET_LCD_COMPARE, PET_LCD_SUBMIT
 };

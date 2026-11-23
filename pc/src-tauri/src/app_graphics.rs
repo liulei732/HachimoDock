@@ -29,7 +29,7 @@ pub fn keyframes(surface:&Value)->Option<(u64,u64)>{
     let im=surface["images"].as_array()?.first()?;
     if im["encoding"]!="jpeg"{return None;}
     let frames=im.get("frames").and_then(Value::as_u64).unwrap_or(1);
-    if frames<=1{return None;}
+    if !(2..=V2.keyframes).contains(&frames){return None;}
     Some((frames,im.get("fps").and_then(Value::as_u64).unwrap_or(1)))
 }
 /// Source PNG of frame k>=2: assets/bg.png -> assets/bg.2.png. Frame 1 is the declared asset.

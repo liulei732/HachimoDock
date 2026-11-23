@@ -25,29 +25,33 @@ const FRAME_TIMEOUT: Duration = Duration::from_secs(4);
 // Wi-Fi status identifies the board family. Offer a version comparison only
 // when both bundled chip variants agree; chip selection remains in the updater.
 pub(super) fn bundled_wifi6_status(app: &tauri::AppHandle, board_id: &str) -> (Option<&'static str>, bool) {
-    static BUNDLED: OnceLock<Option<(String, [[u8; 32]; 2])>> = OnceLock::new();
-    let Some((version, digests)) = BUNDLED
-        .get_or_init(|| {
-            let board = P4BoardModel::Wifi6;
-            let inspect = |target| {
-                let path = crate::bundled_p4_firmware_path(
-                    app,
-                    usb_serial::bundled_resource_for_device(board, target),
-                )
-                .ok()?;
-                let info = usb_serial::inspect_firmware_image(&path, target).ok()?;
-                board
-                    .image_version_matches(&info.version)
-                    .then_some(info)
+    static BUNDLED: OnceLock<(String, [[u8; 32]; 2])> = OnceLock::new();
+    static ATTEMPT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    if BUNDLED.get().is_none() {
+        let Ok(mut attempt) = ATTEMPT.lock() else { return (None, false); };
+        if BUNDLED.get().is_none() && attempt.is_none_or(|last| last.elapsed() >= Duration::from_secs(10)) {
+            *attempt = Some(Instant::now());
+            let inspect_bundle = || {
+                let board = P4BoardModel::Wifi6;
+                let inspect = |target| {
+                    let path = crate::bundled_p4_firmware_path(
+                        app,
+                        usb_serial::bundled_resource_for_device(board, target),
+                    )
+                    .ok()?;
+                    let info = usb_serial::inspect_firmware_image(&path, target).ok()?;
+                    board
+                        .image_version_matches(&info.version)
+                        .then_some(info)
+                };
+                let v1 = inspect(P4ChipTarget::LegacyV1)?;
+                let v3 = inspect(P4ChipTarget::Revision(302))?;
+                (v1.version == v3.version).then_some((v1.version, [v1.sha256, v3.sha256]))
             };
-            let v1 = inspect(P4ChipTarget::LegacyV1)?;
-            let v3 = inspect(P4ChipTarget::Revision(302))?;
-            (v1.version == v3.version).then_some((v1.version, [v1.sha256, v3.sha256]))
-        })
-        .as_ref()
-    else {
-        return (None, false);
-    };
+            if let Some(bundle) = inspect_bundle() { let _ = BUNDLED.set(bundle); }
+        }
+    }
+    let Some((version, digests)) = BUNDLED.get() else { return (None, false); };
     let blocked = app.path().app_data_dir().is_ok_and(|app_data| {
         let directory = firmware_rollback::directory(&app_data);
         // A board's chip revision cannot change, and installs can only record
@@ -225,7 +229,7 @@ impl TrustedOtaLink for Link {
 
 fn error_text(error: Error) -> String {
     match error {
-        Error::Image => "内置无线固件校验失败。".into(),
+        Error::Image => "无线固件校验失败。".into(),
         Error::Device => "目标设备或启动身份已改变。".into(),
         Error::Rejected(message) => format!("设备拒绝无线升级（{message}）"),
         Error::Unknown(message) => format!("无线升级结果未确认（{message}）"),
@@ -240,11 +244,12 @@ pub(crate) struct WirelessUpdateResult {
     boot_id: String,
 }
 
-fn install_bundled(
+fn install_firmware(
     app: &tauri::AppHandle,
     usb: &usb_serial::UsbSerialManager,
     expected_board_device_id: &str,
     expected_boot_id: &str,
+    selected: Option<(&std::path::Path, &str)>,
 ) -> Result<WirelessUpdateResult, String> {
     let _update = firmware_rollback::start_update()?;
     let _foreground = super::widget_data::foreground()?;
@@ -252,7 +257,7 @@ fn install_bundled(
         let _ = app.emit(
             "lan-firmware-update-progress",
             serde_json::json!({
-                "stage": stage, "percent": percent,
+                "stage": stage, "percent": percent, "updateId": selected.map(|(_, id)| id),
             }),
         );
     };
@@ -277,20 +282,19 @@ fn install_bundled(
     }
     let target = P4ChipTarget::Revision(revision);
     let board = P4BoardModel::Wifi6;
-    let path = crate::bundled_p4_firmware_path(
-        app,
-        usb_serial::bundled_resource_for_device(board, target),
-    )?;
-    let info = usb_serial::inspect_firmware_image(&path, target)?;
+    let path = match selected {
+        Some((path, _)) => path.to_owned(),
+        None => crate::bundled_p4_firmware_path(app, usb_serial::bundled_resource_for_device(board, target))?,
+    };
+    let (info, bytes) = usb_serial::read_firmware_image(&path, target)?;
     if !board.image_version_matches(&info.version) {
-        return Err("内置固件的板型标记不匹配。".into());
+        return Err("固件的板型标记不匹配。".into());
     }
     if crate::compare_firmware_versions(&status.firmware, &info.version)?
         != std::cmp::Ordering::Less
     {
         return Err("设备固件已是最新版本。".into());
     }
-    let bytes = std::fs::read(&path).map_err(|err| err.to_string())?;
     // Current bundled ESP images append the native digest after the final segment.
     let end = bytes
         .len()
@@ -303,7 +307,7 @@ fn install_bundled(
     if bytes[23] != 1 || <[u8; 32]>::from(Sha256::digest(&bytes[..end])) != digest {
         return Err(error_text(Error::Image));
     }
-    let sha256 = Sha256::digest(&bytes).into();
+    let sha256 = info.sha256;
     let image = wireless_ota::VerifiedImage::new(&bytes, sha256, digest, revision)
         .map_err(error_text)?;
     let directory = firmware_rollback::directory(&app.path().app_data_dir().map_err(|e| e.to_string())?);
@@ -322,7 +326,7 @@ fn install_bundled(
     super::require_no_usb(usb)?;
     let pending =
         wireless_ota::install(&mut link, &id, transfer, image, progress).map_err(error_text)?;
-    progress("reboot", 100);
+    progress(if pending.commit_confirmed() { "reboot" } else { "validate" }, 100);
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut next_scan = Instant::now() + Duration::from_secs(12);
     while Instant::now() < deadline {
@@ -333,6 +337,12 @@ fn install_bundled(
                     progress("validate", 100);
                 }
                 if pending.validated(live.board_id(), &boot) {
+                    if crate::shared_font::supports(&info.version) {
+                        live.close();
+                        progress("font", 100);
+                        super::ensure_bubble_font(usb, &id, &boot.id)
+                            .map_err(|e| format!("固件已升级，气泡字库待同步。{e}"))?;
+                    }
                     return Ok(WirelessUpdateResult {
                         version: info.version,
                         board_device_id: id,
@@ -355,7 +365,7 @@ fn install_bundled(
             next_scan = Instant::now() + Duration::from_secs(8);
         }
     }
-    Err("设备已收到升级，但新固件启动状态尚未确认。".into())
+    Err("尚未验证目标镜像已成功启动。请恢复连接后核对固件状态。".into())
 }
 
 #[tauri::command]
@@ -367,13 +377,36 @@ pub(crate) async fn lan_update_bundled_firmware(
 ) -> Result<WirelessUpdateResult, String> {
     let usb = usb_manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        install_bundled(
+        install_firmware(
             &app_handle,
             &usb,
             &expected_board_device_id,
             &expected_boot_id,
+            None,
         )
     })
     .await
     .map_err(|_| "无线升级任务未完成。")?
+}
+
+#[tauri::command]
+pub(crate) async fn lan_update_firmware_file(
+    app_handle: tauri::AppHandle,
+    expected_board_device_id: String,
+    expected_boot_id: String,
+    firmware_path: String,
+    update_id: String,
+    usb_manager: tauri::State<'_, usb_serial::UsbSerialManager>,
+) -> Result<WirelessUpdateResult, String> {
+    let path = std::path::PathBuf::from(firmware_path);
+    if !path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("bin")) {
+        return Err("请选择 .bin 格式的应用固件。".into());
+    }
+    if uuid::Uuid::parse_str(&update_id).is_err() {
+        return Err("无线升级任务标识无效。".into());
+    }
+    let usb = usb_manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        install_firmware(&app_handle, &usb, &expected_board_device_id, &expected_boot_id, Some((&path, &update_id)))
+    }).await.map_err(|_| "无线升级任务未完成。")?
 }

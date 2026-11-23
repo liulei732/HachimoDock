@@ -26,3 +26,13 @@ test("MiMoCode platform limitations are surfaced before starting voice recogniti
     assert.equal(deviceVoicePlatformWarning(id, "macos"), "");
   }
 });
+
+test("Antigravity uses the detected macOS desktop Agent for push-to-talk", () => {
+  assert.equal(deviceVoicePlatformWarning("antigravity", "macos"), "");
+  assert.equal(deviceVoiceTransportReady("antigravity", "macos", true), true);
+  assert.equal(deviceVoiceTransportReady("antigravity", "macos", false), false);
+  for (const platform of ["windows", "other"]) {
+    assert.equal(deviceVoiceTransportReady("antigravity", platform, true), false);
+    assert.match(deviceVoicePlatformWarning("antigravity", platform), /目前支持 macOS/);
+  }
+});

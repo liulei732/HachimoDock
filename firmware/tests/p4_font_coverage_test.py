@@ -22,6 +22,8 @@ PREAMBLE = r'''
 #include <time.h>
 static unsigned long long reads;
 #include "pet_p4_rgb565_blend.h"
+/* These pixel baselines exercise the fallback when the optional font is absent. */
+#define draw_shared_bubble_glyph(cp,x,y,color,medium) false
 #define PET_P4_UI_WIDTH 480
 #define PET_P4_UI_HEIGHT 180
 #define LV_FONT_GLYPH_FORMAT_A1 1

@@ -14,7 +14,7 @@ Rust `pc_fetch::parse_declaration` 做导入期结构检查；`pc_fetch::host::r
 
 结果提供 variables、data、values、ui。设备变量通过 `publish_fetch` 在实例校验后发送 app/snapshot，数据通过 widget/data；PC 面板轮询同一缓存。成功映射原子替换缓存；失败保留旧缓存，TTL 后不再提供旧变量并把行快照标记过期。手动 refresh 仍遵守网络最小间隔。
 
-共享 Wi-Fi 快照通道可以承载已获准发布的 `fetch.*` 行快照。现有 PC Fetch 的交互式实例、`app/snapshot` 发布入口和设备发起的 PC `data.refresh` 仍依赖 USB。设备直接刷新 `wifi.feed` 由独立的 HTTPS 宿主处理。
+共享 Wi-Fi 快照通道可以承载已获准发布的 `fetch.*` 行快照。支持配对应用通道的双端还可通过 WiFi6 交换交互式实例事件与 `app/snapshot`。设备发起的 PC `data.refresh` 仍依赖 USB。设备直接刷新 `wifi.feed` 则由固件数据宿主处理。
 
 ## 页面、表单与展示
 

@@ -149,19 +149,27 @@ def upgrade(link, opts, save):
         # From here on, never abort/retry: an absent response may already mean
         # the new boot partition was committed. Inspect boot state instead.
         commit_sent = True
-        ack = link.request('firmware/commit', {'transferId': tid}, 'firmware/ack', 30)
-        if (ack.get('transferId') != tid or ack.get('phase') != 'commit'
-                or ack.get('ok') is not True or ack.get('sha256') != opts.sha256
-                or ack.get('version') != opts.version
-                or (target_partition and ack.get('targetPartition') != target_partition)):
-            raise RuntimeError('Commit confirmation invalid; inspect before retrying')
-        save('commit', {'version': ack['version'], 'sha256': ack['sha256'],
-                        'targetPartition': ack.get('targetPartition')})
+        try:
+            ack = link.request('firmware/commit', {'transferId': tid}, 'firmware/ack', 30)
+        except TimeoutError:
+            if initial_identity is None:
+                raise
+            # The boot may already have consumed the ACK. Only an exact new
+            # ELF, changed boot and valid target slot can resolve this outcome.
+            ack = None
+        if ack is not None:
+            if (ack.get('transferId') != tid or ack.get('phase') != 'commit'
+                    or ack.get('ok') is not True or ack.get('sha256') != opts.sha256
+                    or ack.get('version') != opts.version
+                    or (target_partition and ack.get('targetPartition') != target_partition)):
+                raise RuntimeError('Commit confirmation invalid; inspect before retrying')
+            save('commit', {'version': ack['version'], 'sha256': ack['sha256'],
+                            'targetPartition': ack.get('targetPartition')})
     finally:
         if not commit_sent:
             # Firmware verifies transferId; never abort someone else's transfer.
             link.send('firmware/abort', {'transferId': tid})
-    print('Commit confirmed; checking new boot', flush=True)
+    print('Checking new boot' if ack is not None else 'Commit ACK unavailable; reading boot identity', flush=True)
     end = time.monotonic() + 75
     while time.monotonic() < end:
         time.sleep(1)
@@ -190,6 +198,9 @@ def upgrade(link, opts, save):
         break
     else:
         raise RuntimeError('New boot not confirmed; inspect, do not repeat update')
+    if ack is None:
+        save('commit_observed', {'version': r['firmware'], 'appElfSha256': target_elf,
+                                 'targetPartition': r['runningPartition'], 'evidence': 'boot-readback'})
     inventory = link.request('widget/list', {}, 'widget/inventory')
     if not inventory.get('complete') or not inventory.get('ok'):
         raise RuntimeError('Post-update inventory incomplete')

@@ -522,7 +522,8 @@ test("device dashboard remains the management surface with one desktop-pet assig
   const channelMatrix = readSource("src/dashboard/ChannelMatrixCard.jsx");
 
   assert.match(channelMatrix, /resolveDashboardPreviewMedia/);
-  assert.match(dashboard, /title="Agent与形象"/);
+  assert.match(dashboard, /title="桌宠伙伴"/);
+  assert.doesNotMatch(channelMatrix, /className="channel-row__thumb-wrap"/);
   assert.match(channelMatrix, /agentOptions\.filter\(\(agent\) => agent\?\.id\)/);
   assert.match(channelMatrix, /BUILTIN_TERRIER_APPEARANCE_ID/);
   assert.match(channelMatrix, /saveAgentAppearance\(agentId, appearance\.id\)/);
@@ -560,7 +561,7 @@ test("generation setup clearly supports GIF first-frame input and field help aff
   assert.match(wizard, /GIF 会取首帧作为参考图/);
   assert.match(wizard, /FieldWithHelp/);
   assert.match(wizard, /generation-api-status/);
-  assert.match(wizard, /打开 API 配置/);
+  assert.match(wizard, /打开模型配置/);
   assert.doesNotMatch(wizard, /type="password"/);
   assert.match(wizard, /label="Base URL"/);
   assert.match(wizard, /label="视频生成模型"/);
@@ -568,7 +569,7 @@ test("generation setup clearly supports GIF first-frame input and field help aff
   assert.match(wizard, /loadProviderConfig/);
   assert.match(wizard, /saveProviderConfig/);
   assert.match(wizard, /thinkingModel: thinkingModel\.trim\(\) \|\| \(isVolcengine \? VOLCENGINE_THINKING_MODEL : trimmedModel\)/);
-  assert.match(wizard, /请先在 API 配置中保存火山引擎 API Key/);
+  assert.match(wizard, /请先在模型配置中保存火山引擎 API Key/);
   assert.doesNotMatch(wizard, /Thinking 模型 endpoint/);
   assert.doesNotMatch(wizard, /providerId === "volcengine" && !thinkingModel\.trim\(\)/);
   assert.doesNotMatch(wizard, /推理接入点 \/ Endpoint/);

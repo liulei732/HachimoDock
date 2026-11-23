@@ -122,14 +122,35 @@ fn toggle(app:&tauri::AppHandle,usb:&UsbSerialManager,token:PressToken,input:Opt
     }
     match action {
         Action::Stop(session_id)=>crate::realtime_chat::stop_wifi_bound(&key.board,&key.boot,&session_id).map(Some),
-        Action::Start(target)=>crate::realtime_chat::start_wifi_bound(app,input.ok_or("请重新长按开始")?,target).map(Some),
+        Action::Start(target)=>{
+            let started=crate::realtime_chat::start_wifi_bound(app,input.ok_or("请重新长按开始")?,target);
+            if started.is_err() && !crate::realtime_chat::status().active {
+                let _=super::runtime_events::failed_press(usb,&binding.peer,&key.board,&key.boot,key.seq,&binding.owner);
+            }
+            started.map(Some)
+        },
     }
 }
 
 #[tauri::command]
-pub(crate) async fn lan_realtime_toggle(app_handle:tauri::AppHandle,usb_manager:tauri::State<'_,UsbSerialManager>,token:PressToken,input:Option<RealtimeChatStartInput>)->Result<Option<RealtimeChatStatus>,String>{
+pub(crate) async fn lan_realtime_toggle(app_handle:tauri::AppHandle,usb_manager:tauri::State<'_,UsbSerialManager>,token:PressToken,input:Option<RealtimeChatStartInput>,configuration_failed:Option<bool>)->Result<Option<RealtimeChatStatus>,String>{
     let usb=usb_manager.inner().clone();
-    tauri::async_runtime::spawn_blocking(move||toggle(&app_handle,&usb,token,input)).await.map_err(|_|"Wi-Fi 按键任务异常".to_string())?
+    tauri::async_runtime::spawn_blocking(move||{
+        if configuration_failed!=Some(true){return toggle(&app_handle,&usb,token,input);}
+        let key=token.token();
+        if input.is_some() || crate::realtime_chat::status().active {return Err("本次按键无法显示启动提示".into());}
+        let binding={
+            let mut i=inbox().lock().map_err(|_|"Wi-Fi 按键状态不可用")?;
+            if !i.action.as_ref().is_some_and(|(t,a)|t==&key && matches!(a,Action::Start(_))) ||
+                !i.admission.claim(&key,Instant::now()){return Err("本次按键已过期".into());}
+            let binding=i.binding.clone().ok_or("无线配对已变化")?;
+            // Final disposition of this exact offer. An uncertain hint is never replayed.
+            i.admission.finish(&key,true);
+            binding
+        };
+        super::runtime_events::failed_press(&usb,&binding.peer,&key.board,&key.boot,key.seq,&binding.owner)?;
+        Ok(None)
+    }).await.map_err(|_|"Wi-Fi 按键任务异常".to_string())?
 }
 
 #[cfg(test)]
@@ -145,7 +166,7 @@ mod tests {
         let copy=binding.clone();
         let task=std::thread::spawn(move||{
             for ack in if corrupt {vec![0]} else {vec![0,1]} {
-                let (mut stream,_)=listener.accept().unwrap();stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut stream=crate::lan_agent::confirmation_tests::accept(&listener);
                 let mut client=[0;16];stream.read_exact(&mut client).unwrap();let server=[9;16];stream.write_all(&server).unwrap();
                 let mut header=[0;3];stream.read_exact(&mut header).unwrap();assert_eq!(header,[MODE,0,36]);
                 let key=key_from_digest(&session_digest(copy.peer.key.as_ref(),&client,&server));

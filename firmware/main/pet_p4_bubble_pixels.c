@@ -25,8 +25,6 @@
 #define SCHEMA "p4-text-alpha-v2:rle4:1:"
 #define GLYPH_RECORD_BYTES (4U + PET_BUBBLE_GLYPH_BYTES)
 #define GLYPH_MAX_BYTES (511U * GLYPH_RECORD_BYTES)
-#define BODY_FIRST_WAIT_MS 2500U
-#define BODY_UPDATE_WAIT_MS 3200U
 #define VIEW_LEASE_MS 5000U
 enum {PIXEL_PAGE, PIXEL_CELLS, PIXEL_BODY_MASK};
 typedef struct {
@@ -54,10 +52,10 @@ typedef struct {
 } desired_t;
 typedef struct {
   uint64_t        owner, target, since_ms, seen_ms, title_key, body_key;
-  uint64_t        body_deadline, body_shown_key;
+  uint64_t        body_shown_key;
   unsigned        style;
   uint32_t        epoch;
-  bool            occupied, title_bitmap, body_bitmap, body_waiting, body_local, title_waiting;
+  bool            occupied, title_bitmap, body_bitmap, title_waiting;
   uint8_t         body_page, body_shown_page;
 } text_view_t;
 static text_image_t cache[CACHE_SLOTS], staging;
@@ -424,8 +422,8 @@ pet_bubble_pixels_desire(const cJSON * payload, const void *ctx, const char *sco
   }
   if (valid) {
     bool cells = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(m, "glyphCells"));
-    bool masks = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(m, "bodyMasks"));
-    bool titles = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(m, "titleMasks"));
+    bool masks = !pet_shared_font_ready() && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(m, "bodyMasks"));
+    bool titles = !pet_shared_font_ready() && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(m, "titleMasks"));
     if (strcmp(c, client) || route != (uintptr_t) ctx || cells != glyph_cells || masks != body_masks || titles != title_masks) {
       clear_stage();
       retire_cache();
@@ -718,59 +716,28 @@ pet_bubble_pixels_pin_page(pet_bubble_text_view_t * out, unsigned page)
   xSemaphoreGive(mutex);
 }
 static bool wants_asset(const char *text, unsigned style, unsigned (*coverage)(const char *, unsigned)) {
-  if (!text[0]) return false;
+  if (!text[0] || (pet_shared_font_ready() && !glyph_cells)) return false;
   unsigned kinds = coverage ? coverage(text, style) : PET_BUBBLE_GLYPH_MISSING;
   /* Older senders supply a page without codepoint positions. That page can
    * display a fully unsupported string, but cannot replace a resident run. */
   return (kinds & PET_BUBBLE_GLYPH_MISSING) && (glyph_cells || !(kinds & PET_BUBBLE_GLYPH_RESIDENT));
 }
 
-/* One deadline for an unresolved stream of partials. Local fallback is scoped
- * to the current body and never prevents promotion to its exact mask. */
+/* Glyph delivery is asynchronous. Only pin a bitmap for the text being
+ * displayed. The renderer can draw that same text locally on its first frame. */
 static int select_body_mask(text_view_t *v, pet_bubble_text_view_t *out,
-    const char *text, uint64_t key, uint64_t now, bool retain_previous) {
-  if (!text[0]) {
-    v->body_waiting = v->body_local = false;
-    v->body_deadline = v->body_shown_key = 0;
-    return -1;
+    const char *text, uint64_t key) {
+  int exact = -1;
+  if (text[0]) {
+    if (v->body_shown_key == key)
+      exact = find(key, out->style, v->body_shown_page, PIXEL_BODY_MASK);
+    if (exact < 0) exact = find(key, out->style, 0, PIXEL_BODY_MASK);
+    if (exact < 0 && body_masks && client[0]) missing(key, out->style, 0, text);
   }
-  int previous = v->body_shown_key
-    ? find(v->body_shown_key, out->style, v->body_shown_page, PIXEL_BODY_MASK) : -1;
-  int exact = previous >= 0 && v->body_shown_key == key
-    ? previous : find(key, out->style, 0, PIXEL_BODY_MASK);
-  if (exact >= 0) {
-    if (v->body_shown_key != key) v->since_ms = now;
-    v->body_shown_key = key;
-    v->body_shown_page = (uint8_t)cache[exact].page;
-    v->body_waiting = v->body_local = false;
-    v->body_deadline = 0;
-    out->body_exact = true;
-    return exact;
-  }
-  if (!retain_previous) {
-    v->body_shown_key = 0;
-    previous = -1;
-  }
-  if (body_masks && client[0]) {
-    bool owned = missing(key, out->style, 0, text);
-    /* The authenticated RTC HUD and its manifest arrive on different lanes.
-     * A caption may become visible just before the matching owner is installed. */
-    if ((owned || out->style == PET_BUBBLE_BODY) && !v->body_local) {
-      if (!v->body_deadline)
-        v->body_deadline = now + (previous >= 0 ? BODY_UPDATE_WAIT_MS : BODY_FIRST_WAIT_MS);
-      if (now < v->body_deadline) {
-        v->body_waiting = true;
-        out->body_pending = previous < 0;
-        return previous;
-      }
-    }
-  }
-  const bool was_waiting = v->body_waiting;
-  v->body_waiting = false;
-  v->body_local = true;
-  v->body_shown_key = 0;
-  if (was_waiting) bump(); /* A cached Agent overlay must repaint at the deadline. */
-  return -1;
+  v->body_shown_key = exact >= 0 ? key : 0;
+  v->body_shown_page = exact >= 0 ? (uint8_t)cache[exact].page : 0;
+  out->body_exact = exact >= 0;
+  return exact;
 }
 
 void
@@ -812,23 +779,17 @@ pet_bubble_pixels_select(const char *owner, unsigned style, const char *title, c
   const bool expired_view = now - v->seen_ms > VIEW_LEASE_MS;
   const bool title_changed = v->title_key != tk;
   const bool peer_changed = v->epoch != lifecycle_epoch;
-  if (expired_view || title_changed) {
-    v->body_waiting = v->body_local = false;
-    v->body_deadline = 0;
-  }
-  uint64_t        target = tk ^ (bk * UINT64_C(1099511628211));
+  uint64_t target = tk ^ (bk * UINT64_C(1099511628211));
   if (v->target != target) {
-    /* A new update after a quiet period is independent of the previous
-     * fallback. Fast partials still share the original bounded deadline. */
-    if (v->body_local && now - v->since_ms >= BODY_FIRST_WAIT_MS)
-      v->body_deadline = 0;
-    v->body_local = false;
     v->target = target;
     v->since_ms = now;
     v->body_page = 0;
   }
+  const bool previous_title_bitmap = v->title_bitmap;
   if (title_changed || peer_changed || title_masks)
-    v->title_bitmap = title_masks ? key_title[0] && asset_owner(tk, PET_BUBBLE_TITLE)
+    v->title_bitmap = title_masks ? key_title[0] && (asset_owner(tk, PET_BUBBLE_TITLE)
+        || (!expired_view && !title_changed && !peer_changed && previous_title_bitmap
+            && find(tk, PET_BUBBLE_TITLE, 0, PIXEL_PAGE) >= 0))
       : wants_asset(key_title, PET_BUBBLE_TITLE, coverage);
   if (v->body_key != bk || peer_changed)
     v->body_bitmap = wants_asset(key_body, style, coverage);
@@ -842,8 +803,7 @@ pet_bubble_pixels_select(const char *owner, unsigned style, const char *title, c
   out->target_key = target;
   out->title_bitmap = v->title_bitmap;
   out->body_bitmap = v->body_bitmap;
-  const bool retain_previous = !expired_view && !title_changed && !peer_changed;
-  int b = is_body(style) ? select_body_mask(v, out, key_body, bk, now, retain_previous) : -1;
+  int b = is_body(style) ? select_body_mask(v, out, key_body, bk) : -1;
   out->since_ms = v->since_ms;
   if (b >= 0) {
     out->body_mask = true;
@@ -857,11 +817,14 @@ pet_bubble_pixels_select(const char *owner, unsigned style, const char *title, c
   int a = out->title_bitmap ? find(tk, PET_BUBBLE_TITLE, 0, format_for(PET_BUBBLE_TITLE)) : -1;
   bool title_owned = out->title_bitmap && a < 0
     && missing(tk, PET_BUBBLE_TITLE, 0, key_title);
-  /* An owned host title has one presentation: never paint a thin local title
-   * just because delivery is slow. No timer or retained previous-title text.
-   * Unmanaged/offline titles immediately keep the local renderer instead. */
+  /* Pending describes delivery only. Local glyphs remain drawable until the
+   * exact title is ready. Ownership changes cannot blank a visible label. */
   out->title_pending = title_masks && key_title[0] && a < 0 && title_owned;
-  if (v->title_waiting != out->title_pending) bump();
+  /* An exact title mask can stay cached when the same peer withdraws or
+   * restores its owner. Repaint even if neither selection waited for pixels. */
+  if (v->title_waiting != out->title_pending
+      || (title_masks && previous_title_bitmap != out->title_bitmap))
+    bump();
   v->title_waiting = out->title_pending;
   out->title_mask = title_masks && a >= 0;
   if (a >= 0) {

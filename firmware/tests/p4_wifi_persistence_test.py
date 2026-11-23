@@ -24,6 +24,7 @@ void esp_netif_sntp_deinit(void);
 #include <stddef.h>
 #include <stdint.h>
 #define ESP_OK 0
+#define ESP_ERR_NVS_NOT_FOUND 1
 #define NVS_READONLY 0
 #define NVS_READWRITE 1
 typedef unsigned nvs_handle_t;

@@ -1,0 +1,8 @@
+{
+  "id": "ble-room-temperature",
+  "name": "配件温度",
+  "version": "1.0.0",
+  "kind": "tool",
+  "description": "在设备上逐次允许读取指定传感器的摄氏温度。",
+  "author": "PetUI"
+}

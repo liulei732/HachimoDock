@@ -17,7 +17,7 @@ class Bench:
     def send(self,t,p):
         raw=(json.dumps({'topic':t,'payload':p},ensure_ascii=False,separators=(',',':'))+'\n').encode()
         for i in range(0,len(raw),64):self.s.write(raw[i:i+64]);time.sleep(.0007)
-    def recv(self,t,match=lambda p:True,timeout=15):
+    def recv(self,t,match=lambda p:True,timeout=15,*,allow_rejection=False):
         end=time.monotonic()+timeout
         while time.monotonic()<end:
             raw=self.s.readline().replace(b'\0',b'')
@@ -28,7 +28,8 @@ class Bench:
             except ValueError:continue
             p=m.get('payload',{})
             if m.get('topic')==t and match(p):
-                assert p.get('ok') is not False,p
+                if not allow_rejection and p.get('ok') is False:
+                    raise AssertionError(p)
                 return p
         raise TimeoutError(t)
     def request(self,t,p=None,reply='protocol/ack',timeout=15):
@@ -41,8 +42,41 @@ class Bench:
         self.send('miniapp/query',{});return self.recv('miniapp/state')
     def action(self,a):return self.request('miniapp/event',{'action':a})
     def transfer(self,kind,phase,p,timeout=20):
-        self.send(kind+'/'+phase,p)
-        return self.recv('widget-install-ack' if kind=='widget' else kind+'/ack',lambda a:a.get('transferId')==p['transferId'] and a.get('phase')==phase and (phase!='chunk' or (a.get('seq')==p.get('seq') if kind=='firmware' else a.get('path')==p.get('path') and str(a.get('index'))==str(p.get('index')))),timeout)
+        def matches(ack):
+            if ack.get("transferId") != p["transferId"] or ack.get("phase") != phase:
+                return False
+            if phase != "chunk":
+                return True
+            if kind == "firmware":
+                return ack.get("seq") == p.get("seq")
+            return ack.get("path") == p.get("path") and str(ack.get("index")) == str(p.get("index"))
+
+        reply = "widget-install-ack" if kind == "widget" else kind + "/ack"
+        topic = kind + "/" + phase
+        if topic != "widget/commit":
+            self.send(topic, p)
+            return self.recv(reply, matches, timeout)
+
+        # Snapshot the scalar commit envelope once. A retry must address the
+        # already staged package, without resending begin or any file bytes.
+        p = dict(p)
+        deadline = time.monotonic() + 3.5
+        delays = iter((0.1, 0.25, 0.5, 0.85, 1.3))
+        while True:
+            self.send(topic, p)
+            ack = self.recv(reply, matches, timeout, allow_rejection=True)
+            if ack.get("ok") is True:
+                return ack
+            if (ack.get("ok") is not False or ack.get("errorCode") != "commit_storage_deferred"
+                    or ack.get("msg") != "component storage is busy; commit has not started; staged package preserved"):
+                raise AssertionError(ack)
+            delay = next(delays, None)
+            if delay is None or time.monotonic() + delay > deadline:
+                raise AssertionError(ack)
+            time.sleep(delay)
+            if time.monotonic() > deadline:
+                raise AssertionError(ack)
+
     def capture(self,name):
         self.send('debug/screenshot',{'fullResolution':True});start=self.recv('debug/screenshot_begin');w,h=start['width'],start['height'];assert (w,h)==(640,480) and start['format']=='rgb565le'
         raw=bytearray();index=0

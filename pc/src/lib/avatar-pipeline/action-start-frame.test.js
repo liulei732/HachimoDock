@@ -47,3 +47,33 @@ test('action-specific first-frame role reaches the actual video submit request',
  assert.equal(bodies.length,1);assert.ok(bodies[0].content.find(c=>c.type==='text').text.includes(SUBJECT_MOTION_POLICY_EN));assert.deepEqual(bodies[0].content.filter(c=>c.type==='image_url').map(c=>c.role),['first_frame']);
  }finally{globalThis.fetch=old;}
 });
+
+test('a confirmed rejection gets one new frame carrying review feedback and survives another resume', async () => {
+  const oldFetch=globalThis.fetch;
+  const issues=['重心与参考图相同'];
+  let reviews=0;
+  globalThis.fetch = async () => Response.json({output_text: JSON.stringify({pass:++reviews===2, issues:reviews===1?issues:[]})});
+  const owner={}, prompts=[];
+  const opts={owner,actions:{working:owner},family:'working',reference:{bytes:new Uint8Array([1]),dataUrl:'data:image/png;base64,AQ=='},
+    cloudBackground:{apiKey:'fixture'},thinking:{apiKey:'fixture'},commit:async()=>{},allowCorrection:true,normalize:async raw=>raw.bytes,
+    generate:async ({prompt})=>{prompts.push(prompt);return {bytes:new Uint8Array([1+prompts.length]),mime:'image/png'};}};
+  try {
+    await ensureActionStartFrame(opts);
+    await ensureActionStartFrame(opts);
+    assert.equal(prompts.length,2);assert.equal(reviews,2);assert.match(prompts[1],/重心与参考图相同/);
+    assert.equal(owner.frameRedrawUsed,true);assert.equal(owner.startFrameApproved,true);
+  } finally { globalThis.fetch=oldFetch; }
+});
+
+test('exact duplicates exhaust a single redraw and an ambiguous replacement is never replayed', async () => {
+  for(const unknown of [false,true]) {
+    let count=0;
+    const owner={};
+    const options={owner,actions:{working:owner},family:'working',reference:{bytes:new Uint8Array([1]),dataUrl:'data:image/png;base64,AQ=='},
+      cloudBackground:{apiKey:'fixture'},thinking:{},commit:async()=>{},allowCorrection:true,normalize:async raw=>raw.bytes,
+      generate:async()=>{if(++count===2 && unknown)throw Error('simulated connection loss');return {bytes:new Uint8Array([1]),mime:'image/png'};}};
+    await assert.rejects(ensureActionStartFrame(options),unknown?/simulated/:/重复/);
+    await assert.rejects(ensureActionStartFrame(options),unknown?/结果未知/:/重复/);
+    assert.equal(count,2);assert.equal(owner.frameRedrawUsed,true);
+  }
+});

@@ -38,6 +38,26 @@ def validate_cover(data):
             return
         offset = end
     raise ValueError("封面 PNG 数据损坏")
+
+
+def publication_cover(data):
+    """Decode the bounded PNG on a light backdrop, including palette transparency."""
+    from io import BytesIO
+    from PIL import Image
+    validate_cover(data)
+    try:
+        with Image.open(BytesIO(data)) as image:
+            rgba = image.convert("RGBA")
+            visible = Image.new("RGB", rgba.size, "white")
+            visible.paste(rgba, mask=rgba.getchannel("A"))
+    except (OSError, ValueError) as error:
+        raise ValueError("组件封面解码失败") from error
+    tile = visible.resize((64, 48), Image.Resampling.LANCZOS).quantize(colors=16,
+                  method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE).convert("RGB").tobytes()
+    colors = {(r >> 3, g >> 2, b >> 3) for r, g, b in zip(tile[::3], tile[1::3], tile[2::3])}
+    if len(colors) < 2:
+        raise ValueError("封面缩至 64×48 后为空白或纯色，请截取有代表性的组件画面")
+    return visible
 REQUIRED = ("component.json", "negative-screen.json", "buttons.json",
             "runtime/widget.json", "share.json")
 UNSAFE = {".bat",".cmd",".com",".css",".dll",".dylib",".exe",".html",".js",
@@ -48,29 +68,68 @@ def json_bytes(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+def initial_host_dashboard(widget):
+    if not isinstance(widget, dict) or widget.get("host") is not True or "hachiWasm" in widget:
+        return None
+    surface, dashboard = widget.get("surface"), widget.get("dashboard")
+    if (isinstance(surface, dict) and surface.get("engine") == "p4-app-surface-v1"
+            and surface.get("bindings") == "p4-variable-bindings-v1"
+            and isinstance(dashboard, dict) and dashboard
+            and all(isinstance(value, str) for value in dashboard.values())):
+        return dashboard
+    return None
+
+
+def package_entries(source, max_entries=1024):
+    # Count directories too. scandir streams even a single very wide directory.
+    directories = [source]
+    count = 0
+    while directories:
+        directory = directories.pop()
+        if directory.is_symlink():
+            raise ValueError(f"不安全的组件路径: {directory.relative_to(source)}")
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                count += 1
+                if count > max_entries:
+                    raise ValueError(f"组件源目录超过 {max_entries} 个目录项")
+                path = Path(entry.path)
+                yield path
+                if entry.is_dir(follow_symlinks=False):
+                    directories.append(path)
+
+
 def package_directory(source, module=None):
+    from python_plugin import ENTRY as PYTHON_ENTRY
     if not source.is_dir() or source.is_symlink():
         raise ValueError("组件源必须是本地普通目录")
     files = {}
     total = 0
-    for path in sorted(source.rglob("*")):
+    for path in package_entries(source):
         name = path.relative_to(source).as_posix()
         if path.is_symlink() or ":" in name or "\\" in name:
             raise ValueError(f"不安全的组件路径: {name}")
         if path.is_dir():
             continue
-        if not path.is_file() or path.suffix.lower() in UNSAFE and name != "runtime/app.wasm":
+        if not path.is_file() or path.suffix.lower() in UNSAFE and name not in ("runtime/app.wasm", PYTHON_ENTRY):
             raise ValueError(f"组件内不允许该文件: {name}")
         length = path.stat().st_size
         total += length
         if len(files) >= 120 or length > 4*1024*1024 or total > 7*1024*1024:
             raise ValueError("组件超过打包大小或文件数量上限")
-        files[name] = path.read_bytes()
-    for name in REQUIRED:
-        if name not in files:
-            raise ValueError(f"缺少 {name}")
+        with path.open("rb") as stream:
+            data = stream.read(length + 1)
+        if len(data) != length:
+            raise ValueError(f"打包时文件已变化: {name}")
+        files[name] = data
     if module is None:
         module = files.get("runtime/app.wasm")
+    for name in REQUIRED:
+        if name not in files:
+            if (name == "negative-screen.json" and module is None
+                    and initial_host_dashboard(json.loads(files.get("runtime/widget.json", b"null"))) is not None):
+                continue
+            raise ValueError(f"缺少 {name}")
     return files, module
 
 
@@ -79,13 +138,14 @@ CANVAS_PROFILE = "640x480-v1"
 HOST_PROFILE = "hachi-host-v1"
 AUDIO_PROFILE = "hachi-audio-v2"
 AUDIO_ASSET = "assets/speech.hab"
+NETWORK_IMPORTS = {b"service_submit", b"service_poll", b"service_read", b"service_release"}
 HOST_IMPORTS = {b"clock_read", b"uv_read", b"random_u32"}
-WASM_IMPORTS = HOST_IMPORTS | {
+WASM_IMPORTS = HOST_IMPORTS | NETWORK_IMPORTS | {
     b"canvas640", b"text", b"rect", b"blit", b"sprite", b"tone", b"sample", b"load", b"save", b"media_cmd"
 }
 
 
-def wasm_profile(module):
+def wasm_profile(module, include_network=False, *, component_id=None):
     """Return the profiles selected by imports."""
     if not 8 <= len(module) <= MAX_WASM_BYTES or not module.startswith(b"\0asm\x01\0\0\0"):
         raise ValueError("WASM 模块格式不正确或超过 192 KiB")
@@ -145,10 +205,26 @@ def wasm_profile(module):
         at = end
     if not saw_memory or b"text" in imports and b"canvas640" not in imports:
         raise ValueError("WASM 缺少固定内存或原生画布声明")
+    if component_id is not None and b"media_cmd" in imports and component_id != "city-radio":
+        raise ValueError("media_cmd 仅用于旧电台兼容")
     canvas = CANVAS_PROFILE if b"canvas640" in imports else None
     services = HOST_PROFILE if imports & HOST_IMPORTS else None
     audio = AUDIO_PROFILE if b"sample" in imports else None
-    return canvas, services, audio
+    return (canvas, services, audio, bool(imports & NETWORK_IMPORTS)) if include_network else (canvas, services, audio)
+
+
+def validate_audio_ownership(runtime):
+    owners = ("instrument", "media", "local", "program", "host", "sequence", "samples", "sfx")
+    surface = runtime.get("surface")
+    if any(key in runtime for key in owners):
+        raise ValueError("WASM 离线语音不能与其他音频、媒体或宿主服务混用")
+    if isinstance(surface, dict):
+        for field in ("nodes", "elements"):
+            nodes = surface.get(field)
+            if isinstance(nodes, list) and any(isinstance(n, dict) and n.get("type") == "clip" for n in nodes):
+                raise ValueError("WASM 离线语音不能与视频混用")
+        if "big_images" in surface:
+            raise ValueError("WASM 离线语音不能与 big_images 混用")
 
 
 def validate_audio(data):
@@ -197,8 +273,10 @@ def native_validate(path):
     native_command(["validate", path])
 
 
-def write_package(destination, files, module=None, *, require_cover=False):
-    if COVER in files:
+def write_package(destination, files, module=None, *, require_cover=True, device_profile=None):
+    if COVER in files and require_cover:
+        publication_cover(files[COVER])
+    elif COVER in files:
         validate_cover(files[COVER])
     elif require_cover:
         raise ValueError(f"交付包缺少封面 {COVER}")
@@ -247,13 +325,19 @@ def write_package(destination, files, module=None, *, require_cover=False):
             f"runtime/widget.json.transitions[{index}].from 必须是已声明的状态或 '*'"
         )
     if module is not None:
-        canvas, services, audio = wasm_profile(module)
+        canvas, services, audio, network = wasm_profile(module, include_network=True, component_id=component_id)
+        if network:
+            from component_network import validate as validate_network
+            validate_network(widget.get("hachiNetwork"))
+        elif "hachiNetwork" in widget:
+            raise ValueError("Unused component network declaration")
         for key, profile in (("hachiCanvas", canvas), ("hachiHost", services), ("hachiAudio", audio)):
             if profile:
                 widget[key] = profile
             else:
                 widget.pop(key, None)
         if audio:
+            validate_audio_ownership(widget)
             bank = files.get(AUDIO_ASSET)
             validate_audio(bank)
             widget["hachiAudioSha256"] = hashlib.sha256(bank).hexdigest()
@@ -264,8 +348,16 @@ def write_package(destination, files, module=None, *, require_cover=False):
         widget["hachiWasm"] = hashlib.sha256(module).hexdigest()
         files["runtime/widget.json"] = json_bytes(widget)
         files["runtime/app.wasm"] = module
-    elif AUDIO_ASSET in files or any(key in widget for key in ("hachiWasm", "hachiCanvas", "hachiHost", "hachiAudio", "hachiAudioSha256")):
+    elif AUDIO_ASSET in files or any(key in widget for key in ("hachiWasm", "hachiCanvas", "hachiHost", "hachiAudio", "hachiAudioSha256", "hachiNetwork")):
         raise ValueError("声明了 WASM 但包内缺少 runtime/app.wasm")
+    dashboard = initial_host_dashboard(widget)
+    if dashboard is not None:
+        preview = json.loads(files.get("negative-screen.json", b"{}"))
+        if not isinstance(preview, dict):
+            raise ValueError("negative-screen.json 必须是对象")
+        if preview.get("dashboard") != dashboard:
+            preview["dashboard"] = dashboard
+            files["negative-screen.json"] = json_bytes(preview)
     files["runtime/widget.json"] = json_bytes(widget)
     files["hachiapp.json"] = json_bytes(manifest)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -278,7 +370,17 @@ def write_package(destination, files, module=None, *, require_cover=False):
             for name, data in sorted(files.items()):
                 archive.writestr(zipfile.ZipInfo(name), data)
         native_validate(staged)
+        delivery = None
+        if device_profile is not None:
+            from p4_local_delivery import PROFILE, compile_payload
+            if device_profile != PROFILE:
+                raise ValueError("未知设备目录配置")
+            delivery = compile_payload(files)
+            if delivery is None:
+                raise ValueError("组件超出 WiFi6 本地目录配置")
         staged.replace(destination)
+        if delivery is not None:
+            return {k: v for k, v in delivery.items() if k != "payload"}
 
 
 def main():
@@ -286,6 +388,7 @@ def main():
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--wasm", type=Path)
+    parser.add_argument("--device-profile", choices=["p4-local-v1"], help="check WiFi6 delivery and report costs")
     args = parser.parse_args()
     if args.output.suffix != ".hachiapp":
         parser.error("输出必须为 .hachiapp")
@@ -293,7 +396,9 @@ def main():
         parser.error("WASM 模块超过 192 KiB")
     try:
         files, module = package_directory(args.source, args.wasm.read_bytes() if args.wasm else None)
-        write_package(args.output, files, module, require_cover=True)
+        costs = write_package(args.output, files, module, require_cover=True, device_profile=args.device_profile)
+        if costs is not None:
+            print(json.dumps(costs, sort_keys=True))
     except (ValueError, OSError, KeyError) as exc:
         parser.error(str(exc))
     print(args.output.resolve())

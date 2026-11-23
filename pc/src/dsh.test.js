@@ -46,9 +46,9 @@ test("Rust routes DeepSeek voice through the current visible composer, not bound
   assert.match(body("agent_uses_visible_composer"), /"deepseek-harness"/);
   assert.match(body("should_use_current_visible_session"), /matches!\(agent_id,[^\n]*"deepseek-harness"/);
   assert.match(body("device_voice_bound_target_is_addressable"),
-    /!matches!\(target\.agent_id\.as_str\(\), "workbuddy" \| "devin" \| "deepseek-harness"\)/);
+    /!matches!\(target\.agent_id\.as_str\(\), "workbuddy" \| "devin" \| "deepseek-harness"(?: \| "[^"]+")*\)/);
   assert.match(body("agent_streams_voice_draft"),
-    /!matches!\(agent_id, "workbuddy" \| "devin" \| "deepseek-harness"\)/);
+    /!matches!\(agent_id, "workbuddy" \| "devin" \| "deepseek-harness"(?: \| "[^"]+")*\)/);
 });
 
 test("DSH interrupt action is wired end to end and gated by selected agent", () => {

@@ -41,6 +41,7 @@ static pet_h264_packed_view_t g_h264_packed_current;
 static int g_h264_presented_frame=-1;
 static uint64_t g_h264_first_presented_ms;
 static bool g_h264_tail_confirmed;
+static bool g_h264_rgb_cached=true;
 static char g_h264_presented_path[80];
 static bool g_h264_reset_requested;
 static void *g_h264_decoder;
@@ -97,7 +98,7 @@ int main(int argc,char**argv){
   g_clip_entry.decoder_readers=1;
   assert(!renderer_ext_clip_retire());assert(!unpins&&g_clip_lease.token==17&&g_clip_entry.bytes==encoded);
   g_clip_entry.decoder_readers=0;assert(pet_prefetch_complete(g_h264_prefetch_job.ticket,false));
-  assert(renderer_ext_clip_retire());assert(unpins==1&&finishes==1&&!g_clip_lease.token&&!g_clip_entry.bytes);return 0;
+  assert(renderer_ext_clip_retire());assert(!g_h264_rgb_cached);assert(unpins==1&&finishes==1&&!g_clip_lease.token&&!g_clip_entry.bytes);return 0;
  }
  assert(pet_prefetch_complete(g_h264_prefetch_job.ticket,true));
  pet_surface_node_t n={.x=10,.y=20,.w=2,.h=2,.color=0x1234};renderer_ext_draw_clip(&n,2000);

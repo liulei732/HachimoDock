@@ -5,7 +5,7 @@ const TRANSFER_BUSY = 'device transfer busy; volume not submitted';
 const percent = v => Number.isInteger(v) && v >= 0 && v <= 100;
 
 export function createDeviceVolumeController({invoke,onState=()=>{},wait=ms=>new Promise(resolve=>setTimeout(resolve,ms))}) {
-  let state={...EMPTY_VOLUME_STATE}, target=null, generation=0, disposed=false;
+  let state={...EMPTY_VOLUME_STATE}, target=null, generation=0, disposed=false, visible=true;
   const publish = patch => {state={...state,...patch};onState({...state});};
   const current = serial => !disposed && serial===generation;
   const valid = (reply,board) => reply?.ok===true && reply.engine===MASTER_VOLUME_ENGINE && reply.boardDeviceId===board && percent(reply.volume) && typeof reply.persisted==='boolean';
@@ -48,17 +48,26 @@ export function createDeviceVolumeController({invoke,onState=()=>{},wait=ms=>new
   }
   return {
     getSnapshot:()=>({...state}),
-    setTarget(value) {
+    setTarget(value, active=true) {
       if (disposed) {disposed=false;target=null;}
       const key=JSON.stringify([value?.connected,value?.boardDeviceId,value?.bootId,value?.connectionId,value?.portName,value?.engine,value?.runtime]);
-      if (key===target?.key) return Promise.resolve(false);
+      const wasVisible=visible;
+      visible=active;
+      if (key===target?.key) {
+        if (!visible && state.loading) {
+          generation++;
+          publish({busy:false, loading:false, waitingForTransfer:false});
+        }
+        if (visible && !wasVisible && target.available) return request();
+        return Promise.resolve(false);
+      }
       generation++;
       const connected=value?.connected===true && Boolean(value.boardDeviceId);
       const supported=value?.runtime==='esp-p4' && value?.engine===MASTER_VOLUME_ENGINE;
       target={key,boardDeviceId:value?.boardDeviceId||'',available:connected&&supported};
       state={...EMPTY_VOLUME_STATE,available:target.available,reason:!connected?'请先连接设备':supported?'':'更新设备固件后可调节总音量'};
       onState({...state});
-      return target.available ? request() : Promise.resolve(false);
+      return target.available && visible ? request() : Promise.resolve(false);
     },
     refresh:()=>request(),
     setDraft(value) {if(percent(value)&&state.known&&!state.busy)publish({draft:value});},

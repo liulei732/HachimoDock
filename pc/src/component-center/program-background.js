@@ -32,8 +32,23 @@ export function backgroundSnapshot(value){
   });
   return Object.freeze({bootId:value.bootId,items:Object.freeze(items)});
 }
-export function createProgramBackgroundController({board,invoke,onChange=()=>{}}){
+export function wirelessMaintenanceTarget(wifi) {
+  const target=wifi?.componentTarget;
+  if (wifi?.controlTrusted!==true || wifi.wifiConnected!==true || wifi.componentBundle!==true || !target
+      || target.capabilities?.widgetMaintenance!=='paired-component-maintenance-v1'
+      || target.boardDeviceId!==wifi.boardDeviceId || !/^p4-[a-f0-9]{12}$/.test(wifi.boardDeviceId)
+      || target.bootId!==wifi.bootId || !bootValid(target.bootId)
+      || !integer(target.association) || target.association===0) return null;
+  return target;
+}
+export function createProgramBackgroundController({board,invoke,maintenanceTarget,onChange=()=>{}}){
   if(!idValid(board)||typeof invoke!=='function')throw Error('invalid_background_owner');
+  const scope=maintenanceTarget?{maintenanceTarget:Object.freeze({...maintenanceTarget})}:{};
+  function readSnapshot(value){
+    const snapshot=backgroundSnapshot(value);
+    if(scope.maintenanceTarget && snapshot.bootId!==scope.maintenanceTarget.bootId)throw Error("background_owner_changed");
+    return snapshot;
+  }
   let alive=true,token={},reading=null,pending=false,state=BACKGROUND_IDLE;
   const publish=value=>{if(alive){state=Object.freeze(value);onChange(state);}return state;};
   const ready=()=>alive&&!pending&&!reading&&state.status==='ready'&&state.snapshot;
@@ -43,8 +58,8 @@ export function createProgramBackgroundController({board,invoke,onChange=()=>{}}
     if(reading)return reading;
     const current=token;
     publish({...state,checking:true});
-    reading=Promise.resolve().then(()=>invoke('usb_get_background_programs',{expectedBoardDeviceId:board})).then(value=>{
-      const snapshot=backgroundSnapshot(value);
+    reading=Promise.resolve().then(()=>invoke('usb_get_background_programs',{expectedBoardDeviceId:board,...scope})).then(value=>{
+      const snapshot=readSnapshot(value);
       if(alive&&current===token)publish({status:'ready',snapshot,pending:false,checking:false,code:''});
     }).catch(()=>{
       if(alive&&current===token)publish({...state,status:'error',checking:false,code:'query_unavailable'});
@@ -56,12 +71,12 @@ export function createProgramBackgroundController({board,invoke,onChange=()=>{}}
     if(action==='stop'&&(!observed||!bootValid(observed.bootId)||!serialValid(observed.registration)
       ||state.snapshot.bootId!==observed.bootId||!state.snapshot.items.some(row=>row.widgetId===id&&row.registration===observed.registration)))throw Error('background_owner_changed');
     const current=token={};pending=true;publish({...state,pending:true,code:''});
-    const payload={expectedBoardDeviceId:board,componentId:id,...(action==='stop'?{bootId:observed.bootId,registration:observed.registration}:{})};
+    const payload={...scope,expectedBoardDeviceId:board,componentId:id,...(action==='stop'?{bootId:observed.bootId,registration:observed.registration}:{})};
     try{
       const result=await invoke(action==='start'?'usb_start_background_program':'usb_stop_background_program',payload);
       let snapshot;
       if(result?.confirmed===true){
-        snapshot=backgroundSnapshot(result.snapshot);
+        snapshot=readSnapshot(result.snapshot);
         const row=snapshot.items.find(row=>row.widgetId===id);
         if(action==='start'?!row?.live||row.stopped:!row?.stopped||row.live||snapshot.bootId!==observed.bootId||row.registration!==observed.registration)throw Error('unconfirmed_background_owner');
       }

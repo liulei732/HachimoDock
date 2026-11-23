@@ -4,8 +4,10 @@ export const NATIVE_CANVAS = "640x480-v1";
 export const HOST_PROFILE = "hachi-host-v1";
 export const AUDIO_PROFILE = "hachi-audio-v2";
 export const MAX_WASM_BYTES = 192 * 1024;
+export const NETWORK_PROFILE = "component-network-v1";
+const networkImports = ["service_submit", "service_poll", "service_read", "service_release"];
 const hostImports = ["clock_read", "uv_read", "random_u32"];
-const allowedImports = new Set(["canvas640", "text", "rect", "blit", "sprite", "tone", "sample", "load", "save", "media_cmd", ...hostImports]);
+const allowedImports = new Set(["canvas640", "text", "rect", "blit", "sprite", "tone", "sample", "load", "save", "media_cmd", ...hostImports, ...networkImports]);
 const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 export function checkProfile(bytes) {
@@ -69,6 +71,8 @@ export async function createRuntime(bytes, initialSave = {}, host = {}) {
       exported.some(item => expectedExports.get(item.name) !== item.kind)) {
     throw new Error("组件导出的入口无效");
   }
+  const networkProfile = networkImports.some(name => names.has(name)) ? NETWORK_PROFILE : undefined;
+  let serviceCalls = 0;
   let pixels, texts, tones, saves, operations, area, textWork, frame;
   let sampleEvent, cue, music;
   const slots = {};
@@ -95,6 +99,20 @@ export async function createRuntime(bytes, initialSave = {}, host = {}) {
     output.setInt32(8, sample?.value ?? 0, true);
     output.setUint32(12, sample?.age ?? 0, true);
     return sample?.status ?? 0;
+  }
+  function serviceRange(ptr, length, maximum) {
+    const memory = instance.exports.memory.buffer.byteLength;
+    if (ptr < 0 || length <= 0 || length > maximum || ptr > memory || length > memory - ptr) return false;
+    return ++serviceCalls <= 8;
+  }
+  function mockResult(value) { return (value | 0) === value ? value : -3; }
+  function serviceOutput(ptr, capacity, value, terminated) {
+    if (value == null) return 0;
+    if (!(value instanceof Uint8Array) || value.length > capacity - (terminated ? 1 : 0)) return -5;
+    const out = new Uint8Array(instance.exports.memory.buffer, ptr, capacity);
+    out.set(value);
+    if (terminated) out[value.length] = 0;
+    return value.length;
   }
   const instance = await WebAssembly.instantiate(module, { hachi: {
     canvas640() {},
@@ -195,6 +213,22 @@ export async function createRuntime(bytes, initialSave = {}, host = {}) {
         tones.push({ hz, ms, volume });
       }
     },
+    service_submit(ptr, length) {
+      if (!serviceRange(ptr, length, 8192)) return -3;
+      return host.services ? mockResult(host.services.submit(new Uint8Array(instance.exports.memory.buffer, ptr, length).slice())) : -1;
+    },
+    service_poll(ptr, capacity) {
+      if (!serviceRange(ptr, capacity, 512)) return -3;
+      return host.services ? serviceOutput(ptr, capacity, host.services.poll(capacity), true) : -1;
+    },
+    service_read(handle, offset, ptr, capacity) {
+      if (!serviceRange(ptr, capacity, 4096)) return -3;
+      return host.services ? serviceOutput(ptr, capacity, host.services.read(handle >>> 0, offset >>> 0, capacity), false) : -1;
+    },
+    service_release(handle) {
+      if (++serviceCalls > 8) return -3;
+      return host.services ? mockResult(host.services.release(handle >>> 0)) : -1;
+    },
     load(slot, fallback) {
       return slot >= 0 && slot < 8 ? slots[slot] ?? fallback : fallback;
     },
@@ -216,7 +250,7 @@ export async function createRuntime(bytes, initialSave = {}, host = {}) {
     sampleEvent = type === "frame" || (type === "event" && [1, 3, 4].includes(args[0]));
     cue = music = undefined;
     pixels = []; texts = []; tones = []; saves = [];
-    operations = 0; area = 0; textWork = 0; frame = type === "frame";
+    serviceCalls = 0; operations = 0; area = 0; textWork = 0; frame = type === "frame";
     const entry = { init: "hachi_init", event: "hachi_event", frame: "hachi_frame" }[type];
     if (!entry) throw new Error("未知组件事件");
     const before = { ...slots };
@@ -227,7 +261,7 @@ export async function createRuntime(bytes, initialSave = {}, host = {}) {
       Object.assign(slots, before);
       throw error;
     }
-    return { hostProfile, audioProfile, cue, music, pixels, texts, tones, saves, width: screenWidth, height: screenHeight, frame, init: type === "init" };
+    return { hostProfile, audioProfile, networkProfile, cue, music, pixels, texts, tones, saves, width: screenWidth, height: screenHeight, frame, init: type === "init" };
   }
   return run;
 }

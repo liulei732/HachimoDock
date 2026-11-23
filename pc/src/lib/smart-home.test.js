@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { visibleDevices, stepLabel, parsePropertyValue, HOME_STATUSES } from "./smart-home.js";
 test("home guidance explains realtime voice, examples and spoken confirmation", () => {
   const page = readFileSync(new URL("../SmartHome.jsx", import.meta.url), "utf8");
-  for (const text of ["切换到「实时对话」", "播放一首爵士乐", "换一首歌", "5 步以内", "无需在本页点击"]) assert.ok(page.includes(text));
+  for (const text of ["进入「实时对话」", "播放一首爵士乐", "换一首歌", "5 步以内的明确指令直接执行", "超过 5 步或保存常用任务", "直接说「确认」或「取消」"]) assert.ok(page.includes(text));
   assert.ok(!page.includes("轻量单步操作直接执行，编排任务确认后执行"));
 });
 test("home filtering uses home ID, not ambiguous names", () => {
@@ -13,7 +13,9 @@ test("home filtering uses home ID, not ambiguous names", () => {
   assert.equal(visibleDevices(devices, "", "卧室", "speaker").length, 1);
 });
 test("value parsing preserves false and rejects blank/non-numeric numbers", () => {
-  assert.equal(parsePropertyValue({ format: "bool" }, "false"), false);
+  for (const v of ["false", false, "0", 0]) assert.equal(parsePropertyValue({ format: "bool" }, v), false);
+  for (const v of ["true", true, "1", 1]) assert.equal(parsePropertyValue({ format: "bool" }, v), true);
+  for (const v of ["", "disable?", null]) assert.throws(() => parsePropertyValue({ format: "bool" }, v));
   assert.equal(parsePropertyValue({ format: "uint8" }, "20"), 20);
   for (const v of ["", "nan", "Infinity"]) assert.throws(() => parsePropertyValue({ format: "uint8" }, v));
 });
@@ -22,4 +24,14 @@ test("receipt language distinguishes acceptance from verified state", () => {
   assert.match(HOME_STATUSES.verified, /核验/);
   assert.equal(stepLabel({ kind: "wait", seconds: 2 }), "等待 2 秒");
   assert.match(stepLabel({ kind: "set", did: "1", siid: 2, piid: 1, value: false }, [{ did: "1", name: "音箱" }]), /音箱.*false/);
+});
+
+test("partial execution keeps confirmed, uncertain and unsent steps distinct after restart", async () => {
+  const {executionRows} = await import("./smart-home.js");
+  const steps = ["a", "b", "c"].map(did => ({kind:"set", did}));
+  const results = [{step:steps[0], result:{status:"verified"}}];
+  const rows = executionRows({status:"unconfirmed", steps, results, inFlight:steps[1]});
+  assert.deepEqual(rows.map(r => r.result.status), ["verified", "unconfirmed", "not_sent"]);
+  assert.equal(results.length, 1);
+  assert.deepEqual(executionRows({status:"completed", results}), results);
 });

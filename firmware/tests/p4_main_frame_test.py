@@ -13,6 +13,11 @@ FLAG='PET_P4_H264_WORKER_PACK'
 CHAIN=['PET_P4_APP_DIRTY_CACHE','PET_P4_APP_CLEAR_OPAQUE_CENTER','PET_P4_APP_COLD_FAST','PET_P4_APP_PPA_COPY']
 RTOS_FORBIDDEN=('TASK_PRIORITY','F_CPU','BUDGET_US','WATCHDOG','AFFINITY','CONFIG_')
 
+def pack_handoff(renderer):
+    state = renderer[renderer.index('static atomic_uint g_h264_pack_offered;'):
+                     renderer.index('g_h264_pack_slow_joins;') + len('g_h264_pack_slow_joins;')]
+    return state + '\n' + function(renderer, 'h264_pack_claim') + '\n' + function(renderer, 'h264_pack_rows_joined')
+
 def _cc(args,src):
     return subprocess.run(['cc','-std=c11','-fsyntax-only','-I',str(ROOT/'main'),*args,str(src)],capture_output=True,text=True)
 
@@ -72,7 +77,7 @@ def test_worker_pack_structure_keeps_phases_buffers_and_fallback_in_place():
     for forbidden in ('vTaskPrioritySet','heap_caps','malloc(','vTaskDelay','portENTER_CRITICAL','g_h264_packed_current','g_framebuffer'):
         assert forbidden not in pack,forbidden
     # Same half/half split with the existing pack task and the same row kernel, joined before publication.
-    assert pack.index('g_h264_pack_job=primary;')<pack.index('xTaskNotifyGive(g_h264_pack_task);')<pack.index('pack_h264_i420_rows(&primary);')<pack.index('xSemaphoreTake(g_h264_pack_done,portMAX_DELAY);')<pack.index('job->packed_ok=true;')
+    assert pack.index('h264_pack_rows_joined(primary, false)') < pack.index('job->packed_ok=true;')
     assert 'required>job->packed_capacity' in pack and 'resolve_h264_i420_layout(job->width,job->height,job->output_size,&stride,&storage_h)' in pack
     # Worker: pack only after an authoritative decode, before any decoder reset or lease finish.
     worker=function(inc,'h264_prefetch_worker')
@@ -99,8 +104,8 @@ def test_worker_pack_structure_keeps_phases_buffers_and_fallback_in_place():
     assert 'g_metrics.lifetime.worker_packs=g_worker_packs;' in record and 'g_metrics.lifetime.worker_pack_max_us=g_worker_pack_max_us;' in record
     # The original render-thread pack job and its boost are untouched.
     original=function(renderer,'pack_h264_i420_for_ppa')
-    assert original.index('xTaskNotifyGive(')<original.index('xSemaphoreTake(g_h264_pack_done, portMAX_DELAY)')<original.index('*packed =')
-    assert 'pet_p4_render_can_boost' in original
+    assert original.index('h264_pack_rows_joined(primary_job, true)') < original.index('*packed =')
+    assert 'render_caller && pet_p4_render_can_boost' in function(renderer, 'h264_pack_rows_joined')
     # No task, priority, clock or watchdog policy changes anywhere in the touched sources.
     for path in ('main/pet_p4_h264_prefetch.inc','main/pet_p4_render_policy.h','main/pet_p4_render_lifetime.h'):
         text=(ROOT/path).read_text()
@@ -113,6 +118,9 @@ def test_worker_pack_is_byte_exact_against_reference_and_original_i420_pixels_in
 #include "pet_p4_h264_pack_word.h"
 #include <assert.h>
 #include <limits.h>
+#include <stdatomic.h>
+#include "pet_p4_render_lifetime.h"
+#include "pet_p4_task_policy.h"
 #include <stdlib.h>
 #include <string.h>
 #define PET_P4_UI_WIDTH 640
@@ -135,9 +143,19 @@ static int64_t esp_timer_get_time(void){return clock_us+=7;}
 static uint32_t elapsed_us_clamped(int64_t from,int64_t to){return to>=from?(uint32_t)(to-from):0;}
 static void actual_pack_rows(const pet_p4_h264_pack_job_t *job);
 static void pack_h264_i420_rows(const pet_p4_h264_pack_job_t *job){rows_packed+=(unsigned)(job->row_end-job->row_begin);actual_pack_rows(job);}
-static void xTaskNotifyGive(TaskHandle_t task){assert(task==g_h264_pack_task&&!pack_given);split_packs++;pack_h264_i420_rows(&g_h264_pack_job);pack_given=true;}
+#define ESP_TASK_MAIN_PRIO 1U
+#define PET_P4_H264_PACK_TASK_PRIORITY 8U
+#define pdMS_TO_TICKS(ms) (ms)
+#define ESP_LOGW(...) ((void)0)
+#define ESP_LOGD(...) ((void)0)
+typedef int BaseType_t;
+#define uxTaskPriorityGet(task) 1U
+#define vTaskPrioritySet(task, priority) assert(0)
+static void h264_pack_claim(void);
+static void xSemaphoreGive(SemaphoreHandle_t sem){assert(sem==g_h264_pack_done);pack_given=true;}
+static void xTaskNotifyGive(TaskHandle_t task){assert(task==g_h264_pack_task);split_packs++;h264_pack_claim();}
 static int xSemaphoreTake(SemaphoreHandle_t sem,unsigned timeout){assert(sem==g_h264_pack_done);if(pack_given){pack_given=false;return pdTRUE;}assert(timeout==0);return pdFALSE;}
-'''+function(renderer,'clamp_u8')+function(renderer,'resolve_h264_i420_layout')+function(renderer,'pack_h264_i420_rows').replace('pack_h264_i420_rows(','actual_pack_rows(',1)+function(renderer,'scale_h264_frame_cpu')+function(inc,'scale_h264_packed_cpu')+function(inc,'h264_worker_pack')+r'''
+'''+pack_handoff(renderer)+function(renderer,'clamp_u8')+function(renderer,'resolve_h264_i420_layout')+function(renderer,'pack_h264_i420_rows').replace('pack_h264_i420_rows(','actual_pack_rows(',1)+function(renderer,'scale_h264_frame_cpu')+function(inc,'scale_h264_packed_cpu')+function(inc,'h264_worker_pack')+r'''
 static void independent_reference(const uint8_t *i420,int w,int stride,int storage_h,uint8_t *dest){
  const uint8_t *py=i420,*pu=i420+(size_t)stride*storage_h,*pv=pu+(size_t)stride*storage_h/4;
  for(int row=0;row<storage_h;row++){
@@ -164,7 +182,7 @@ int main(void){
    free(source);free(packed);free(expected);continue;
   }
   assert(job.packed_ok&&job.packed_stride==stride&&job.packed_storage_h==storage_h&&job.pack_us>0);
-  assert(split_packs==splits+(mode?1:0)&&rows_packed==(unsigned)storage_h&&!pack_given);
+  assert(split_packs==splits+(mode?1:0)&&rows_packed==(unsigned)storage_h&&!atomic_load(&g_h264_pack_offered));
   memset(expected,0x5a,capacity+64);independent_reference(source,w,stride,storage_h,expected);
   assert(!memcmp(packed,expected,capacity+64)); /* exact bytes; nothing beyond `required` touched */
   pet_h264_packed_view_t view={0};assert(pet_h264_packed_view_init(&view,packed,capacity,(size_t)w*3/2,w,h,storage_h));
@@ -202,6 +220,7 @@ def test_actual_adapter_with_worker_pack_alternates_buffers_never_packs_on_the_r
         'pet_p4_renderer_set_asset_preparation_suspended','reset_h264_decoder','reset_h264_decoder_traced',
         'start_h264_decoder_role','decode_next_h264_frame_role'))
     functions+='\n'+function(source,'pack_h264_i420_rows').replace('pack_h264_i420_rows(','actual_pack_rows(',1)
+    functions+='\n'+pack_handoff(source)
     harness=(ROOT/'tests/p4_main_frame_adapter_test.c').read_text()
     assert harness.count('/* ACTUAL_DECLARATIONS */')==1 and harness.count('/* ACTUAL_FUNCTIONS */')==1
     code=harness.replace('/* ACTUAL_DECLARATIONS */',declarations).replace('/* ACTUAL_FUNCTIONS */',functions)
@@ -210,3 +229,93 @@ def test_actual_adapter_with_worker_pack_alternates_buffers_never_packs_on_the_r
       *[f'-D{d}=1' for d in CHAIN],'-DPET_P4_H264_PREFETCH=1',f'-D{FLAG}=1',
       '-I',str(ROOT/'main'),str(src),str(ROOT/'main/pet_p4_resources.c'),'-o',str(binary)],check=True)
     subprocess.run([str(binary)],check=True,timeout=35)
+
+
+def test_join_reclaims_only_unclaimed_rows_and_holds_a_running_generation(tmp_path):
+    from p4_h264_prefetch_test import compile_run
+    renderer = (ROOT / 'main/pet_p4_renderer.c').read_text()
+    # A real concurrent claim can pause inside the row kernel. Drive all
+    # interleavings with a condition variable, without timing assumptions.
+    compile_run(tmp_path, r'''
+#include <assert.h>
+#include <limits.h>
+#include <stdatomic.h>
+#include <pthread.h>
+#include <string.h>
+#include "pet_p4_render_lifetime.h"
+#include "pet_p4_task_policy.h"
+#define ESP_TASK_MAIN_PRIO 1
+#define PET_P4_H264_PACK_TASK_PRIORITY 8
+#define pdTRUE 1
+#define pdMS_TO_TICKS(ms) (ms)
+#define ESP_LOGW(...) (++warnings)
+#define ESP_LOGD(...) ((void)0)
+typedef int BaseType_t;
+typedef struct { int row_begin, row_end; int *rows; } pet_p4_h264_pack_job_t;
+static pet_p4_h264_pack_job_t g_h264_pack_job;
+static int g_h264_pack_done = 1, g_h264_pack_task = 2;
+static unsigned priority = 1, waits, warnings, mode;
+static bool entered, release_worker;
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
+static pthread_t thread;
+static int64_t now;
+static int64_t esp_timer_get_time(void) { return now; }
+static uint32_t elapsed_us_clamped(int64_t a, int64_t b) { return b-a; }
+static unsigned uxTaskPriorityGet(void *t) { assert(!t); return priority; }
+static void vTaskPrioritySet(void *t, unsigned p) { assert(!t); priority = p; }
+static void xSemaphoreGive(int sem) { assert(sem == g_h264_pack_done); }
+static void h264_pack_claim(void);
+static void *run_worker(void *p) { (void)p; h264_pack_claim(); return NULL; }
+static void pack_h264_i420_rows(const pet_p4_h264_pack_job_t *job) {
+  if (mode == 2 && job->row_begin) {
+    pthread_mutex_lock(&lock);
+    entered = true;
+    pthread_cond_signal(&changed);
+    while (!release_worker) pthread_cond_wait(&changed, &lock);
+    pthread_mutex_unlock(&lock);
+  }
+  for (int row = job->row_begin; row < job->row_end; row++) job->rows[row]++;
+}
+static void xTaskNotifyGive(int task) {
+  assert(task == g_h264_pack_task);
+  assert(priority == (mode == 1 ? ESP_TASK_MAIN_PRIO : PET_P4_H264_PACK_TASK_PRIORITY));
+  if (mode == 1) h264_pack_claim();
+  if (mode == 2) {
+    pthread_mutex_lock(&lock);
+    assert(!pthread_create(&thread, NULL, run_worker, NULL));
+    while (!entered) pthread_cond_wait(&changed, &lock);
+    pthread_mutex_unlock(&lock);
+  }
+}
+static int xSemaphoreTake(int sem, unsigned timeout) {
+  assert(sem == g_h264_pack_done && timeout == 100 && mode == 2);
+  if (++waits == 1) return pdTRUE; // previous generation's semaphore token
+  now += 100000;
+  if (waits == 2) return 0; // still inside row kernel, no permission to reuse
+  assert(waits == 3 && warnings == 1);
+  pthread_mutex_lock(&lock);
+  release_worker = true;
+  pthread_cond_signal(&changed);
+  pthread_mutex_unlock(&lock);
+  assert(!pthread_join(thread, NULL));
+  return 0; // matching generation is visible even if the give was lost
+}
+''' + pack_handoff(renderer) + r'''
+int main(void) {
+  g_h264_pack_generation = UINT_MAX-1;
+  for (mode = 0; mode <= 2; mode++) {
+    int rows[6] = {0};
+    h264_pack_rows_joined((pet_p4_h264_pack_job_t){0, 6, rows}, mode != 1);
+    assert(priority == ESP_TASK_MAIN_PRIO);
+    for (int i = 0; i < 6; i++) assert(rows[i] == 1);
+    h264_pack_claim(); // old unconsumed notification cannot touch these rows
+    for (int i = 0; i < 6; i++) assert(rows[i] == 1);
+    assert(g_h264_pack_takeovers == 1);
+    assert(waits == (mode == 2 ? 3 : 0));
+  }
+  assert(g_h264_pack_generation == 1 && g_h264_pack_slow_joins == 1);
+  assert(warnings == 2 && g_h264_pack_max_wait_us == 200000);
+  return 0;
+}
+''', 'pack-join')

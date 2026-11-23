@@ -11,8 +11,8 @@ ROOT=Path(__file__).resolve().parents[1]
 
 @pytest.fixture(scope='module',params=[0,1],ids=['atomic-rename','sealed-inplace'])
 def binary(tmp_path_factory,request):
-    # The host harness tests catalog behavior independently of the target-only size option.
-    code=(ROOT/'main/pet_p4_miniapp.c').read_text().replace(' __attribute__((optimize("Oz")))', '')
+    # Clang compiles the same loader body without GCC's per-function size tuning.
+    code=(ROOT/'main/pet_p4_miniapp.c').read_text().replace('__attribute__((optimize("Oz"))) ', '')
     source=_mutation_source(False)
     source=source.replace('int name=0','int name __attribute__((unused))=0')
     source=source.replace('assert(!held&&commits);','assert(!held&&g_catalog_sequence==21&&!g_catalog_recovery_blocked);')

@@ -11,6 +11,7 @@ def test_slot_query_io_and_tx_release_state_lock_with_exact_owner(tmp_path):
     main = (ROOT / 'main/pet_p4_main.c').read_text()
     code = r'''
 #include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -51,8 +52,9 @@ static pet_p4_native_io_snapshot_t pet_p4_native_usb_io_snapshot(void){assert(he
 static bool pet_p4_miniapp_storage_busy(void){assert(held);return false;}
 static bool pet_p4_ota_transfer_active(void){assert(held);return false;}
 static bool pet_p4_diagnostics_reboot_pending(void){assert(held);return false;}
+static bool simulate_read_error;
 static bool read_ready_slot_pack_id(int slot,char *out,size_t size){
- assert(!held);reads++;assert(size==65);memset(out,'a',64);out[64]=0;return slot==0;
+ assert(!held);reads++;assert(size==65);memset(out,'a',64);out[64]=0;if(slot==1 && simulate_read_error)errno=EAGAIN;return slot==0;
 }
 static pet_resource_result_t pet_resources_device_owner_open(uint32_t m,pet_resource_owner_t*out){assert(held);return pet_resources_owner_open(&broker,m,out);}
 static pet_resource_result_t pet_resources_device_acquire(pet_resource_owner_t o,pet_resource_kind_t k,uint32_t u,pet_resource_lease_t*out){assert(held);return pet_resources_try_acquire(&broker,o,k,u,out);}
@@ -109,6 +111,10 @@ int main(void){
  // A changed slot while unlocked invalidates publication; no stale success.
  change_slot=true;send_asset_slot_query_ack(&state,request,tx,(void*)123,"same-transfer");
  assert(held&&rejected==1&&sends==1&&reads==4);change_slot=false;g_asset_active_slot=0;no_resources_leaked();
+ simulate_read_error=true;
+ send_asset_slot_query_ack(&state,request,tx,(void*)123,"same-transfer");
+ assert(held&&rejected==2&&sends==1&&!state.asset_transfer_active);no_resources_leaked();
+ simulate_read_error=false;
  cJSON_Delete(request);
  // Payload/array OOM closes BOTH IO borrows and releases actual STORAGE_WORK.
  for(unsigned fail=1;fail<=2;fail++){
@@ -118,7 +124,7 @@ int main(void){
   assert(held&&reads==old_reads&&unlocked==old_unlocks+2&&locked==unlocked&&!state.asset_transfer_active&&!live);
   no_resources_leaked();cJSON_InitHooks(NULL);
  }
- assert(sends==1&&rejected==2);return 0;
+ assert(sends==1&&rejected==3);return 0;
 }
 '''
     src=tmp_path/'slot_query.c';binary=tmp_path/'slot_query';src.write_text(code)

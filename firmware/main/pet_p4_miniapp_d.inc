@@ -1,5 +1,25 @@
 /* D-only parser/effect hooks. Included after the production JSON helpers.
  * Queues belong to the current native runtime; no background grants or retry. */
+#if PET_P4_SYSTEM_WIFI
+#include "pet_p4_runtime_events.h"
+static uint64_t runtime_event_view(void) {
+  return ((uint64_t)g_image_revision << 32) | g_input_epoch;
+}
+bool pet_p4_miniapp_runtime_event_current(uint64_t view) {
+  if (!g_runtime_mutex || xSemaphoreTakeRecursive(g_runtime_mutex,0)!=pdTRUE) return false;
+  const bool current=g_runtime.active && g_input_visible && runtime_event_view()==view;
+  miniapp_runtime_unlock();
+  return current;
+}
+#endif
+#if PET_P4_NOTIFY || PET_P4_DATA_ROWS
+static bool miniapp_emit_runtime_event(const char *topic,const cJSON *payload) {
+#if PET_P4_SYSTEM_WIFI
+  if (pet_p4_runtime_wireless()) return pet_p4_runtime_emit(topic,payload,runtime_event_view());
+#endif
+  return pet_app_host_emit(topic,payload);
+}
+#endif
 #if PET_P4_NOTIFY
 static pet_notify_limiter_t g_d_notify_limiter;
 static bool miniapp_parse_notify(miniapp_runtime_t *r,const cJSON *root){
@@ -39,7 +59,7 @@ static void miniapp_d_drain_locked(bool visible){
     g_runtime.notice_pending=false;
     if(visible&&g_runtime.active){
       const pet_notify_t *n=&g_runtime.notice;cJSON *p=cJSON_CreateObject();
-      if(p){cJSON_AddStringToObject(p,"componentId",n->component);cJSON_AddStringToObject(p,"title",n->title);if(n->has_badge)cJSON_AddNumberToObject(p,"badge",n->badge);pet_app_host_emit("widget/notify",p);cJSON_Delete(p);}
+      if(p){cJSON_AddStringToObject(p,"componentId",n->component);cJSON_AddStringToObject(p,"title",n->title);if(n->has_badge)cJSON_AddNumberToObject(p,"badge",n->badge);miniapp_emit_runtime_event("widget/notify",p);cJSON_Delete(p);}
     }
   }
 #endif
@@ -52,7 +72,7 @@ static void miniapp_d_drain_locked(bool visible){
     } else
 #endif
     if(visible&&g_runtime.active){
-      cJSON *p=cJSON_CreateObject();if(p){cJSON_AddStringToObject(p,"componentId",g_runtime.widget_id);cJSON_AddStringToObject(p,"source",g_runtime.data_source);pet_app_host_emit("widget/data/refresh",p);cJSON_Delete(p);}
+      cJSON *p=cJSON_CreateObject();if(p){cJSON_AddStringToObject(p,"componentId",g_runtime.widget_id);cJSON_AddStringToObject(p,"source",g_runtime.data_source);miniapp_emit_runtime_event("widget/data/refresh",p);cJSON_Delete(p);}
     }
   }
 #endif

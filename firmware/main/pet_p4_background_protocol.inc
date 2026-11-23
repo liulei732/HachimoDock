@@ -34,7 +34,8 @@ static bool background_boot_current(const cJSON *p){
   for(unsigned i=0;i<16;i++)if(!((requested[i]>='0'&&requested[i]<='9')||(requested[i]>='a'&&requested[i]<='f')))return false;
   return !strcmp(requested,current);
 }
-static bool handle_background_program_topic(pet_p4_runtime_state_t *state,const char *topic,const cJSON *p,pet_p4_send_line_fn send,void *ctx){
+cJSON *pet_p4_background_program_reply(pet_p4_runtime_state_t *state,const char *topic,const cJSON *p,
+    bool (*start_program)(const char *,const uint32_t *,uint64_t *,char *,size_t)) {
   bool query=!strcmp(topic,"widget/program-query"),start=!strcmp(topic,"widget/program-start"),stop=!strcmp(topic,"widget/program-stop");
   bool inspect=!strcmp(topic,"widget/program-inspect");
   char error[160]={0};bool ok=(query||start||stop||inspect)&&background_fields(p,start,stop,inspect);
@@ -44,42 +45,50 @@ static bool handle_background_program_topic(pet_p4_runtime_state_t *state,const 
   if(!ok)copy_text(error,sizeof(error),"invalid background control fields");
   else if((start||stop)&&!background_boot_current(p)){ok=false;copy_text(error,sizeof(error),"background boot changed; request not applied");}
   else if(!pet_p4_miniapp_background_available()){ok=false;copy_text(error,sizeof(error),"background capability unavailable");}
-  else if(start)ok=pet_p4_miniapp_background_start(json_string(p,"widgetId"),content,&registration,error,sizeof(error));
+  else if(start)ok=start_program(json_string(p,"widgetId"),content,&registration,error,sizeof(error));
   else if(stop)ok=pet_p4_miniapp_background_stop(json_string(p,"widgetId"),registration,error,sizeof(error));
   else if(inspect){ok=pet_p4_miniapp_background_content(json_string(p,"widgetId"),content);if(!ok)copy_text(error,sizeof(error),"verified installed content unavailable");}
   cJSON *out=cJSON_CreateObject(),*items=cJSON_CreateArray();
-  if(!out||!items){cJSON_Delete(out);cJSON_Delete(items);return false;}
+  if(!out||!items){cJSON_Delete(out);cJSON_Delete(items);return NULL;}
   bool complete=cJSON_AddBoolToObject(out,"ok",ok)
     &&cJSON_AddStringToObject(out,"requestId",background_fields(p,start,stop,inspect)?json_string(p,"requestId"):"")
     &&cJSON_AddStringToObject(out,"boardDeviceId",state?state->board_device_id:"")
     &&cJSON_AddStringToObject(out,"engine",PET_P4_MINIAPP_BACKGROUND_ENGINE)
     &&cJSON_AddStringToObject(out,"bootId",pet_p4_boot_identity());
-  if(!complete||(error[0]&&!cJSON_AddStringToObject(out,"error",error))){cJSON_Delete(out);cJSON_Delete(items);return false;}
+  if(!complete||(error[0]&&!cJSON_AddStringToObject(out,"error",error))){cJSON_Delete(out);cJSON_Delete(items);return NULL;}
   if(inspect&&ok){
     cJSON *identity=cJSON_CreateObject();char checksums[3][9];
-    if(!identity){cJSON_Delete(out);cJSON_Delete(items);return false;}
+    if(!identity){cJSON_Delete(out);cJSON_Delete(items);return NULL;}
     for(unsigned i=0;i<3;i++)snprintf(checksums[i],sizeof(checksums[i]),"%08x",content[i]);
     complete=cJSON_AddStringToObject(identity,"widgetId",json_string(p,"widgetId"))
       &&cJSON_AddStringToObject(identity,"widgetChecksum",checksums[0])
       &&cJSON_AddStringToObject(identity,"buttonsChecksum",checksums[1])
       &&cJSON_AddStringToObject(identity,"spritesChecksum",checksums[2]);
-    if(!complete||!cJSON_AddItemToObject(out,"installedContent",identity)){cJSON_Delete(identity);cJSON_Delete(out);cJSON_Delete(items);return false;}
+    if(!complete||!cJSON_AddItemToObject(out,"installedContent",identity)){cJSON_Delete(identity);cJSON_Delete(out);cJSON_Delete(items);return NULL;}
   }
   pet_p4_miniapp_background_status_t status[PET_P4_MINIAPP_BACKGROUND_MAX];
   size_t entries=pet_p4_miniapp_background_list(status);
-  if(entries>PET_P4_MINIAPP_BACKGROUND_MAX){cJSON_Delete(out);cJSON_Delete(items);return false;}
+  if(entries>PET_P4_MINIAPP_BACKGROUND_MAX){cJSON_Delete(out);cJSON_Delete(items);return NULL;}
   for(size_t i=0;i<entries;i++){
     const pet_p4_miniapp_background_status_t *s=&status[i];cJSON *item=cJSON_CreateObject();
-    if(!item){cJSON_Delete(out);cJSON_Delete(items);return false;}
+    if(!item){cJSON_Delete(out);cJSON_Delete(items);return NULL;}
     char serial[24];snprintf(serial,sizeof(serial),"%llu",(unsigned long long)s->registration);
     complete=cJSON_AddStringToObject(item,"widgetId",s->widget_id)&&cJSON_AddStringToObject(item,"registration",serial)
       &&cJSON_AddBoolToObject(item,"live",s->live)&&cJSON_AddBoolToObject(item,"stopped",s->stopped)
       &&cJSON_AddBoolToObject(item,"checkpointPending",s->checkpoint_pending)&&cJSON_AddNumberToObject(item,"revision",s->revision)
       &&cJSON_AddNumberToObject(item,"phase",s->phase)&&cJSON_AddNumberToObject(item,"lastStepUs",s->last_step_us)&&cJSON_AddNumberToObject(item,"maxStepUs",s->max_step_us);
-    if(!complete||!cJSON_AddItemToArray(items,item)){cJSON_Delete(item);cJSON_Delete(out);cJSON_Delete(items);return false;}
+    if(!complete||!cJSON_AddItemToArray(items,item)){cJSON_Delete(item);cJSON_Delete(out);cJSON_Delete(items);return NULL;}
   }
   /* Never publish a partial/empty success if allocation failed after a real
    * mutation. Missing receipt stays unknown; the client must not replay it. */
-  if(!cJSON_AddItemToObject(out,"items",items)){cJSON_Delete(out);cJSON_Delete(items);return false;}
-  send_topic_payload(send,ctx,"widget/program-status",out);return ok;
+  if(!cJSON_AddItemToObject(out,"items",items)){cJSON_Delete(out);cJSON_Delete(items);return NULL;}
+  return out;
+}
+
+static bool handle_background_program_topic(pet_p4_runtime_state_t *state,const char *topic,const cJSON *p,pet_p4_send_line_fn send,void *ctx) {
+  cJSON *reply = pet_p4_background_program_reply(state, topic, p, pet_p4_miniapp_background_start);
+  if (!reply) return false;
+  bool ok = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(reply, "ok"));
+  send_topic_payload(send,ctx,"widget/program-status",reply);
+  return ok;
 }

@@ -103,7 +103,10 @@ def data(root,r,art,todos):
     s['elements']+=hint(muted,paper,('回首页','first_page','SW1'))
     s['elements'].append(text('摇杆左右翻页',218,451,260,24,13,muted))
     r['surface']=s;r['dashboard'].update(visualStyle='clean',footer='主键回首页 · 摇杆左右翻页 · 全局键退出')
-    return ('1.1.0','显示真实近期待办，蓝色为未完成、绿色为已完成；日期不显示年份，可在设备触屏或摇杆翻页。',91) if todos else ('1.1.0','显示电脑提供的真实运行状态，支持设备触屏或摇杆翻页；断连或数据失效时明确提示。',91)
+    if todos:
+        return '1.1.0','显示真实近期待办，蓝色为未完成、绿色为已完成；日期不显示年份，可在设备触屏或摇杆翻页。',91
+    manifest=json.loads((root/'component.json').read_text())
+    return manifest['version'],manifest['description'],91
 def build(output,art):
     if output.exists() and any(output.iterdir()):raise ValueError('Use empty output directory')
     output.mkdir(parents=True,exist_ok=True);reports=[]
