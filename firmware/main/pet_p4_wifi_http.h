@@ -73,9 +73,9 @@ static inline bool pet_wifi_http_no_store(const char *value) {
   return false;
 }
 
-static inline bool pet_wifi_http_response(pet_wifi_http_read_t read, void *ctx, char *body,
+static inline bool pet_wifi_http_response_bytes(pet_wifi_http_read_t read, void *ctx, char *body,
                                          size_t limit, size_t *length, const char *sent_etag,
-                                         pet_wifi_http_metadata_t *metadata) {
+                                         pet_wifi_http_metadata_t *metadata, bool binary) {
   char line[1024];
   size_t budget = 4096, content_length = 0;
   bool chunked = false, has_length = false, has_encoding = false, has_etag = false;
@@ -145,12 +145,17 @@ static inline bool pet_wifi_http_response(pet_wifi_http_read_t read, void *ctx, 
       if (!pet_wifi_http_line(read, ctx, line, sizeof(line), &budget)) return false;
     } while (*line);
   }
-  if (!used || memchr(body, 0, used)) return false;
+  if (!used || (!binary && memchr(body, 0, used))) return false;
   body[used] = 0; /* Caller reserves limit + 1 bytes. */
   *length = used;
   return true;
 }
 
+
+static inline bool pet_wifi_http_response(pet_wifi_http_read_t read, void *ctx, char *body,
+    size_t limit, size_t *length, const char *etag, pet_wifi_http_metadata_t *metadata) {
+  return pet_wifi_http_response_bytes(read,ctx,body,limit,length,etag,metadata,false);
+}
 
 static inline bool pet_wifi_http_body(pet_wifi_http_read_t read, void *ctx, char *body,
                                       size_t limit, size_t *length) {

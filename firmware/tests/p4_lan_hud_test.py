@@ -23,6 +23,8 @@ static pet_p4_runtime_state_t state;
 static int rtc_hud_mux;
 static uint32_t rtc_hud_generation;
 static uint64_t now;
+static unsigned played;
+static unsigned pet_p4_audio_stream_played_bytes(void) { return played; }
 #define portENTER_CRITICAL(p) ((void)(p))
 #define portEXIT_CRITICAL(p) ((void)(p))
 ''' + checks + offer + process + r'''
@@ -115,6 +117,26 @@ int main(void) {
   payload(1,"generation-5","pending");assert(rtc_hud_offer(frame));
   rtc_hud_process(&state,++now,false,5); // Forget/USB/offline before worker cleanup.
   assert(!pet_p4_conversation_active(&state)&&!rtc_hud.live);
+  pet_lan_rtc_header(header,0,9,0,520);assert(rtc_wire_check_header(header,0)==544);
+  header[3]--;assert(!rtc_wire_check_header(header,0));
+  pet_lan_hud_begin(&rtc_hud);
+  payload(0,"timed","");assert(rtc_hud_offer(frame));
+  pet_lan_hud_turn(&rtc_hud,1);
+  char one[512]="first", two[512]="second";
+  assert(pet_lan_hud_cue(&rtc_hud,1,0,one));
+  assert(!pet_lan_hud_cue(&rtc_hud,1,1,two));
+  assert(pet_lan_hud_cue(&rtc_hud,1,960,two));
+  assert(!pet_lan_hud_cue(&rtc_hud,1,640,two));
+  rtc_hud_process(&state,++now,true,5);
+  assert(!state.conversation_history_count); // Waiting for slow TTS / DAC startup.
+  played=640;rtc_hud_process(&state,++now,true,5);assert(!strcmp(state.conversation_text,"first"));
+  played=960;rtc_hud_process(&state,++now,true,5);assert(state.conversation_history_count==1);
+  played=1280;rtc_hud_process(&state,++now,true,5);assert(!strcmp(state.conversation_text,"second"));
+  for(unsigned i=0;i<PET_P4_CONVERSATION_CUES_MAX;i++) assert(pet_lan_hud_cue(&rtc_hud,1,2000,two));
+  assert(!pet_lan_hud_cue(&rtc_hud,1,2000,two));
+  pet_lan_hud_turn(&rtc_hud,0);pet_lan_hud_turn(&rtc_hud,2);
+  assert(!pet_lan_hud_cue(&rtc_hud,1,0,one));
+  played=3000;rtc_hud_process(&state,++now,true,5);assert(state.conversation_history_count==2);
   puts("HUD production frame/state lifecycle passed");
 }
 '''
@@ -143,9 +165,10 @@ def test_actual_pc_rtc_pump_preparation_terminal_order_and_old_peer(tmp_path):
 #![allow(dead_code)]
 mod lan_agent { pub mod realtime {
   use std::{net::TcpStream,sync::Mutex};
-  pub struct AudioTarget {pub stream:Mutex<Option<TcpStream>>,pub hud:bool}
+  pub struct AudioTarget {pub stream:Mutex<Option<TcpStream>>,pub hud:bool,pub timed:bool}
   impl AudioTarget {
     pub fn hud_supported(&self)->bool{self.hud}
+    pub fn timed_captions(&self)->bool{self.timed}
     pub fn boot_matches(&self,boot:&str)->bool{boot=="boot-test"}
     pub fn is_idle(&self)->bool{true}
     pub fn open(&self)->Result<(TcpStream,zeroize::Zeroizing<[u8;16]>),String>{
@@ -186,18 +209,18 @@ fn production_pump_hud_lifecycle() {
       let tag=key.seal_in_place_separate_tag(nonce(2,*seq),Aad::from(h),&mut[]).unwrap();*seq+=1;
       peer.write_all(&h).unwrap();peer.write_all(tag.as_ref()).unwrap();
     }
-    fn pair(cap:bool)->(Arc<Session>,TcpStream){
+    fn pair(hud:bool,timed:bool)->(Arc<Session>,TcpStream){
       let l=TcpListener::bind("127.0.0.1:0").unwrap();let stream=TcpStream::connect(l.local_addr().unwrap()).unwrap();
       stream.set_read_timeout(Some(Duration::from_millis(8))).unwrap();
       let(mut peer,_)=l.accept().unwrap();peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
       let(tx,_rx)=std::sync::mpsc::sync_channel(128);
-      let s=Arc::new(Session{id:"rtc-socket-test".into(),wifi:Some(Link::new(AudioTarget{stream:Mutex::new(Some(stream)),hud:cap})),
+      let s=Arc::new(Session{id:"rtc-socket-test".into(),wifi:Some(Link::new(AudioTarget{stream:Mutex::new(Some(stream)),hud,timed})),
         capture_ready:AtomicBool::new(false),input:tx,completed_playback:Mutex::new(String::new()),failed:AtomicBool::new(false)});
       *super::ACTIVE.get_or_init(||Mutex::new(None)).lock().unwrap()=Some(s.clone());(s,peer)
     }
     fn payload(state:&str)->serde_json::Value{serde_json::json!({"sessionId":"rtc-socket-test","state":state,"name":"小西","text":"测试"})}
     for active in [false,true] {
-      let(s,mut peer)=pair(true);let mut rx=0;let mut tx=0;
+      let(s,mut peer)=pair(true,true);let mut rx=0;let mut tx=0;
       Link::hud(&s,&payload("preparing")).unwrap();
       let(k,b)=receive(&mut peer,&mut rx);assert_eq!(k,7);assert_eq!(b[0],0);reply(&mut peer,2,&mut tx);
       let link=s.wifi.as_ref().unwrap();assert!(!link.activate.load(Ordering::Acquire));
@@ -208,6 +231,23 @@ fn production_pump_hud_lifecycle() {
           Link::hud(&s,&payload(phase)).unwrap();
           loop{let(k,b)=receive(&mut peer,&mut rx);reply(&mut peer,2,&mut tx);if k==7{assert_eq!(b[0],code);break;}assert_eq!(k,2);}
         }
+        link.playback(Playback::Begin,"a",&[]).unwrap();
+        link.subtitle("a",0,"first").unwrap();
+        link.playback(Playback::Pcm,"a",&[47;640]).unwrap();
+        for kind in [4,9,1] {
+          let(k,b)=receive(&mut peer,&mut rx);assert_eq!(k,kind);assert_eq!(&b[..4],&1u32.to_be_bytes());
+          if k==9 {assert_eq!(b.len(),520);assert_eq!(&b[4..14],b"\0\0\0\0first\0");}
+          if k==1 {assert_eq!(&b[4..],&[47;640]);}
+        }
+        link.playback(Playback::Flush,"a",&[]).unwrap();
+        link.playback(Playback::Flush,"a",&[]).unwrap();
+        assert!(link.playback(Playback::Pcm,"a",&[1;640]).is_err());
+        link.playback(Playback::Begin,"b",&[]).unwrap();
+        link.subtitle("b",320,"next").unwrap();
+        for (kind,turn) in [(6,1u32),(4,2),(9,2)] {
+          let(k,b)=receive(&mut peer,&mut rx);assert_eq!(k,kind);assert_eq!(&b[..4],&turn.to_be_bytes());
+          if k==9 {assert_eq!(&b[4..8],&320u32.to_be_bytes());}
+        }
       }
       link.finish_hud(&payload(if active{"error"}else{"ended"}));
       loop{let(k,b)=receive(&mut peer,&mut rx);if k==7{assert_eq!(b[0],if active{5}else{4});break;}assert_eq!(k,2);reply(&mut peer,2,&mut tx);}
@@ -215,7 +255,36 @@ fn production_pump_hud_lifecycle() {
       let until=Instant::now()+Duration::from_secs(1);while !link.stopped()&&Instant::now()<until{thread::sleep(Duration::from_millis(5));}
       assert!(link.stopped());assert!(!s.failed.load(Ordering::Acquire));
     }
-    let(s,_peer)=pair(false);Link::hud(&s,&payload("preparing")).unwrap();
+    let(s,mut peer)=pair(true,false);let mut rx=0;let mut tx=0;
+    Link::hud(&s,&payload("preparing")).unwrap();
+    assert_eq!(receive(&mut peer,&mut rx).0,7);reply(&mut peer,2,&mut tx);
+    let link=s.wifi.as_ref().unwrap();
+    assert!(!link.timed_captions());
+    assert!(link.subtitle("old",0,"must use HUD").is_err());
+    Link::hud(&s,&payload("speaking")).unwrap();
+    assert_eq!(receive(&mut peer,&mut rx).0,7);
+    link.finish_hud(&payload("ended"));
+    assert_eq!(receive(&mut peer,&mut rx).0,7);
+    assert_eq!(receive(&mut peer,&mut rx).0,3);reply(&mut peer,3,&mut tx);
+    // Hold the consumer so queue admission and flush priority are deterministic.
+    let(s,_peer)=pair(true,true);let link=s.wifi.as_ref().unwrap();
+    link.state.store(RUNNING,Ordering::Release);
+    link.playback(Playback::Begin,"stalled",&[]).unwrap();
+    let frames=vec![99;PCM*(PLAYBACK_QUEUE_FRAMES-4)];
+    link.playback(Playback::Pcm,"stalled",&frames).unwrap();
+    assert!(link.playback(Playback::Pcm,"stalled",&[8;2*PCM]).is_err());
+    assert_eq!(link.turn.lock().unwrap().pending.len(),PLAYBACK_QUEUE_FRAMES-3);
+    link.subtitle("stalled",0,"one").unwrap();
+    assert!(link.playback(Playback::Pcm,"stalled",&[3;PCM]).is_err());
+    link.playback(Playback::End,"stalled",&[]).unwrap(); // Reserved turn boundary.
+    assert!(link.subtitle("stalled",0,"after end").is_err());
+    link.playback(Playback::Flush,"stalled",&[]).unwrap();
+    assert!(link.turn.lock().unwrap().pending.is_empty());
+    link.playback(Playback::Begin,"next",&[]).unwrap();
+    assert!(link.playback(Playback::Flush,"stalled",&[]).is_err());
+    assert!(link.subtitle("stalled",0,"late").is_err());
+    assert_eq!(link.turn.lock().unwrap().pending.len(),1);
+    let(s,_peer)=pair(false,false);Link::hud(&s,&payload("preparing")).unwrap();
     let link=s.wifi.as_ref().unwrap();assert_eq!(link.state.load(Ordering::Acquire),IDLE);
     assert!(link.hud.lock().unwrap().is_empty()); // Old peer never receives unknown kind 7.
 }
@@ -273,6 +342,8 @@ static uint32_t rtc_hud_generation;
 static struct {int fd;uint32_t generation,ptt;uint8_t handshake_key[16],media_key[16];
   int capture_lock;unsigned head,count;uint8_t queue[8][640];} rtc_wire;
 static unsigned mode, starts,stops,closed,deleted,offers,selects;
+static unsigned step, begins, frames, flushes;
+static const unsigned script[]={4,9,1,5,6,6,1,4,9,9,1,3};
 static int64_t clock_us;
 static bool ota_wire_trusted(uint32_t g){return g==1;}
 static int64_t esp_timer_get_time(void){return clock_us+=1000;}
@@ -283,6 +354,7 @@ static void mbedtls_platform_zeroize(void*p,size_t n){memset(p,0,n);}
 static bool send_sealed_response(int f,mbedtls_gcm_context*g,const uint8_t*h,uint8_t*w,uint8_t*b,size_t n,int64_t d){(void)f;(void)g;(void)h;(void)w;(void)b;(void)n;(void)d;return true;}
 static unsigned rtc_wire_receive_start(int f,mbedtls_gcm_context*g,uint8_t*w,uint8_t*b,uint32_t*s,int64_t d){
   (void)f;(void)g;(void)w;(void)b;(void)s;(void)d;
+  if(mode==3 && !offers){memset(b,0,644);memcpy(b+4,"rtc-script",11);return 7;}
   if(mode==0){atomic_store(&usb_client_active,true);return 7;}return PET_LAN_RTC_KEEPALIVE;
 }
 static bool rtc_hud_offer(const uint8_t*b){offers++;return pet_lan_hud_offer(&rtc_hud,b);}
@@ -298,23 +370,41 @@ static int pet_p4_audio_wifi_start(void(*tap)(void),void*c,pet_p4_audio_wifi_ses
 static bool pet_p4_audio_wifi_live(pet_p4_audio_wifi_session_t s){return s==1;}
 static int pet_p4_audio_wifi_stop(pet_p4_audio_wifi_session_t s){assert(s==1);stops++;return 0;}
 static uint32_t pet_p4_audio_wifi_take_drained_turn(pet_p4_audio_wifi_session_t s){(void)s;return 0;}
-static int pet_p4_audio_wifi_play(pet_p4_audio_wifi_session_t s,uint32_t t,int k,const uint8_t*b,size_t n){(void)s;(void)t;(void)k;(void)b;(void)n;return 0;}
+static int pet_p4_audio_wifi_play(pet_p4_audio_wifi_session_t s,uint32_t t,int k,const uint8_t*b,size_t n){
+  assert(s==1 && mode==3);
+  if(k==PET_P4_AUDIO_WIFI_PLAY_BEGIN){assert(t==++begins&&!rtc_hud.cue_count);}
+  if(k==PET_P4_AUDIO_WIFI_PLAY_FLUSH){++flushes;assert(!rtc_hud.cue_count);}
+  if(k==PET_P4_AUDIO_WIFI_PLAY_FRAME){
+    ++frames;assert(n==640 && b[0]==t && rtc_hud.cue_count==1);
+    assert(rtc_hud.cues[rtc_hud.cue_head].offset_bytes==320*t);
+  }
+  return 0;
+}
 static bool rtc_wire_send(int f,mbedtls_gcm_context*g,uint8_t*w,uint32_t*s,unsigned k,unsigned flags,uint8_t*b,size_t n){(void)f;(void)g;(void)w;(void)s;(void)k;(void)flags;(void)b;(void)n;return true;}
 static size_t rtc_wire_seal(mbedtls_gcm_context*g,uint8_t*w,uint32_t*s,unsigned k,unsigned flags,uint8_t*b,size_t n){(void)g;(void)w;(void)s;(void)k;(void)flags;(void)b;(void)n;return 0;}
 static unsigned rtc_wire_take(uint8_t*b,bool wait){(void)b;(void)wait;return 0;}
 static void ota_wire_put_u32(uint8_t*b,uint32_t n){(void)b;(void)n;}
-static uint32_t ota_wire_u32(const uint8_t*b){(void)b;return 0;}
+static uint32_t ota_wire_u32(const uint8_t*b){return ((uint32_t)b[2]<<8)|b[3];}
 static bool rtc_wire_retry_io(void){return false;}
-static size_t rtc_wire_check_header(const uint8_t*w,uint32_t s){(void)w;(void)s;return 0;}
-static unsigned rtc_wire_open(mbedtls_gcm_context*g,uint8_t*w,uint8_t*b,uint32_t*s,size_t n){(void)g;(void)w;(void)b;(void)s;(void)n;return 0;}
+static size_t rtc_wire_check_header(const uint8_t*w,uint32_t s){(void)w;(void)s;return 24;}
+static unsigned rtc_wire_open(mbedtls_gcm_context*g,uint8_t*w,uint8_t*b,uint32_t*s,size_t n){
+  (void)g;(void)w;(void)s;(void)n;
+  assert(step<sizeof(script)/sizeof(script[0]));
+  const unsigned kind=script[step];
+  const unsigned turn=(step<7 || step==8)?1:2; // Step 8 replays an old caption.
+  memset(b,0,644);b[3]=turn;
+  if(kind==9){unsigned offset=320*turn;b[6]=offset>>8;b[7]=offset;memcpy(b+8,"cue",4);}
+  if(kind==1)b[4]=turn;
+  ++step;return kind;
+}
 static bool socket_io(int f,uint8_t*b,size_t n,bool w,int64_t d){(void)f;(void)b;(void)n;(void)w;(void)d;return true;}
 static void vTaskDelay(int t){(void)t;assert(!"HUD must not sleep");}
 static void vTaskDelete(void*p){(void)p;deleted++;}
 static void vSemaphoreDelete(int s){(void)s;}
 static int fake_close(int f){(void)f;closed++;return 0;}
-static int fake_select(int n,fd_set*r,fd_set*w,fd_set*e,struct timeval*t){(void)n;(void)r;(void)w;(void)e;(void)t;selects++;atomic_store(&usb_client_active,true);return 0;}
+static int fake_select(int n,fd_set*r,fd_set*w,fd_set*e,struct timeval*t){(void)n;(void)r;(void)w;(void)e;(void)t;selects++;if(mode==3)return 1;atomic_store(&usb_client_active,true);return 0;}
 static int fake_send(int f,const uint8_t*b,size_t n,int flags){(void)f;(void)b;(void)n;(void)flags;assert(false);return 0;}
-static int fake_recv(int f,uint8_t*b,size_t n,int flags){(void)f;(void)b;(void)n;(void)flags;assert(false);return 0;}
+static int fake_recv(int f,uint8_t*b,size_t n,int flags){(void)f;(void)flags;assert(mode==3);memset(b,0,n);return (int)n;}
 #define close fake_close
 #define select fake_select
 #define send fake_send
@@ -334,6 +424,11 @@ int main(void){
   uint8_t late[644]={0};memcpy(late+4,"old-lan",8);assert(!pet_lan_hud_offer(&rtc_hud,late));
   pet_p4_conversation_clear(&state);
  }
+ mode=3;starts=stops=closed=deleted=offers=selects=0;
+ atomic_store(&usb_client_active,false);atomic_store(&rtc_wire_busy,true);
+ rtc_wire_task(NULL);
+ assert(atomic_load(&rtc_wire_last_exit)==0 && !atomic_load(&rtc_wire_busy));
+ assert(offers==1 && begins==2 && frames==2 && flushes==1 && starts==1 && stops==1);
  puts("RTC passive, activation and active-loop USB takeover release passed");
 }
 '''

@@ -1,6 +1,6 @@
 /**
  * [Input] Detected local coding agents, persisted appearance records, and localStorage bridge assignment state.
- * [Output] Fixed Agent display ordering, explicit first-run selection, shared per-channel appearance mapping, and single active desktop-channel helpers used by setup, dashboard, and gallery.
+ * [Output] Fixed Agent display ordering including read-only Antigravity, explicit first-run selection, shared per-channel appearance mapping, and single active desktop-channel helpers used by setup, dashboard, and gallery.
  * [Pos] lib node in pc/src/lib
  * [Sync] If this file changes, update `pc/src/.folder.md` and consumers that persist agent assignments.
  */
@@ -31,6 +31,11 @@ export const FIXED_AGENT_OPTIONS = [
     id: "mimocode",
     label: "MiMo Desktop / MiMoCode",
     detail: "跟随小米 MiMo 桌面应用和 MiMoCode 的会话状态",
+  },
+  {
+    id: "antigravity",
+    label: "Antigravity",
+    detail: "跟随 Antigravity 的会话状态与气泡",
   },
   {
     id: "claude-code",
@@ -94,7 +99,7 @@ export function pickFirstDetectedAgentId(agents = [], preferredAgentId = "") {
     );
     if (preferred) return preferred.id;
   }
-  return agents.find((agent) => agent.detected)?.id || "";
+  return agents.find((agent) => agent.detected && agent.id !== "antigravity")?.id || "";
 }
 
 export function defaultAgentAppearanceMap(records = []) {
@@ -170,7 +175,7 @@ export function activeDesktopAssignment(agentAppearanceMap, enabledAgents = null
   }
 
   const [agentId = "", appearanceId = ""] =
-    Object.entries(agentAppearanceMap || {}).find(([, id]) => Boolean(id)) || [];
+    Object.entries(agentAppearanceMap || {}).find(([id, appearance]) => id !== "antigravity" && Boolean(appearance)) || [];
   return { agentId, appearanceId: appearanceId || (agentId ? BUILTIN_TERRIER_APPEARANCE_ID : "") };
 }
 

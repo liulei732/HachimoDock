@@ -54,9 +54,9 @@ export async function fetchAgentSessions(agentId, signal) {
   return Array.isArray(body?.sessions) ? body.sessions : [];
 }
 
-export async function fetchAgentSessionEvents(agentId, cursor, streamId, signal) {
+export async function fetchAgentSessionEvents(agentId, cursor, streamId, signal, limit = 100) {
   if (!agentId) return { cursor: 0, streamId: "", reset: false, events: [] };
-  const params = new URLSearchParams({ agentId, limit: "100" });
+  const params = new URLSearchParams({ agentId, limit: String(limit) });
   if (Number.isFinite(cursor)) params.set("cursor", String(cursor));
   if (streamId) params.set("streamId", streamId);
   const body = await fetchAgentBusJson(

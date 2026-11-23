@@ -332,8 +332,22 @@ pub(crate) fn inspect_firmware_image(
     path: &std::path::Path,
     target: super::firmware_chip::P4ChipTarget,
 ) -> Result<FirmwareImageInfo, String> {
-    let firmware = std::fs::read(path)
-        .map_err(|error| format!("read firmware {}: {error}", path.display()))?;
+    let (info, _) = read_firmware_image(path, target)?;
+    Ok(info)
+}
+
+pub(crate) fn read_firmware_image(
+    path: &std::path::Path,
+    target: super::firmware_chip::P4ChipTarget,
+) -> Result<(FirmwareImageInfo, Vec<u8>), String> {
+    use std::io::Read;
+    if !path.is_file() {
+        return Err("请选择有效的固件文件。".into());
+    }
+    let file = std::fs::File::open(path).map_err(|_| "无法打开固件文件。")?;
+    let mut firmware = Vec::new();
+    file.take((P4_FIRMWARE_MAX_IMAGE_SIZE + 1) as u64)
+        .read_to_end(&mut firmware).map_err(|_| "无法读取固件文件。")?;
     if firmware.is_empty() || firmware.len() > P4_FIRMWARE_MAX_IMAGE_SIZE {
         return Err(format!(
             "firmware image must be 1..={} bytes, got {}",
@@ -344,12 +358,12 @@ pub(crate) fn inspect_firmware_image(
     let range = super::firmware_chip::firmware_chip_range(&firmware)?;
     super::firmware_chip::validate_firmware_chip(range, target)?;
     let descriptor = parse_esp_idf_app_descriptor(&firmware)?;
-    Ok(FirmwareImageInfo {
+    Ok((FirmwareImageInfo {
         version: descriptor.version,
         project_name: descriptor.project_name,
         bytes: firmware.len() as u64,
         sha256: Sha256::digest(&firmware).into(),
-    })
+    }, firmware))
 }
 
 pub(super) fn evaluate_firmware_validation(

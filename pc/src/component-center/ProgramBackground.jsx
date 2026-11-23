@@ -1,27 +1,31 @@
 import React,{createContext,useContext,useEffect,useRef,useState} from 'react';
 import {invoke} from '@tauri-apps/api/core';
 import Button from '../shell/Button';
-import {BACKGROUND_IDLE,createProgramBackgroundController,supportsBackgroundPrograms,supportsBackgroundProgramEngine} from './program-background.js';
+import {BACKGROUND_IDLE,createProgramBackgroundController,supportsBackgroundPrograms,supportsBackgroundProgramEngine,wirelessMaintenanceTarget} from './program-background.js';
 import {AUTOSTART_IDLE,PROGRAM_AUTOSTART_NOTICE,createProgramAutostartController,programAutostartMessage,supportsProgramAutostart} from './program-autostart.js';
 import './program-background.css';
 const Context=createContext(null);
-export function ProgramBackgroundProvider({usb,active=true,children,request=invoke}){
+export function ProgramBackgroundProvider({usb,wifi,active=true,children,request=invoke}){
   const [state,setState]=useState(BACKGROUND_IDLE),owner=useRef(null);
   const [autostart,setAutostart]=useState(AUTOSTART_IDLE),autoOwner=useRef(null),connection=useRef(null);
-  const board=String(usb?.boardDeviceId||'');
-  const eligible=Boolean(active&&usb?.connected&&usb?.runtime==='esp-p4'&&supportsBackgroundPrograms(usb?.capabilities));
-  const autoEligible=eligible&&supportsProgramAutostart(usb?.capabilities);
-  const boot=String(usb?.capabilities?.debugBootId||'');
+  const target=usb?.connected?null:wirelessMaintenanceTarget(wifi);
+  const caps=target?.capabilities||usb?.capabilities;
+  const board=String(target?.boardDeviceId||usb?.boardDeviceId||'');
+  const boot=String(target?.bootId||usb?.capabilities?.debugBootId||'');
+  const association=target?.association||0;
+  const route=association?'wifi-'+association:'usb-'+(usb?.connectionId||'');
+  const eligible=Boolean(active&&(target||(usb?.connected&&usb.runtime==='esp-p4'))&&supportsBackgroundPrograms(caps));
+  const autoEligible=eligible&&!target&&supportsProgramAutostart(caps);
   useEffect(()=>{
     setState(BACKGROUND_IDLE);setAutostart(AUTOSTART_IDLE);
     if(!eligible){owner.current=null;autoOwner.current=null;connection.current=null;return undefined;}
-    const controller=createProgramBackgroundController({board,invoke:request,onChange:setState});owner.current=controller;
+    const controller=createProgramBackgroundController({board,invoke:request,maintenanceTarget:association?{bootId:boot,association}:undefined,onChange:setState});owner.current=controller;
     const auto=autoEligible?createProgramAutostartController({invoke:request,onChange:setAutostart}):null;
-    autoOwner.current=auto;connection.current={owner:auto,background:controller,board,hint:boot};
+    autoOwner.current=auto;connection.current={owner:auto,background:controller,board,hint:boot,route};
     void controller.refresh();
     if(auto)void auto.refresh();
     return()=>{controller.dispose();auto?.dispose();if(owner.current===controller)owner.current=null;if(autoOwner.current===auto)autoOwner.current=null;};
-  },[board,boot,eligible,autoEligible,request]);
+  },[board,boot,route,association,eligible,autoEligible,request]);
   // Scheduling belongs to the native connection owner, regardless of this
   // page's visibility. Mount/refresh/enable NEVER issue observe or start IPC.
   useEffect(()=>{
@@ -32,11 +36,11 @@ export function ProgramBackgroundProvider({usb,active=true,children,request=invo
   },[eligible,state,autostart.pending]);
   const currentBackground=()=>{
     const current=owner.current,binding=connection.current;
-    if(!current||binding?.background!==current||binding.board!==board||binding.hint!==boot)throw Error('background_owner_changed');
+    if(!current||binding?.background!==current||binding.board!==board||binding.hint!==boot||binding.route!==route)throw Error('background_owner_changed');
     return current;
   };
   const currentAuto=()=>{currentBackground();const current=autoOwner.current;if(!current||connection.current?.owner!==current)throw Error('autostart_owner_changed');return current;};
-  const value=eligible?{state,board,capabilities:usb.capabilities,maxActive:usb.capabilities.widgetProgramBackgroundMaxActive,
+  const value=eligible?{state,board,capabilities:caps,maxActive:caps.widgetProgramBackgroundMaxActive,
     refresh:()=>Promise.allSettled([owner.current?.refresh(),autoOwner.current?.refresh()]),
     start:id=>{const current=currentBackground();if(autoOwner.current?.getState().pending)throw Error('background_state_not_ready');return current.start(id);},
     stop:async(id,observed)=>{

@@ -25,9 +25,38 @@ export async function readGlobalAudioCues(){
   if(!await exists(mapPath,options))return {};
   return validateMap(JSON.parse(await readTextFile(mapPath,options)));
 }
-export function globalAudioRevision(){return globalThis.localStorage?.getItem(dirtyKey)||'';}
-export function globalAudioDirty(){return Boolean(globalAudioRevision());}
-export function markGlobalAudioDirty(dirty,expected){if(dirty)globalThis.localStorage?.setItem(dirtyKey,(globalThis.crypto?.randomUUID?.()||`${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`));else if(expected===undefined||expected===globalAudioRevision())globalThis.localStorage?.removeItem(dirtyKey);}
+// Keep the previous dirty token as the content revision when upgrading. A legacy
+// installation without a token has no record of which board received its sounds.
+const receiptPrefix = 'pet-manager.global-audio-cues-receipt.';
+const listeners = new Set();
+function notify() { for (const listener of listeners) listener(); }
+export function subscribeGlobalAudio(listener) {
+  const onStorage = ({key}) => {
+    if (key === null || key === dirtyKey || key.startsWith(receiptPrefix)) listener();
+  };
+  listeners.add(listener);
+  globalThis.addEventListener?.('storage', onStorage);
+  return () => {
+    listeners.delete(listener);
+    globalThis.removeEventListener?.('storage', onStorage);
+  };
+}
+export function globalAudioRevision() { return globalThis.localStorage?.getItem(dirtyKey) || 'initial'; }
+export function globalAudioDirty(boardDeviceId) {
+  if (!boardDeviceId) return globalAudioRevision() !== 'initial';
+  return globalThis.localStorage?.getItem(receiptPrefix + boardDeviceId) !== globalAudioRevision();
+}
+export function confirmGlobalAudio(boardDeviceId, revision) {
+  if (!boardDeviceId || revision !== globalAudioRevision()) return false;
+  globalThis.localStorage?.setItem(receiptPrefix + boardDeviceId, revision);
+  notify();
+  return true;
+}
+function advanceRevision() {
+  const revision = globalThis.crypto?.randomUUID?.() || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  globalThis.localStorage?.setItem(dirtyKey, revision);
+  notify();
+}
 async function saveCue(family,bytes){
   familyCheck(family);
   if(!(bytes instanceof Uint8Array)||bytes.length<44||bytes.length>1048576+4096)throw new Error('提示音大小不符合要求');
@@ -37,13 +66,18 @@ async function saveCue(family,bytes){
   const path=`${dir}/${family}.wav`;
   await writeFile(`${path}.tmp`,bytes,options);
   await rename(`${path}.tmp`,path,{oldPathBaseDir:BaseDirectory.AppLocalData,newPathBaseDir:BaseDirectory.AppLocalData});
-  overrides[family]=path;
-  await writeMap(overrides);markGlobalAudioDirty(true);
+  // Replacing an existing WAV commits at rename. Only a new override needs
+  // a map write before the audio loader can see it.
+  if (overrides[family] !== path) {
+    overrides[family]=path;
+    await writeMap(overrides);
+  }
+  advanceRevision();
 }
 async function removeCue(family){
   familyCheck(family);const overrides=await readGlobalAudioCues();const path=overrides[family];
   delete overrides[family];await mkdir(GLOBAL_AUDIO_DIR,{...options,recursive:true});
-  await writeMap(overrides);markGlobalAudioDirty(true);
+  await writeMap(overrides);advanceRevision();
   if(path)await remove(path,options).catch(()=>{});
 }
 export async function readGlobalAudioCue(family){
@@ -74,7 +108,7 @@ async function migrateCues(){
     await rename(`${path}.tmp`,path,{oldPathBaseDir:BaseDirectory.AppLocalData,newPathBaseDir:BaseDirectory.AppLocalData});
     migrated[family]=path;
   }
-  await writeMap(migrated);markGlobalAudioDirty(true);
+  await writeMap(migrated);advanceRevision();
 }
 
 export function saveGlobalAudioCue(family,bytes){return transaction(()=>saveCue(family,bytes));}

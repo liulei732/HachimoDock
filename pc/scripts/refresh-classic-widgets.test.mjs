@@ -34,8 +34,16 @@ test("pomodoro skip isn't completion; pause and real completion behave correctly
 test("token pages preserve bridge variables and honest empty state",{skip:!root},()=>{
   const r=load("token-usage");let s=initialApp(r);
   assert.equal(appDashboard(r,s).metricValue,"—");
+  assert.equal(appDashboard(r,s).headline,"等待用量统计");
   Object.assign(s.vars,{total_display:"120",input_display:"80",output_display:"40"});
   for(const [action,expected] of [["stats.show_total","120"],["stats.show_input","80"],["stats.show_output","40"]]){
     s=appAction(r,s,action);assert.equal(appDashboard(r,s).metricValue,expected);
   }
+  const buttons=JSON.parse(fs.readFileSync(path.join(root,"token-usage/buttons.json"),"utf8"));
+  s=appAction(r,s,buttons.find(b=>b.event==="knob.rotate_cw").action);
+  assert.equal(s.page,"total");assert.equal(appDashboard(r,s).metricValue,"120");
+  s=appAction(r,s,r.input.swipe.right);assert.equal(s.page,"output");
+  s=appAction(r,s,appHit(r.surface,appPage(r,s),220,400,s.vars));
+  assert.equal(s.page,"input");assert.equal(appDashboard(r,s).metricValue,"80");
+  assert.ok(r.surface.elements.some(node=>node.text==="左右翻页"));
 });

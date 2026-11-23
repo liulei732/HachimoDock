@@ -6,6 +6,7 @@
     "host.record": "record",
     "host.save": "save",
     "host.todo": "todo",
+    "host.delete": "delete",
     "host.tasks": "tasks",
     "host.toggle": "toggle",
     "host.filter": "filter",

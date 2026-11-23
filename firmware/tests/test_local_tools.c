@@ -12,12 +12,15 @@ int main(int argc,char **argv){
  assert(pet_local_tick(&c,&s,v,ms,now));
  if(!c.countdown){
   for(int group=0;group<c.count;group++){
-   v[0]=group;int last=-1;uint64_t reached=0;unsigned seed=0x12345678;
+   v[0]=group;int last=-1;uint64_t cycle=0,reached=0;unsigned seed=0x12345678;
    for(int i=0;i<512;i++){
     seed^=seed<<13;seed^=seed>>17;seed^=seed<<5;
     assert(pet_local_action(&c,&s,v,"local.draw",ms,now,seed));assert(s.phase==1);
     assert(!pet_local_action(&c,&s,v,"local.draw",ms,now,seed));ms+=c.reveal_ms;assert(pet_local_tick(&c,&s,v,ms,now));
     int selected=v[2+group*2];assert(s.phase==2&&selected!=last);last=selected;reached|=UINT64_C(1)<<selected;
+    if (i % c.groups[group].count == 0) cycle = 0;
+    assert(!(cycle & (UINT64_C(1) << selected)));
+    cycle |= UINT64_C(1) << selected;
     pet_local_view(&c,&s,v,ms,now,&view);assert(!strcmp(view.note,c.groups[group].items[selected].note));
    }assert(reached==(c.groups[group].count==64?UINT64_MAX:(UINT64_C(1)<<c.groups[group].count)-1));
    if(pet_local_enabled(&c,&s,"local.exclude")){
@@ -32,6 +35,10 @@ int main(int argc,char **argv){
   assert(pet_local_action(&c,&s,v,"local.edit",ms,now,0));assert(pet_local_action(&c,&s,v,"local.up",ms,now,0));assert(pet_local_action(&c,&s,v,"local.cancel",ms,now,0));assert(v[2]==1080);
   assert(pet_local_action(&c,&s,v,"local.edit",ms,now,0));assert(pet_local_action(&c,&s,v,"local.up",ms,now,0));assert(pet_local_action(&c,&s,v,"local.edit",ms,now,0));assert(v[2]==1140);
   v[0]=2;v[5]=pet_local_day(2024,2,29);assert(pet_local_action(&c,&s,v,"local.edit",ms,now,0));assert(pet_local_action(&c,&s,v,"local.up",ms,now,0));assert(s.draft_day==pet_local_day(2025,2,28));
+  v[5]=pet_local_day(2026,11,20);s.phase=0;s.last_second=now;
+  assert(!pet_local_tick(&c,&s,v,ms,now+1)); /* Display still shows the same day count. */
+  assert(pet_local_tick(&c,&s,v,ms,now+86400));
+  s.phase=3;assert(!pet_local_tick(&c,&s,v,ms,now+86401));
   for(int y=2020;y<=2099;y++)for(int m=1;m<=12;m++){int yy,mm,dd;pet_local_date(pet_local_day(y,m,1),&yy,&mm,&dd);assert(yy==y&&mm==m&&dd==1);}
  }
  cJSON *local=cJSON_GetObjectItem(root,"local");cJSON_AddStringToObject(local,"script","not allowed");assert(!pet_local_parse(local,&c));cJSON_Delete(root);

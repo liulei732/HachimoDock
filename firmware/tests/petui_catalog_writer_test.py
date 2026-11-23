@@ -33,8 +33,10 @@ def _catalog_writer_case(tmp_path,acceptance):
 #define pet_widget_trace_scope_end(name) ((void)(name))
 #define vTaskDelay(ticks) ((void)(ticks))
 #define pdMS_TO_TICKS(ms) (ms)
-typedef struct {char widget_id[48],title[64];uint8_t slot,package_generation;uint32_t widget_checksum,buttons_checksum,sprites_checksum,center_title_checksum;pet_p4_component_metadata_t package_metadata;} miniapp_catalog_item_t;
+typedef struct {char widget_id[48],title[64];uint8_t slot,package_generation;uint32_t widget_checksum,buttons_checksum,sprites_checksum,center_title_checksum,center_thumb_checksum;uint8_t center_thumb_generation;pet_p4_component_metadata_t package_metadata;} miniapp_catalog_item_t;
 typedef struct {uint8_t generation;uint32_t sequence;} miniapp_catalog_commit_t;
+/* File GC is exercised with actual banks in petui_storage_mutation_test. */
+#define center_thumb_catalog(generation,items,count,committed) ((void)0)
 static char g_storage_failure[128];
 static unsigned allocations,fail_allocation,live,writes,renames;
 static int io_fault;
@@ -68,7 +70,7 @@ static void put(const char *path,const char *text){FILE *f=fopen(path,"wb");asse
 static void assert_text(const char *path,const char *text){FILE *f=fopen(path,"rb");assert(f);char buf[128]={0};fread(buf,1,sizeof(buf)-1,f);fclose(f);assert(!strcmp(buf,text));}
 int main(void){
  cJSON_Hooks hooks={allocate,release};cJSON_InitHooks(&hooks);
- miniapp_catalog_item_t items[2]={{.widget_id="one",.title="One",.slot=3,.package_generation=1,.widget_checksum=11,.buttons_checksum=12,.sprites_checksum=13},
+ miniapp_catalog_item_t items[2]={{.widget_id="one",.title="One",.slot=3,.package_generation=1,.widget_checksum=11,.buttons_checksum=12,.sprites_checksum=13,.center_thumb_checksum=99,.center_thumb_generation=2},
    {.widget_id="two",.title="Two",.slot=7,.package_generation=0,.widget_checksum=21,.buttons_checksum=22,.sprites_checksum=23}};
  miniapp_catalog_commit_t result={0};
  put("catalog-0.json","active-original");put("catalog-1.json","spare-original");
@@ -109,16 +111,30 @@ int main(void){
  assert(cJSON_GetArraySize(array)==2&&cJSON_GetObjectItemCaseSensitive(root,"sequence")->valueint==51);
  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(root,"selectedWidgetId")->valuestring,"two"));
  assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(root,"seedPending")));
- for(int i=0;i<2;i++)assert(cJSON_GetArraySize(cJSON_GetArrayItem(array,i))==7);
+ const cJSON *covered=cJSON_GetArrayItem(array,0), *legacy=cJSON_GetArrayItem(array,1);
+ const cJSON *hash=cJSON_GetObjectItemCaseSensitive(covered,"thumb");
+ const cJSON *bank=cJSON_GetObjectItemCaseSensitive(covered,"thumbBank");
+ assert(cJSON_GetArraySize(covered)==9 && cJSON_IsString(hash) && !strcmp(hash->valuestring,"00000063"));
+ assert(cJSON_IsNumber(bank) && bank->valuedouble==2);
+ assert(cJSON_GetArraySize(legacy)==7 && !cJSON_HasObjectItem(legacy,"thumb") && !cJSON_HasObjectItem(legacy,"thumbBank"));
  cJSON_Delete(root);assert(!live);
  miniapp_catalog_item_t full[PET_P4_MINIAPP_CATALOG_MAX+1]={0};
  for(unsigned i=0;i<PET_P4_MINIAPP_CATALOG_MAX;i++){
    snprintf(full[i].widget_id,sizeof(full[i].widget_id),"item-%u",i);
    snprintf(full[i].title,sizeof(full[i].title),"Preserved item %u",i);full[i].slot=(uint8_t)i;
+   full[i].center_thumb_checksum=UINT32_MAX;full[i].center_thumb_generation=(uint8_t)(i%3);
  }
  assert(write_catalog_snapshot_at(full,PET_P4_MINIAPP_CATALOG_MAX,"item-0","item-0",true,0,51,&result));
  f=fopen("catalog-1.json","rb");assert(f);char full_json[16384]={0};fread(full_json,1,sizeof(full_json)-1,f);fclose(f);
  root=cJSON_Parse(full_json);assert(root&&cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(root,"items"))==PET_P4_MINIAPP_CATALOG_MAX);
+ array=cJSON_GetObjectItemCaseSensitive(root,"items");
+ for(int i=0;i<cJSON_GetArraySize(array);++i){
+   const cJSON *record=cJSON_GetArrayItem(array,i);
+   const cJSON *stored_hash=cJSON_GetObjectItemCaseSensitive(record,"thumb");
+   const cJSON *stored_bank=cJSON_GetObjectItemCaseSensitive(record,"thumbBank");
+   assert(cJSON_IsString(stored_hash) && !strcmp(stored_hash->valuestring,"ffffffff"));
+   assert(cJSON_IsNumber(stored_bank) && stored_bank->valuedouble==i%3);
+ }
  assert(cJSON_GetObjectItemCaseSensitive(root,"version")->valueint==3);
  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(root,"selectedWidgetId")->valuestring,"item-0"));
  assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root,"seedPending")));cJSON_Delete(root);assert(!live);

@@ -23,7 +23,7 @@
 #endif
 /* Public program candidate profile (normal-build admission, 2026-11-01 engineering
  * defaults): exactly ONE PROGRAM lease / 4096 fuel total, PERIPHERAL stays zero,
- * background still PC-started only, no autostart/alarm, audio reservation still
+ * declared local background resumes require board consent; audio reservation still
  * revokes. An explicit quota-table entry, never inferred from the private chain. */
 #ifndef PET_P4_PUBLIC_PROGRAM_PROFILE
 #define PET_P4_PUBLIC_PROGRAM_PROFILE 0

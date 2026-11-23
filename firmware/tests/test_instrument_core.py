@@ -45,6 +45,17 @@ def test_fast_hits_bounded_no_overflow_and_reset(dsp):
     dsp.pet_instrument_reset(C.byref(s))
     assert max(map(abs,render(dsp,s,on=False)))==0
 
+def test_overlapping_knocks_duck_ambience_independent_of_voice_slot(dsp):
+    def overlap(ages):
+        s=Core()
+        dsp.pet_instrument_reset(C.byref(s))
+        s.samples=4000
+        s.gain=1
+        s.age[:]=ages
+        return render(dsp,s,512,effect=0,ambience=100)
+    forward=overlap([920,3000,4500,16000])
+    assert any(forward) and forward == overlap([4500,3000,920,16000])
+
 def test_volume_zero_and_motion_settles(dsp):
     s=Core();dsp.pet_instrument_reset(C.byref(s));dsp.pet_instrument_strike(C.byref(s))
     assert not any(render(dsp,s,effect=0,ambience=0))

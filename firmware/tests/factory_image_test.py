@@ -140,6 +140,7 @@ def test_factory_reuses_the_desktop_bundled_p4_ready_pack(tmp_path):
         config,
     )
 
+    assert (summary["tree"] / "bubble32-v1.fpk").read_bytes() == (RUNTIME / "assets/fonts/bubble32-v1.fpk").read_bytes()
     assert summary["readyProfile"] == appearance["readyProfile"]
     assert summary["packId"] == ready_manifest["packId"]
     assert summary["families"] == 16
@@ -466,3 +467,33 @@ def test_factory_board_metadata_uses_application_descriptor(tmp_path,suffix,expe
     label=('0.7.103-p4-r279-'+suffix).encode();image[48:48+len(label)]=label
     (tmp_path/'firmware.bin').write_bytes(image)
     assert factory.application_board_model(tmp_path)==expected
+
+
+@pytest.mark.parametrize("profile,programmed", [("nv3049-no-touch", False), (None, True)])
+def test_public_packager_refuses_provisioned_display_before_export(tmp_path, profile, programmed):
+    image = bytearray(b"\xff" * 0x10000)
+    if programmed:
+        image[0x9000] = 0
+    (tmp_path / "pet-manager-p4-factory.bin").write_bytes(image)
+    (tmp_path / "factory-spiffs").mkdir()
+    manifest = dict(format=factory.FACTORY_FORMAT, completeInstall=True, chip="esp32p4",
+                    flashOffset="0x0", bytes=len(image), sha256=hashlib.sha256(image).hexdigest())
+    if profile:
+        manifest["displayProfile"] = profile
+    (tmp_path / "pet-manager-p4-factory.json").write_text(json.dumps(manifest))
+    output = tmp_path / "release"
+    result = subprocess.run(["node", str(REPOSITORY / "pc/scripts/package-factory-release.mjs"),
+                             "--build-dir", str(tmp_path), "--output", str(output)],
+                            capture_output=True, text=True)
+    assert result.returncode != 0 and "erased device NVS" in result.stderr
+    assert not output.exists()
+
+
+def test_factory_panel_provisioning_is_opt_in_and_board_independent():
+    base = ["--build-dir", "."]
+    assert factory.parse_args(base).display_profile is None
+    profile = ["--display-profile", "nv3049-no-touch"]
+    with pytest.raises(SystemExit):
+        factory.parse_args(base + profile)
+    args = factory.parse_args(base + profile + ["--nvs-generator", "generator.py"])
+    assert args.display_profile == "nv3049-no-touch" and args.verified_board_model is None

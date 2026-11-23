@@ -27,7 +27,7 @@ def test_compressed_bootstrap_roundtrip_and_budget():
             name = "wasm_" + item["id"].replace("-", "_")
             raw = read_component_wasm(component_root(item["id"]), item["widget"])
             if item["id"] in FACTORY_WASM_IDS:
-                assert raw is not None and name not in packed
+                assert raw and name not in packed  # Supplied by the factory resource partition.
             else:
                 assert zlib.decompress(packed[name]) == raw
     assert render_data_source(bundle, packed) == source

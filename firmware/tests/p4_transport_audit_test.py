@@ -49,7 +49,11 @@ def test_production_tx_audit_faults_concurrency_and_strict_unlocked_handler(tmp_
 def test_worker_routes_audit_before_general_state_lock_and_has_no_sensitive_record_fields():
     source = (ROOT / "main/pet_p4_main.c").read_text()
     worker = source.split("static void protocol_worker_task(", 1)[1].split("static bool consume_byte(", 1)[0]
-    assert worker.index("maybe_handle_transport_audit(") < worker.index("xSemaphoreTake(g_state_mutex")
+    # The pre-dequeue maintenance lock must already be released when the
+    # diagnostic handler runs. Only ordinary dispatch takes the state mutex.
+    maintenance, request = worker.split("if (xQueueReceive", 1)
+    assert maintenance.rindex("xSemaphoreTake(g_state_mutex") < maintenance.rindex("xSemaphoreGive(g_state_mutex)")
+    assert request.index("maybe_handle_transport_audit(") < request.index("if (!handled_debug)") < request.index("xSemaphoreTake(g_state_mutex")
     assert "static EXT_RAM_BSS_ATTR pet_transport_audit_snapshot_t g_transport_audit_snapshot;" in source
     assert "static EXT_RAM_BSS_ATTR char g_transport_audit_reply[" in source
     header = (ROOT / "main/pet_p4_transport_audit.h").read_text()

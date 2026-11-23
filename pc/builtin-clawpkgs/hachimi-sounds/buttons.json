@@ -1,13 +1,13 @@
 [
   {
     "action": "host.primary",
-    "label": "开始播放",
+    "label": "播放 / 停止",
     "control": "SW1",
     "event": "button.sw1.short_press"
   },
   {
     "action": "host.secondary",
-    "label": "十五分钟",
+    "label": "切换定时",
     "control": "SW2",
     "event": "button.sw2.short_press"
   },

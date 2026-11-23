@@ -127,6 +127,15 @@ const char *pet_p4_miniapp_catalog_reconcile(const cJSON *request,char *error,si
   if(!removed_count&&!memcmp(next,g_catalog,count*sizeof(*next)))return "unchanged";
   const int generation=g_catalog_file_generation;const uint32_t sequence=g_catalog_sequence;
   if(!pet_storage_scope_advance(&storage,PET_STORAGE_PREPARE)||!pet_storage_scope_unlock(&storage)||!storage_work_current())return result;
+#if PET_P4_EVENTS
+  /* Removing membership also retires local consent. Saves and resources
+   * stay on disk. A failed retirement leaves the catalog unpublished. */
+  for(size_t i=0;i<g_catalog_count;i++) {
+    if(removed[i]&&!local_alarm_retire(g_catalog[i].slot,g_catalog[i].widget_id,NULL)) {
+      set_error(error,error_size,"local permission retirement failed");return result;
+    }
+  }
+#endif
   miniapp_catalog_commit_t commit;
   if(!write_catalog_snapshot_at(next,count,active,cursor,false,generation,sequence,&commit)){
     if(g_catalog_recovery_blocked){
@@ -145,7 +154,12 @@ const char *pet_p4_miniapp_catalog_reconcile(const cJSON *request,char *error,si
     if(relocked){(void)pet_storage_scope_advance(&storage,PET_STORAGE_PUBLISHED);(void)pet_storage_scope_advance(&storage,PET_STORAGE_CLEANUP);}
     set_error(error,error_size,"catalog durable but publication unknown; do not replay");return "unknown";
   }
-  miniapp_runtime_lock();memcpy(g_catalog,next,sizeof(g_catalog));g_catalog_count=count;
+  miniapp_runtime_lock();
+#if PET_P4_EVENTS
+  for(size_t i=0;i<g_catalog_count;i++)
+    if(removed[i]) miniapp_ext_forget_events(g_catalog[i].widget_id);
+#endif
+  memcpy(g_catalog,next,sizeof(g_catalog));g_catalog_count=count;
   int selected=catalog_find(g_catalog,count,cursor);g_catalog_selected=selected>=0?(size_t)selected:0;
   g_catalog_file_generation=commit.generation;g_catalog_sequence=commit.sequence;g_catalog_seed_pending=false;
   miniapp_runtime_unlock();

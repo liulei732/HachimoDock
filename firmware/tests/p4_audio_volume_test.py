@@ -149,3 +149,82 @@ int main(void){
     exe = tmp_path / "idle"
     subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined", str(unit), "-o", str(exe)], check=True)
     subprocess.run([str(exe)], check=True, timeout=10)
+
+
+def test_worker_services_volume_under_heartbeats_and_bounds_busy_checks(tmp_path):
+    main = (ROOT / "main/pet_p4_main.c").read_text()
+    worker = main.split("static void protocol_worker_task(void *arg) {", 1)[1]
+    start = worker.index("  pet_p4_protocol_request_t request;")
+    end = worker.index("#if PET_P4_HELLO_ASYNC", start)
+    # Run the real scheduling and receive branches. Stub only the surrounding
+    # workers, RTOS queue and hardware. Cross a 32-bit tick rollover each run.
+    unit = tmp_path / "volume_worker.c"
+    unit.write_text(r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <setjmp.h>
+typedef uint32_t TickType_t;
+typedef int pet_p4_protocol_request_t;
+#define pdTRUE 1
+#define pdMS_TO_TICKS(ms) (ms)
+#define portMAX_DELAY UINT32_MAX
+static unsigned now_ms, interval, next_request, received, lan_checks, commit_checks;
+static unsigned applies, saves, dirty_since;
+static bool dirty, lan_pending, busy, probe;
+static struct { bool raw; } g_screenshot;
+static int g_protocol_queue;
+static jmp_buf finished;
+static TickType_t xTaskGetTickCount(void) { return UINT32_MAX - 1500u + now_ms; }
+static bool pet_p4_program_main_probe_pending(void) { return probe; }
+static void pet_p4_program_main_probe_reply(void) {}
+static void screenshot_poll(void) {}
+static void asset_idle_worker(void) {}
+#if PET_P4_SYSTEM_WIFI
+static void volume_worker_lan(void) {
+    assert(now_ms == (++lan_checks) * 1000);
+    if (!busy && lan_pending) { lan_pending = false; ++applies; dirty = true; dirty_since = now_ms; }
+}
+#endif
+static void volume_worker_idle_commit(void) {
+    assert(now_ms == (++commit_checks) * 1000);
+    if (!busy && dirty && now_ms - dirty_since >= 1000) { dirty = false; ++saves; }
+}
+static int xQueueReceive(int queue, int *request, TickType_t wait) {
+    (void)queue; (void)request;
+    if (now_ms == 5000) longjmp(finished, 1);
+    assert(wait > 0 && wait <= 1000 - now_ms % 1000);
+    if (g_screenshot.raw) assert(wait <= 100);
+    if (probe) assert(wait <= 20);
+    if (interval && next_request <= now_ms + wait) {
+        now_ms = next_request; next_request += interval; ++received;
+        busy = now_ms < 2500; return pdTRUE;
+    }
+    now_ms += wait; busy = now_ms < 2500; return 0;
+}
+static void worker(void) {
+""" + worker[start:end] + r"""
+    continue; /* Simulate short request dispatch, including its early returns. */
+  }
+}
+static void run(unsigned rate, bool screenshot, bool fast_probe) {
+    interval = next_request = rate; now_ms = received = 0;
+    lan_checks = commit_checks = applies = saves = dirty_since = 0;
+    lan_pending = busy = true; dirty = !PET_P4_SYSTEM_WIFI;
+    g_screenshot.raw = screenshot; probe = fast_probe;
+    if (!setjmp(finished)) worker();
+    assert(received == (rate ? 5000 / rate : 0));
+    assert(commit_checks == 5 && saves == 1 && !dirty);
+    assert(lan_checks == (PET_P4_SYSTEM_WIFI ? 5 : 0));
+    assert(applies == (PET_P4_SYSTEM_WIFI ? 1 : 0));
+}
+int main(void) {
+    run(500, false, false); run(1, false, false); run(333, false, false);
+    run(0, true, false); run(0, false, true); run(0, false, false);
+}
+""")
+    for wifi in (0, 1):
+        exe = tmp_path / f"volume-worker-{wifi}"
+        subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+                        f"-DPET_P4_SYSTEM_WIFI={wifi}", str(unit), "-o", str(exe)], check=True)
+        subprocess.run([str(exe)], check=True, timeout=5)

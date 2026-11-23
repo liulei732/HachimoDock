@@ -162,6 +162,7 @@ mod tests {
             assert_eq!(s, old);
         }
     }
+    #[cfg(unix)]
     #[test]
     fn settings_round_trip_without_credentials_and_reject_corrupt_state() {
         let t = tempfile::tempdir().unwrap();

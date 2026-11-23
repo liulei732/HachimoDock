@@ -160,7 +160,8 @@ def test_closed_background_parent_exports_refusals_without_changing_callers(tmp_
     import subprocess
     root=Path(__file__).resolve().parents[1]
     text=(root/'main/pet_p4_miniapp_background.inc').read_text()
-    closed=text.rsplit('\n#else\n',1)[1].rsplit('\n#endif',1)[0]
+    signature="bool pet_p4_miniapp_background_available(void){return false;}"
+    closed=text[text.index(signature):].split("\n#endif",1)[0]
     source=tmp_path/'closed.c'
     source.write_text('''#include <assert.h>
 #include <stdbool.h>

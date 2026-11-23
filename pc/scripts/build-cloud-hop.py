@@ -12,23 +12,27 @@ out=Image.new('RGBA',(80,80));out.alpha_composite(im,((80-im.width)//2,80-im.hei
 ink=s.rgb('493D34');green=s.rgb('548879');cream=s.rgb('FFF9EF');gold=s.rgb('D49D62')
 actions={'jump.charge':'按住蓄力，松开跳跃','session.pause':'暂停 / 继续','session.restart':'重开本局（需确认）'}
 states=['ready','playing','paused','result']
-dash=dict(title='云端跳一跳',eyebrow='蓄一点力，向前一点点',headline={'switch_state':dict(ready='陪小狗，跳过下一朵云',playing='松开，出发！',paused='歇一下，云朵会等你',result='没关系，再跳一次')},metricValue={'var':'score'},metricLabel={'switch_state':dict(ready='按住开始',playing='按住蓄力',paused='已暂停',result='按住重来')},metricUnit={'switch_state':dict(ready='暂停',playing='暂停',paused='继续',result='暂停')},badge={'var':'best'},note='按住越久，跳得越远',footer='落上下一座平台得 1 分 · 掉落结束',progress={'pct_of':'charge','of_max':'hundred'},visualStyle='clean',visualPalette='mint',visualLayout='game',visualSprite='pet')
+dash=dict(title='云端跳一跳',eyebrow='蓄一点力，向前一点点',headline={'switch_state':dict(ready='陪小狗，跳过下一朵云',playing={'var':'charge'},paused='歇一下，云朵会等你',result='没关系，再跳一次')},metricValue={'var':'score'},metricLabel={'switch_state':dict(ready='按住开始',playing='按住蓄力',paused='已暂停',result='按住重来')},metricUnit={'switch_state':dict(ready='暂停',playing='暂停',paused='继续',result='暂停')},badge={'var':'best'},note='按住越久，跳得越远',footer='落上下一座平台得 1 分 · 掉落结束',progress={'pct_of':'charge','of_max':'hundred'},visualStyle='clean',visualPalette='mint',visualLayout='game',visualSprite='pet')
 elements=[dict(type='image',x=0,y=0,w=640,h=480,image='background',color=65535),
  dict(type='icon',x=24,y=22,w=24,h=24,color=green,icon='cloud'),s.text(58,20,260,30,bind='title',size=22,weight=600),
  s.text(444,22,72,24,label='最佳',size=16),s.text(528,18,84,32,bind='badge',size=24,align='right'),
- s.text(26,64,470,38,bind='headline',size=24),s.text(542,63,70,56,bind='metricValue',size=44,align='right'),
+ s.text(26,64,470,38,bind='headline',size=24,state_mask=13),
+ s.text(26,64,64,38,label='蓄力',size=24,state_mask=2),
+ s.text(92,64,58,38,bind='headline',size=24,align='right',state_mask=2),
+ s.text(154,64,42,38,label='%',size=24,state_mask=2),
+ s.text(542,63,70,56,bind='metricValue',size=44,align='right'),
  s.text(26,109,360,25,bind='note',size=16,color=green),
  dict(type='panel',x=24,y=361,w=592,h=8,color=s.rgb('DEDCD0'),radius=4),dict(type='meter',x=24,y=361,w=592,h=8,color=green,bind='progress'),
  s.button(24,387,280,48,'jump.charge',bind='metricLabel',icon='arrow',primary=True,color=green,state_mask=11),
  s.button(24,387,280,48,None,label='已暂停 · 点右侧继续',color=cream,state_mask=4),
- s.button(318,387,142,48,'session.pause',bind='metricUnit',icon='pause'),
+ s.button(318,387,142,48,'session.pause',bind='metricUnit',icon='pause',state_mask=6),
  s.button(474,387,142,48,'session.restart',label='重开'),
  dict(type='panel',x=0,y=448,w=640,h=32,color=cream,opacity=235),
  s.button(20,454,33,20,None,label='SW1',key_for='jump.charge',font_size=11,padding=0,radius=4),s.text(59,453,166,22,label='按住蓄力 · 松开跳',size=13),
  s.button(246,454,33,20,None,label='SW2',key_for='session.pause',font_size=11,padding=0,radius=4),s.text(285,453,96,22,label='暂停 / 继续',size=13),
  s.button(395,454,54,20,None,label='中按',key_for='session.restart',font_size=11,padding=0,radius=4),s.text(455,453,46,22,label='重开',size=13),s.text(510,453,106,22,label='全局键退出',size=13,align='right')]
 runtime=dict(schema_version=1,engine='p4-bounded-runtime-v4',vars={k:dict(type='int',init=v) for k,v in dict(score=0,best=0,charge=0,hundred=100).items()},states=states,initial_state='ready',
- transitions=[dict(**{'from':a,'on':'jump.charge','to':'playing'}) for a in ('ready','playing','result')]+[{'from':'playing','on':'session.pause','to':'paused'},{'from':'paused','on':'session.pause','to':'playing'},{'from':'*','on':'session.restart','to':'playing','set':{'charge':0}}],tick=[],dashboard=dash,
+ transitions=[{'from':'*','on':'session.restart','to':'playing','set':{'charge':0}}]+[{'from':a,'on':'jump.charge','to':'playing'} for a in ('ready','playing','result')]+[{'from':'playing','on':'session.pause','to':'paused'},{'from':'paused','on':'session.pause','to':'playing'}],tick=[],dashboard=dash,
  input={'engine':'p4-input-v1','hold':'jump.charge','confirm':{'session.restart':'重新开始本局？最高分会保留。'}},lifecycle={'pause_action':'session.pause','record_var':'best'},
  persist={'version':1,'vars':['best'],'states':{x:'ready' for x in states}},
  scene={'tick_ms':20,'active_state':'playing','result_state':'result','score_var':'score','grid':{'width':16,'height':8},
@@ -45,7 +49,8 @@ runtime=dict(schema_version=1,engine='p4-bounded-runtime-v4',vars={k:dict(type='
 dash['visualLayout']='scoreboard';dash['visualSprite']='star'
 s.fonts(pack,runtime,'云端跳一陪小狗过下朵蓄力松开出发暂停继续最佳按住开始重来歇会等你没关系再次分局键退出·')
 s.save(pack/'runtime/widget.json',runtime)
-s.save(pack/'component.json',dict(id='cloud-hop',name='云端跳一跳',version='1.1.1',kind='game',author='小豆包',description='按住蓄力、松开跳跃，陪小狗连续向前探索。不同距离、大小和颜色的平台不断生成；落上新平台得分，掉落结束，支持暂停、确认重开和最佳成绩存档。'))
+s.save(pack/'hachiapp.json',dict(format='hachiapp/1',id=pack.name))
+s.save(pack/'component.json',dict(id='cloud-hop',name='云端跳一跳',version='1.1.2',kind='game',author='小豆包',description='按住蓄力，看百分比松开跳跃，陪小狗连续向前探索。不同距离、大小和颜色的平台不断生成；落上新平台得分，掉落结束，支持暂停、确认重开和最佳成绩存档。'))
 s.save(pack/'buttons.json',[dict(action=a,control=f'SW{i+1}' if i<2 else '前方摇杆',event=f'button.sw{i+1}.short_press' if i<2 else 'button.encoder.short_press',label=label) for i,(a,label) in enumerate(actions.items())])
 s.save(pack/'negative-screen.json',{'dashboard':{k:v if isinstance(v,str) else '0' if k in ('metricValue','badge') else '按住开始' if k=='metricLabel' else '暂停' if k=='metricUnit' else '陪小狗，跳过下一朵云' if k=='headline' else {'value':0,'label':''} for k,v in dash.items()}})
 s.save(pack/'share.json',{'title':'云端跳一跳','author':'小豆包','tags':['游戏','治愈'],'description':'原创云端蓄力跳跃 · 标准 PetUI'})

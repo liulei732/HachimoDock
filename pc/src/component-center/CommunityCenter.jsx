@@ -26,7 +26,6 @@ import Button from "../shell/Button.jsx";
 import DeviceScreenPreview from "./DeviceScreenPreview.jsx";
 import ComponentCover from "./ComponentCover.jsx";
 import {componentDisplayAuthor} from "./component-authors.js";
-import {legacyAudioInstallBlockedReason} from "./library-order.js";
 import {refreshGate} from "./community-refresh.js";
 import {readCenterPreference,saveCenterPreference} from './catalog-state.js';
 import {commentStorage,readCommentIdentity,saveCommentName} from './comment-identity.js';
@@ -40,6 +39,8 @@ import {
   updateFavorites,
   versionState,
   publicationStatus,
+  publicationCandidates,
+  publicationReceiptError,
   readableBytes,
 } from "./community-model.js";
 import "./community.css";
@@ -184,7 +185,7 @@ function Dialog({ title, onClose, busy = false, children, wide = false }) {
   );
 }
 
-function Publish({ localItems, owned, onClose, onPublished, selectedPath }) {
+function Publish({ localItems, owned, provenance, onClose, onPublished, selectedPath }) {
   const dirty=useRef(false);
   const submitting=useRef(false);
   const [discard,setDiscard]=useState(null);
@@ -210,15 +211,15 @@ function Publish({ localItems, owned, onClose, onPublished, selectedPath }) {
   const pending = useRef(null),
     coverSeq = useRef(0),
     prepareSeq = useRef(0);
-  const currentPackage = prepared?.path === path ? prepared : null;
-  const covers = selectedCovers ?? (currentPackage?.coverDataUrl ? [currentPackage.coverDataUrl] : []);
+  const selected = localItems.find(item => item.libraryPath === path);
+  const sourceKey = selected && JSON.stringify([path, selected.id, selected.version, selected.versionHash]);
+  const currentPackage = sourceKey && prepared?.sourceKey === sourceKey ? prepared : null;
+  const covers = currentPackage ? [currentPackage.coverDataUrl, ...(selectedCovers || [])].filter(Boolean) : [];
   let publishBlocker = prepareError;
-  if (!path) publishBlocker = "请先选择要发布的本地组件。";
-  else if (checking) publishBlocker = "正在检查组件文件…";
-  else if (!publishBlocker && !currentPackage?.canPublish)
-    publishBlocker = currentPackage?.warning || "组件文件尚未通过发布检查。";
+  if (!selected) publishBlocker = "请先选择要发布的本地组件。";
+  else if (checking) publishBlocker = "正在等待社区预检…";
+  else if (!publishBlocker && !currentPackage) publishBlocker = "请先完成社区预检。";
   else if (!publishBlocker && readingCovers) publishBlocker = "正在读取截图…";
-  else if (!publishBlocker && !covers.length) publishBlocker = "请添加至少一张组件截图。";
   useExitProtection(busy ? "社区发布尚未完成，请勿重复提交" : dirty.current ? "组件发布内容尚未提交" : "");
   useEffect(() => {
     const seq = ++prepareSeq.current;
@@ -228,7 +229,7 @@ function Publish({ localItems, owned, onClose, onPublished, selectedPath }) {
     setSelectedCovers(null);
     setReadingCovers(false);
     pending.current=null;dirty.current=false;
-    if (!path) {
+    if (!selected) {
       setChecking(false);
       return;
     }
@@ -237,7 +238,12 @@ function Publish({ localItems, owned, onClose, onPublished, selectedPath }) {
       .then(
         (value) => {
           if (seq !== prepareSeq.current) return;
-          setPrepared({ ...value, path });
+          const problem = publicationReceiptError(value, selected.id, selected.version);
+          if (problem) {
+            setPrepareError(problem);
+            return;
+          }
+          setPrepared({ ...value, sourceKey });
           const old = owned[value.id];
           setForm((f) => ({
             ...f,
@@ -256,7 +262,7 @@ function Publish({ localItems, owned, onClose, onPublished, selectedPath }) {
     return () => {
       prepareSeq.current++;
     };
-  }, [path, prepareAttempt]);
+  }, [sourceKey, prepareAttempt]);
   async function readCovers(files) {
     const seq=prepareSeq.current;
     const selection=++coverSeq.current;
@@ -268,14 +274,14 @@ function Publish({ localItems, owned, onClose, onPublished, selectedPath }) {
       return;
     }
     if (
-      files.length > 3 ||
+      files.length > 2 ||
       files.some(
         (file) =>
           file.size > 2 * 1024 * 1024 ||
           !["image/png", "image/jpeg", "image/webp"].includes(file.type),
       )
     ) {
-      setError("截图未更换。请选择 1–3 张 PNG、JPEG 或 WebP 截图，每张不超过 2 MB。");
+      setError("最多可附两张 PNG、JPEG 或 WebP 截图，每张不超过 2 MB。");
       return;
     }
     setReadingCovers(true);
@@ -308,14 +314,14 @@ function Publish({ localItems, owned, onClose, onPublished, selectedPath }) {
       // Identical retries retain the same request ID, including after a restart.
       // Persist only a digest and ID, never package contents or credentials.
       const bytes = new TextEncoder().encode(
-        JSON.stringify([prepared.contentHash, form, covers]),
+        JSON.stringify([currentPackage.contentHash, form, covers]),
       );
       const fingerprint = [
         ...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)),
       ]
         .map((x) => x.toString(16).padStart(2, "0"))
         .join("");
-      const key = `pet-manager:community-publication:${prepared.id}`;
+      const key = `pet-manager:community-publication:${currentPackage.id}`;
       let old;
       try {
         old = JSON.parse(localStorage.getItem(key) || "null");
@@ -331,8 +337,8 @@ function Publish({ localItems, owned, onClose, onPublished, selectedPath }) {
       const result = await request("publish", {
         path,
         metadata: form,
-        covers: covers.map((url) => url.split(",")[1]),
-        expectedContentHash: prepared.contentHash,
+        covers: (selectedCovers || []).map((url) => url.split(",")[1]),
+        expectedContentHash: currentPackage.contentHash,
         requestId: pending.current.requestId,
       });
       localStorage.setItem(NAME_KEY, form.author.trim());
@@ -369,13 +375,13 @@ function Publish({ localItems, owned, onClose, onPublished, selectedPath }) {
   return (
     <Dialog title="发布我的玩法" onClose={close} busy={busy||Boolean(discard)} wide>
       <form className="community-publish" onSubmit={submit} onChange={()=>{dirty.current=true;}}>
-        <fieldset disabled={busy} style={{border:0,padding:0,minWidth:0}}>
+        <fieldset disabled={busy}>
         <div className="community-publish-intro">
           <Upload size={22} />
           <div>
-            <h3>把创作分享给更多桌面</h3>
+            <h3>提交社区审核</h3>
             <p>
-              选择组件后，社区会预检组件包。新作品和更新均需审核，审核通过后才会公开。
+              选择本地作品后，社区服务器会检查组件包和发布资格。新作品和更新均需审核，审核通过后才会公开。
             </p>
           </div>
         </div>
@@ -388,37 +394,37 @@ function Publish({ localItems, owned, onClose, onPublished, selectedPath }) {
             disabled={busy}
             required
           >
-            <option value="">选择已经验证过的本地作品</option>
-            {localItems
-              .filter((item) => item.isLocal && item.libraryPath && !legacyAudioInstallBlockedReason(item))
-              .map((item) => (
+            <option value="">{localItems.length ? "选择要发布的本地组件" : "暂无可发布的本地组件"}</option>
+            {localItems.map((item) => (
                 <option key={item.libraryPath} value={item.libraryPath}>
                   {item.name} · {item.version || "待检查版本"}
                 </option>
               ))}
           </select>
         </label>
-        {checking && <p role="status">正在检查组件文件…</p>}
+        {!provenance.data && (provenance.error
+          ? <div role="alert">{provenance.error} <Button type="button" onClick={provenance.reload}>重新读取作品来源</Button></div>
+          : <p role="status">正在读取本地作品来源…</p>)}
         {prepareError && <div className="community-error" role="alert">
           <p>{prepareError}</p>
           <Button type="button" variant="secondary" onClick={() => setPrepareAttempt((n) => n + 1)}>重新检查</Button>
         </div>}
-        {prepared && (
+        {currentPackage && (
           <div className="community-package-check">
             <ShieldCheck size={20} />
             <div>
               <strong>
-                {prepared.name} · {prepared.version}
+                {currentPackage.name} · {currentPackage.version}
               </strong>
               <p>
-                {prepared.id} · {readableBytes(prepared.packageBytes)} ·{" "}
-                {prepared.files.length} 个文件
+                {currentPackage.id} · {readableBytes(currentPackage.packageBytes)} ·{" "}
+                {currentPackage.files.length} 个文件
               </p>
-              {prepared.warning && <small>{prepared.warning}</small>}
+              <small role="status">{currentPackage.warning || "社区预检通过，可以提交审核。"}</small>
               <details>
                 <summary>查看将公开的文件</summary>
                 <ul>
-                  {prepared.files.map((name) => (
+                  {currentPackage.files.map((name) => (
                     <li key={name}>{name}</li>
                   ))}
                 </ul>
@@ -426,6 +432,7 @@ function Publish({ localItems, owned, onClose, onPublished, selectedPath }) {
             </div>
           </div>
         )}
+        {currentPackage && <>
         <div className="community-form-grid">
           {field("author", "公开作者名", 40)}
           <label>
@@ -449,7 +456,7 @@ function Publish({ localItems, owned, onClose, onPublished, selectedPath }) {
         {field("releaseNotes", "本次更新说明（选填）", 2000, true, false)}
         {field("sourceUrl", "来源链接（选填，派生作品请注明公开来源）", 500, false, false)}
         <label>
-          组件截图 · 1–3 张
+          补充截图（选填，最多两张）
           <input
             key={path}
             type="file"
@@ -459,20 +466,21 @@ function Publish({ localItems, owned, onClose, onPublished, selectedPath }) {
             onChange={(e) => readCovers([...e.target.files])}
           />
         </label>
-        {selectedCovers === null && currentPackage?.coverDataUrl && (
-          <small>已带入组件封面，可选择其他截图替换。</small>
+        {currentPackage?.coverDataUrl && (
+          <small>首图来自包内封面。要更换首图，请更新组件包。</small>
         )}
         <div className="community-publish-shots">
           {covers.map((src, index) => (
             <img key={index} src={src} alt={`发布截图 ${index + 1}`} />
           ))}
         </div>
+        </>}
         {error && (
           <p className="community-error" role="alert">
             {error}
           </p>
         )}
-        {publishBlocker && !prepareError && <p role="status">{publishBlocker}</p>}
+        {publishBlocker && !prepareError && provenance.data && <p role="status">{!path && !localItems.length ? "还没有可发布的本地作品。请先在组件中心创建或导入自己的组件。" : publishBlocker}</p>}
         <footer>
           <small>
             需要下架或删除社区作品，请联系开发者。更新不会自动覆盖用户设备。
@@ -499,6 +507,7 @@ import { isWithdrawnComponent } from "./library-order.js";
 export default function CommunityCenter({
   active = true,
   tab: controlledTab,
+  capabilityTarget,
   onTabChange,
   localItems,
   inventory,
@@ -516,10 +525,11 @@ export default function CommunityCenter({
     [publish, setPublish] = useState(null),
     [notice, setNotice] = useState("");
   const provenance = useResource(() => request("local"), [revision], []);
+  const [createdOffset, setCreatedOffset] = useState(0);
   const created = useResource(
-    () => (tab === "created" ? request("mine") : null),
-    [tab, revision],
-    [tab],
+    () => (tab === "created" ? request("mine", { offset: createdOffset }) : null),
+    [tab, revision, createdOffset],
+    [tab, createdOffset],
   );
   const changed = useCallback(() => setRevision((v) => v + 1), []);
   const refreshClock = useRef(null);
@@ -536,16 +546,10 @@ export default function CommunityCenter({
   useEffect(() => {
     if (refreshKey) changed();
   }, [refreshKey, changed]);
-  const owned = provenance.data?.owned || {};
-  const publicationItems=localItems.flatMap(item=>item.sourceAlternatives?.filter(source=>source.isLocal) || (item.isLocal?[item]:[]));
-  const unpublished = publicationItems.filter(
-    (item) =>
-      item.isLocal &&
-      !legacyAudioInstallBlockedReason(item) &&
-      !provenance.data?.reservedIds?.includes(item.id) &&
-      !owned[item.id] &&
-      !provenance.data?.downloaded?.[item.id],
-  );
+  const owned = Object.assign(Object.create(null), provenance.data?.owned);
+  for (const work of created.data?.items || []) owned[work.id] = work;
+  const publicationItems = publicationCandidates(localItems, provenance.data, owned);
+  const unpublished = publicationItems.filter(item => !Object.hasOwn(owned, item.id));
   return (
     <div className="community-center">
       <div className="community-tabs" role="tablist" aria-label="组件中心栏目">
@@ -580,7 +584,7 @@ export default function CommunityCenter({
           </Button>
         </div>
       )}
-      {["discover","favorites"].includes(tab) && <CommunityWeb key={tab} view={tab} localItems={localItems} inventory={inventory} deviceInstallTargetKey={deviceInstallTargetKey} onImported={onImported} onOpenLocal={onOpenLocal}/>}
+      {["discover","favorites"].includes(tab) && <CommunityWeb capabilityTarget={capabilityTarget} key={tab} view={tab} localItems={localItems} inventory={inventory} deviceInstallTargetKey={deviceInstallTargetKey} onImported={onImported} onOpenLocal={onOpenLocal}/>}
       {tab === "local" && (
         <section role="tabpanel" aria-label="我的组件">
           <div className="community-section-title">
@@ -643,8 +647,8 @@ export default function CommunityCenter({
                   </article>
                 );
               })}
-              {unpublished.map((item) => (
-                <article key={item.id}>
+              {createdOffset === 0 && unpublished.map((item) => (
+                <article key={item.libraryPath}>
                   <div>
                     <h3>
                       {item.name}
@@ -660,7 +664,13 @@ export default function CommunityCenter({
                 </article>
               ))}
             </div>
-            {!created.data?.items?.length && !unpublished.length && (
+            {(createdOffset > 0 || created.data?.nextOffset != null) && <nav aria-label="作品翻页">
+              <Button size="small" disabled={created.loading || createdOffset === 0}
+                onClick={() => setCreatedOffset(Math.max(0, createdOffset - 30))}>上一页</Button>
+              <Button size="small" disabled={created.loading || created.data?.nextOffset == null}
+                onClick={() => setCreatedOffset(created.data.nextOffset)}>下一页</Button>
+            </nav>}
+            {createdOffset === 0 && !created.data?.items?.length && !unpublished.length && (
               <div className="community-empty">
                 <Sparkles size={28} />
                 <strong>从一个小想法开始</strong>
@@ -688,16 +698,14 @@ export default function CommunityCenter({
       )}
       {publish && (
         <Publish
-          localItems={publicationItems.filter(
-            (item) =>
-              !provenance.data?.reservedIds?.includes(item.id) &&
-              (!provenance.data?.downloaded?.[item.id] || owned[item.id]),
-          )}
+          localItems={publicationItems}
+          provenance={provenance}
           owned={owned}
           selectedPath={publish.path}
           onClose={() => setPublish(null)}
           onPublished={(work) => {
             setPublish(null);
+            setCreatedOffset(0);
             setTab("created");
             setNotice(`「${work.name}」已提交审核，通过后会公开上架。`);
             changed();

@@ -6,10 +6,12 @@ from pathlib import Path
 def test_hidden_alarm_delivery_cancel_and_delete(tmp_path):
     fw = Path(__file__).resolve().parents[1]
     source = (fw/'main/pet_p4_miniapp_ext.inc').read_text()
+    from p4_alarm_utc_test import NO_LOCAL_GRANTS
+    source = source.replace('#include "pet_p4_local_alarm.inc"', NO_LOCAL_GRANTS)
     top = source[source.index('#if PET_P4_CAPABILITY_EXT'):source.index('static int ext_find_int_var')] + '\n#endif\n'
     start = source.index('#if PET_P4_EVENTS\n/* Alarm bookkeeping')
     process = source[start:source.index('static pet_cext_publish_ticket_t *g_ext_pending_publish', start)]
-    start = source.index('static void miniapp_ext_removed(')
+    start = source.index('#if PET_P4_EVENTS\nstatic void miniapp_ext_forget_events(')
     removed = source[start:source.index('static bool miniapp_ext_install_chunk', start)]
     (tmp_path/'freertos').mkdir()
     (tmp_path/'freertos/semphr.h').write_text('''#include <pthread.h>
@@ -72,7 +74,24 @@ int main(void){
  // Removal revokes an already queued notice and clears all future table activity.
  e->alarms.items[0].armed=true;e->alarms.items[0].cancelled=false;e->alarms.items[0].utc_deadline=false;e->alarms.items[0].waiting_for_clock=false;e->alarms.items[0].deadline_ms=100000;
  miniapp_ext_process(100000,false);assert(g_ext_notice_pending);
+ // Other alarms/components cannot revoke the queued reminder.
+ e->alarms.count=2;
+ e->alarms.items[1]=e->alarms.items[0];
+ strcpy(e->alarms.items[1].id,"other");
+ assert(!pet_p4_miniapp_alarm_cancel("parked", "missing"));
+ assert(pet_p4_miniapp_alarm_cancel("parked", "other"));
+ assert(pet_p4_miniapp_alarm_cancel("active", "timer"));
+ miniapp_ext_removed("different", 1);
+ assert(g_ext_notice_pending);
+ assert(pet_p4_miniapp_alarm_cancel("parked", "timer"));
+ assert(!pet_p4_miniapp_alarm_notification(title,text));
+ // Queue once more and uninstall before the notification consumer runs.
+ e->alarms.items[0].cancelled=false;
+ e->alarms.items[0].pending=true;
+ miniapp_ext_process(100001,false);
+ assert(g_ext_notice_pending);
  miniapp_ext_removed("parked",0);assert(!pet_p4_miniapp_alarm_notification(title,text));assert(!ext_alarm_entry("parked",false));
+ assert(!pet_p4_miniapp_alarm_cancel("parked", "timer"));
  miniapp_ext_process(100001,true);assert(!dispatches);
  setup();pet_p4_miniapp_alarm_policy(true);miniapp_ext_process(0,false);
  assert(pet_p4_miniapp_alarm_cancel("active","timer"));miniapp_ext_process(70000,false);
@@ -81,7 +100,7 @@ int main(void){
 }
 ''')
     binary = tmp_path/'events'
-    subprocess.run(['cc','-std=c11','-pthread','-fsanitize=address,undefined','-Wall','-Wextra','-Werror','-I',str(tmp_path),'-I',str(fw/'main'),'-I',str(fw/'tests/vendor/cjson'),str(harness),str(fw/'main/pet_p4_component_events.c'),'-o',str(binary)],check=True)
+    subprocess.run(['cc','-std=c11','-DPET_P4_EVENTS=1','-pthread','-fsanitize=address,undefined','-Wall','-Wextra','-Werror','-I',str(tmp_path),'-I',str(fw/'main'),'-I',str(fw/'tests/vendor/cjson'),str(harness),str(fw/'main/pet_p4_component_events.c'),'-o',str(binary)],check=True)
     subprocess.run([str(binary)],check=True,timeout=10)
 
 

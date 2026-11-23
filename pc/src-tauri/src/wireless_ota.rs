@@ -96,12 +96,15 @@ impl<'a> VerifiedImage<'a> {
 pub(crate) struct Pending {
     board_id: String,
     prior: Boot,
-    receipt: Receipt,
+    receipt: Option<Receipt>,
+    expected_digest: Hash,
 }
 
 impl Pending {
+    pub fn commit_confirmed(&self) -> bool { self.receipt.is_some() }
+
     pub fn rolled_back(&self, authenticated_board_id: &str, boot: &Boot) -> bool {
-        authenticated_board_id == self.board_id
+        self.commit_confirmed() && authenticated_board_id == self.board_id
             && !boot.id.is_empty()
             && boot.id != self.prior.id
             && boot.valid
@@ -116,8 +119,17 @@ impl Pending {
             && !boot.id.is_empty()
             && boot.id != self.prior.id
             && boot.valid
-            && boot.partition == self.receipt.partition
-            && boot.digest == self.receipt.installed_digest
+            && boot.partition != self.prior.partition
+            && match &self.receipt {
+                Some(receipt) => boot.partition == receipt.partition,
+                // Published P4 layouts have two slots. The authenticated boot must now
+                // occupy the alternate slot, including on legacy 2.5 MiB layouts.
+                None => self.expected_digest != self.prior.digest && matches!(
+                    (self.prior.partition, boot.partition),
+                    (0x10000, 0x290000 | 0x310000) | (0x290000 | 0x310000, 0x10000)
+                ),
+            }
+            && boot.digest == self.expected_digest
     }
 }
 
@@ -158,18 +170,19 @@ pub(crate) fn install(
             }
         }
         report_progress("verify", 100);
-        let receipt = link.commit(id)?;
-        if receipt.partition == prior.partition
-            || receipt.installed_digest != image.installed_digest
-        {
-            return Err(Error::Unknown(
-                "OTA receipt does not match the selected image".into(),
-            ));
-        }
+        let receipt = match link.commit(id) {
+            Ok(receipt) if receipt.partition != prior.partition
+                && receipt.installed_digest == image.installed_digest => Some(receipt),
+            Ok(_) => return Err(Error::Unknown("OTA receipt does not match the selected image".into())),
+            // The board may already be rebooting. Only observe the next authenticated boot.
+            Err(Error::Unknown(_)) => None,
+            Err(error) => return Err(error),
+        };
         Ok(Pending {
             board_id: board_id.into(),
             prior,
             receipt,
+            expected_digest: image.installed_digest,
         })
     })();
     link.close();
@@ -206,7 +219,7 @@ mod tests {
             self.event("boot")?;
             Ok(Boot {
                 id: "first".into(),
-                partition: 1,
+                partition: 0x10000,
                 digest: [4; 32],
                 valid: true,
             })
@@ -229,7 +242,7 @@ mod tests {
         fn commit(&mut self, _: TransferId) -> Result<Receipt, Error> {
             self.event("commit")?;
             Ok(Receipt {
-                partition: 2,
+                partition: 0x310000,
                 installed_digest: [7; 32],
             })
         }
@@ -272,10 +285,19 @@ mod tests {
             };
             let image =
                 VerifiedImage::new(&bytes, Sha256::digest(&bytes).into(), [7; 32], 302).unwrap();
-            assert!(matches!(
-                install(&mut link, "test-board", [1; 16], image, |_, _| {}),
-                Err(Error::Unknown(_))
-            ));
+            let result = install(&mut link, "test-board", [1; 16], image, |_, _| {});
+            if phase == "commit" {
+                let pending = result.unwrap();
+                let boot = Boot { id: "next".into(), partition: 0x310000, valid: true, digest: [7; 32] };
+                assert!(pending.validated("test-board", &boot));
+                assert!(!pending.validated("other-board", &boot));
+                assert!(!pending.validated("test-board", &Boot { partition: 0x9000, ..boot.clone() }));
+                assert!(!pending.validated("test-board", &Boot { partition: 0x10000, ..boot.clone() }));
+                assert!(!pending.validated("test-board", &Boot { digest: [8;32], ..boot }));
+                assert!(!pending.rolled_back("test-board", &Boot { id: "next".into(), ..pending.prior.clone() }));
+            } else {
+                assert!(matches!(result, Err(Error::Unknown(_))));
+            }
             assert_eq!(link.events, events);
         }
     }
@@ -321,7 +343,7 @@ mod tests {
         );
         let mut boot = Boot {
             id: "second".into(),
-            partition: 2,
+            partition: 0x310000,
             digest: [7; 32],
             valid: false,
         };

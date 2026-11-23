@@ -75,7 +75,10 @@ def extract(profile, release, local_assets, temporary):
     archive_path.write_bytes(data)
     with zipfile.ZipFile(archive_path) as package:
         members = package.infolist()
-        matches = [member for member in members if member.filename == stem + '.bin']
+        package_root = f'HachimoDock-P4-{profile.rsplit("-", 1)[1]}_{app["version"]}_Factory-Flasher'
+        image_name = f'HachimoDock-P4_{app["version"]}_factory.bin'
+        expected_paths = {stem + '.bin', f'{package_root}/firmware/{image_name}'}
+        matches = [member for member in members if member.filename in expected_paths]
         verify(len(matches) == 1 and matches[0].file_size == FACTORY_BYTES,
                f'{profile}: invalid factory image')
         length = app['bytes']

@@ -25,9 +25,9 @@ paused, playing, ended, disconnected and error states remain distinguishable.
 Inputs: primary play/pause; secondary queue/player; joystick previous/next or seek
 in seek mode, up/down volume or queue selection, middle seek/confirm selection.
 Global exit and long-press voice bindings remain owned by the product.
-Leaving the component keeps music playing in the background. From 0.7.69-p4,
-pressing the configured global Back again on the pet home page stops music locally
-and emits `media/event` with `operation=stop`, even during PC-side preparation.
+Leaving the component stops playback on the device and emits `media/event`
+with `operation=stop` to cancel desktop playback or preparation. The configured
+global Back on the pet home page can also cancel desktop preparation.
 PC cancels the current generation immediately without blocking the USB receive
 thread; any cleanup request is scoped to that generation's registered session.
 The library is retained. Back in realtime mode still exits the conversation first.

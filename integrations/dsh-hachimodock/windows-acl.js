@@ -43,21 +43,40 @@ function validateAclReceipt(receipt, operation, target) {
   else if (receipt.item !== null) throw new Error('unexpected Windows capability item')
   return receipt
 }
+function nativeAclExecutable() {
+  // Installed bridge adapters and the managed DeepSeek plugin use the same
+  // bundled helper. Resolve from fixed resource locations, never from PATH.
+  const directory = path.basename(__dirname) === 'adapters'
+    ? path.resolve(__dirname, '../../../../..', 'dsh-bridge')
+    : __dirname
+  return path.join(directory, 'windows-acl.exe')
+}
+
+function runNativeAcl(mode, operation, target, options = {}, nonce = null) {
+  const env = options.env || process.env
+  const systemRoot = windowsPath(env.SystemRoot || env.SYSTEMROOT || env.WINDIR)
+  const executable = nativeAclExecutable()
+  if (!options.spawn) {
+    const binary = fs.lstatSync(executable)
+    if (!binary.isFile() || binary.isSymbolicLink()) throw new Error('Windows native ACL helper unavailable')
+  }
+  const args = [mode, operation, target]
+  if (nonce !== null) args.push(nonce)
+  return (options.spawn || spawnSync)(executable, args, {
+    windowsHide: true, encoding: 'utf8', timeout: 5000,
+    maxBuffer: mode === 'profile' ? 65536 : 32768,
+    env: { SystemRoot: systemRoot, WINDIR: systemRoot },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+}
+
 function windowsAcl(operation, target, options = {}) {
   if (!OPERATIONS.has(operation)) throw new Error('invalid Windows ACL operation')
   target = windowsPath(target)
-  const env = options.env || process.env
-  const systemRoot = windowsPath(env.SystemRoot || env.SYSTEMROOT || env.WINDIR)
-  const executable = path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-  const script = fs.readFileSync(path.join(__dirname, 'windows-acl.ps1'), 'utf8')
-  const result = (options.spawn || spawnSync)(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], {
-    windowsHide: true, encoding: 'utf8', timeout: 5000, maxBuffer: 32768,
-    env: { SystemRoot: systemRoot, WINDIR: systemRoot, PSModulePath: path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules'), HACHIMODOCK_DSH_ACL_OPERATION: operation, HACHIMODOCK_DSH_ACL_PATH: target },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
+  const result = runNativeAcl('capability', operation, target, options)
   if (result.error || result.signal || result.status !== 0 || result.stderr?.trim() || typeof result.stdout !== 'string' || Buffer.byteLength(result.stdout) > 32768) throw aclFailure(operation, result)
   let receipt
   try { receipt = JSON.parse(result.stdout.replace(/^\uFEFF/, '').trim()) } catch { throw new Error('invalid Windows ACL receipt') }
   return validateAclReceipt(receipt, operation, target)
 }
-module.exports = { windowsPath, validateAclReceipt, windowsAcl }
+module.exports = { windowsPath, validateAclReceipt, windowsAcl, runNativeAcl }

@@ -27,6 +27,11 @@ def factory_command(environment, include_upload):
         upload_port = environment.subst("$UPLOAD_PORT").strip()
         if not upload_port:
             raise RuntimeError("factory_upload requires --upload-port")
+        physical_board = os.environ.get("PET_FACTORY_PHYSICAL_BOARD", "").strip()
+        if physical_board:
+            if physical_board not in ("pico", "wifi6"):
+                raise RuntimeError("PET_FACTORY_PHYSICAL_BOARD must be the physically checked pico or wifi6")
+            command.extend(["--flash-board-model", physical_board])
         command.extend(
             [
                 "--flash-port",

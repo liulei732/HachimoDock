@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "engine": "p4-bounded-runtime-v4",
+  "hardware": {
+    "service": "microphone-level-v1",
+    "quiet_below": 20
+  },
+  "vars": {},
+  "states": [
+    "idle"
+  ],
+  "initial_state": "idle",
+  "transitions": [],
+  "tick": [],
+  "dashboard": {
+    "title": "安静练习",
+    "headline": "等待设备授权",
+    "note": "在设备上练习保持安静，电平达到 20 时提示超过阈值。",
+    "footer": "SW1 开始或停止，退出结束",
+    "visualStyle": "clean",
+    "visualPalette": "ocean",
+    "visualLayout": "tool",
+    "visualSprite": "gauge"
+  }
+}

@@ -46,7 +46,7 @@ test("offline mappings use the last reading only when it matches the selected bo
 });
 
 test("a Wi-Fi peer exposes configuration loading, but an active USB connection takes priority", () => {
-  const wifi = { boardDeviceId: "p4-123", bootId: "0123456789abcdef" };
+  const wifi = { boardDeviceId: "p4-123", bootId: "0123456789abcdef", wifiConnected:true, controlTrusted:true };
   const wireless = renderKeyboard({ usb: { connected: false }, wifi }, null);
   assert.match(wireless, /正在读取配置…/);
   assert.match(wireless, /蓝牙模式状态未确认/);
@@ -55,4 +55,13 @@ test("a Wi-Fi peer exposes configuration loading, but an active USB connection t
     wifi }, null);
   assert.match(wired, /当前设备固件尚未开放独立的蓝牙键盘配置/);
   assert.doesNotMatch(wired, /正在读取配置…/);
+});
+
+test("untrusted wireless peer cannot edit and an unknown board cannot show another board's cache", () => {
+  const keys = Array(20).fill(0x106);
+  const html = renderKeyboard({ usb:{connected:false}, wifi:{boardDeviceId:"board",bootId:"a".repeat(16),
+    wifiConnected:true,controlTrusted:false} }, {board:"elsewhere",keys});
+  assert.match(html,/授权 Wi-Fi 控制/);
+  assert.doesNotMatch(html,/正在读取配置|左 Ctrl \+ C|role="switch"/);
+  assert.doesNotMatch(renderKeyboard({usb:{}},{board:"elsewhere",keys}),/左 Ctrl \+ C|上次读取的设备配置/);
 });

@@ -4,7 +4,8 @@ import {readFileSync} from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
 
-const source=readFileSync(new URL('./app.js',import.meta.url),'utf8');
+import {featureView} from './feature-view.mjs';
+const source=readFileSync(new URL('./app.js',import.meta.url),'utf8').replace("import {featureView} from './feature-view.mjs';", '');
 class Element {
   constructor(tag){this.tag=tag;this.children=[];this.attributes={};this.events={};}
   append(...children){this.children.push(...children);}
@@ -14,7 +15,7 @@ class Element {
 }
 function harness(detail){
   const root=new Element('main'),writes=[],parent={postMessage(){}};
-  const sandbox=vm.createContext({Node:Element,URLSearchParams,AbortSignal,crypto:globalThis.crypto,
+  const sandbox=vm.createContext({featureView,Node:Element,URLSearchParams,AbortSignal,crypto:globalThis.crypto,
     document:{querySelector:()=>root,createElement:tag=>new Element(tag),createTextNode:text=>text},
     window:{parent,addEventListener(){}},parent,location:{hash:'',origin:'https://community.invalid'},
     localStorage:{getItem:key=>key==='community-browser-token'?JSON.stringify('a'.repeat(64)):null,setItem:(...args)=>writes.push(args)},
@@ -61,4 +62,14 @@ test('hidden first page keeps next page reachable and filters explicit unavailab
   assert.equal((await h.run('loadFavoritePage(context.favorites,18)')).items.length,1);
   assert.equal(h.run("card({id:'withdrawn',available:false})"),null);
   assert.deepEqual(h.writes,[]);
+});
+
+test('public detail renders confirmed producers with unknown target, even with a stale legacy flag',async()=>{
+  const work={id:'unit',name:'测试',requirements:{pcRequired:true,featureManifest:{schemaVersion:1,runtime:'r',
+    features:[{id:'feed',label:'报价',paths:['device-wifi','pc-usb']},{id:'manage',label:'管理',paths:['pc']}]}}};
+  const h=harness(()=>work);
+  h.run("context={identity:{displayName:'测试'},favorites:[]};api=async a=>a==='comments'?{items:[]}:a==='status'?{}:__detail()");
+  await h.run("renderDetail('unit')");
+  assert.match(text(h.root),/报价.*WiFi6 设备联网.*板卡能力待核对.*PC 经 USB/s);
+  assert.match(text(h.root),/管理.*PC/s);
 });

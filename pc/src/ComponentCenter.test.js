@@ -48,7 +48,7 @@ test("stock management lives only in the matching component details", () => {
 test("ComponentCenter uses one library and removes the separate board overview", () => {
   const component = readSource("ComponentCenter.jsx");
   assert.match(component, /id="component-library"/);
-  assert.match(component, /组件库卡片会直接显示设备同步状态/);
+  assert.match(component, /组件卡片会显示安装状态/);
   assert.doesNotMatch(component, /component-center-header-tools/);
   assert.match(component, /component-library-filters/);
   assert.match(component, /label: "全部"/);
@@ -87,7 +87,7 @@ test("component center keeps the creation workflow in its drawer and hosts commu
   assert.match(component, /title="组件中心"/);
   assert.match(
     component,
-    /subtitle="发现、创作与分享属于你的桌面玩法"/,
+    /subtitle="预览和管理设备组件，也可以从社区发现新玩法。"/,
   );
   assert.match(component, /<CommunityCenter/);
   assert.match(component, /请使用 PetUI.*\$petui/);
@@ -115,7 +115,7 @@ test("direct sync preflights one component and respects board capacity", () => {
     component.indexOf("async function installSelectedComponent"),
   );
   assert.match(syncBody, /localInstallBlockedReason\(component\)/);
-  assert.match(syncBody, /componentUsbInstallBlockedReason\(component, usb\)/);
+  assert.match(syncBody, /componentInstallBlockedReason\(component, usb, wifi, liveInventoryTarget\)/);
   assert.match(syncBody, /deviceInventory\.items\.length >= maxInstalled/);
   assert.match(syncBody, /await installSelectedComponent\(component, \{freshImport\}\)/);
   assert.match(syncBody, /设备组件已满/);
@@ -301,7 +301,7 @@ test("ComponentCenter keeps the 创建组件 actions button + drawer wiring", ()
   assert.match(component, /setCreateDrawerOpen/);
 });
 
-test("ComponentCenter writes target-scoped active state on successful install (driving ContextRail)", () => {
+test("ComponentCenter writes target-scoped active state on successful install", () => {
   const component = readSource("ComponentCenter.jsx");
   const store = readSource("lib/active-component-store.js");
   assert.match(component, /writeActiveComponentForTarget\(component, target\)/);
@@ -558,7 +558,7 @@ test("builtin catalog starts with stocks followed by 双键接球 and a sprite-c
 
   assert.match(fixtures, /components:\s*\[\s*\{\s*id: "stock-watchlist"/);
   assert.equal(componentManifest.id, "two-key-pong");
-  assert.equal(componentManifest.version, "1.2.3");
+  assert.equal(componentManifest.version, "1.2.4");
   assert.equal(widget.engine, "p4-bounded-runtime-v4");
   assert.equal(widget.surface.scene_view.engine, "p4-scene-surface-v1");
   assert.deepEqual(widget.scene.grid, { width: 16, height: 16 });

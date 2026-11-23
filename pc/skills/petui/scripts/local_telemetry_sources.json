@@ -1,0 +1,5 @@
+{
+  "codex.accounts": {
+    "actions": ["refresh", "previous", "next", "page_up", "page_down", "quota", "overview", "detail", "cycle_period", "hour", "today", "day", "week", "month"]
+  }
+}

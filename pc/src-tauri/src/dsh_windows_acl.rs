@@ -1,4 +1,4 @@
-//! Fixed Windows-only ACL verifier. The child receives paths/operation, never a token.
+//! Launch the bundled Win32 ACL verifier with a path and operation.
 use serde_json::Value;
 
 fn valid_path(path: &str) -> bool {
@@ -74,7 +74,6 @@ fn validate_receipt(v: &Value, file: &str) -> Result<(), String> {
 }
 
 pub(crate) fn verify_file(file: &std::path::Path) -> Result<(), String> {
-    use base64::Engine;
     use std::io::Read;
     #[cfg(windows)]
     use std::os::windows::process::CommandExt;
@@ -90,29 +89,18 @@ pub(crate) fn verify_file(file: &std::path::Path) -> Result<(), String> {
     if !valid_path(&root) {
         return Err("invalid Windows SystemRoot".into());
     }
-    let executable =
-        std::path::Path::new(&root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
-    let script = include_str!("../../../integrations/dsh-hachimodock/windows-acl.ps1");
-    let utf16: Vec<u8> = script
-        .encode_utf16()
-        .flat_map(|c| c.to_le_bytes())
-        .collect();
-    let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
+    let app = std::env::current_exe().map_err(|_| "Windows ACL helper path unavailable")?;
+    let executable = app.parent().ok_or("Windows ACL helper path unavailable")?.join("dsh-bridge/windows-acl.exe");
+    let metadata = std::fs::symlink_metadata(&executable).map_err(|_| "Windows native ACL helper unavailable")?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("Windows native ACL helper unavailable".into());
+    }
     let mut command = Command::new(executable);
     command
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-EncodedCommand",
-            &encoded,
-        ])
+        .args(["capability", "verify-file", target])
         .env_clear()
         .env("SystemRoot", &root)
         .env("WINDIR", &root)
-        .env("PSModulePath", std::path::Path::new(&root).join("System32/WindowsPowerShell/v1.0/Modules"))
-        .env("HACHIMODOCK_DSH_ACL_OPERATION", "verify-file")
-        .env("HACHIMODOCK_DSH_ACL_PATH", target)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

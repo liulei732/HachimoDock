@@ -5,6 +5,7 @@
  * [Sync] If this file changes, update `pc/src/component-center/.folder.md`.
  */
 
+import {wifiComponentTarget} from '../lib/wifi-device-control.js';
 import {compareVersions} from './catalog-state.js';
 import factoryConfig from '../../../firmware/factory-config.json' with {type: 'json'};
 
@@ -74,14 +75,42 @@ export function legacyAudioInstallBlockedReason(component) {
   return "此包使用已停用的旧播放器接口 audio.player。请用 PetUI 的本地媒体服务桥重新打包，再导入和同步。";
 }
 
-export function componentUsbInstallBlockedReason(component, usb) {
+export function componentInstallBlockedReason(component, usb, wifi, target) {
   const requirements = Object.entries(component?.syncRequirements?.usbCapabilities || {});
   if (!requirements.length) return "";
-  if (!usb?.connected || !usb.boardDeviceId) {
-    return "此组件需要通过 USB 握手确认服务能力。请连接 USB 设备后同步。";
+  let capabilities;
+  let transport;
+  if (usb?.connected) {
+    if (!usb.boardDeviceId) return "USB 设备尚未完成身份握手。";
+    capabilities = usb.capabilities;
+    transport = "USB";
+  } else if (target?.transport === "ssh") {
+    return "当前 SSH 连接未协商组件能力，请连接 USB 或受信 Wi-Fi 设备。";
+  } else {
+    if (!wifi?.wifiConnected) return "无线设备未在线，请连接 USB 或恢复设备 Wi-Fi。";
+    if (!wifi.controlTrusted) return "当前无线设备尚未授权控制，请先完成设备信任。";
+    if (!wifi.panelControl || !wifi.componentDelivery || !wifi.componentBundle)
+      return "当前固件不支持 Wi-Fi 组件分段安装，请更新固件或连接 USB。";
+    if (wifi.componentTargetError) return wifi.componentTargetError;
+    const snapshot = wifiComponentTarget(wifi);
+    if (!snapshot || target?.boardDeviceId !== snapshot.boardDeviceId || target?.bootId !== snapshot.bootId
+        || target?.association !== snapshot.association)
+      return "未取得当前设备、本次启动和 Wi-Fi 连接的组件能力，请刷新或更新固件。";
+    capabilities = snapshot.capabilities;
+    transport = "Wi-Fi";
   }
-  const missing = requirements.filter(([key, version]) => usb.capabilities?.[key] !== version);
+  const missing = requirements.filter(([key, version]) => capabilities?.[key] !== version);
+  for (const [key, needed] of Object.entries(component.syncRequirements.minimumLimits || {})) {
+    let limit = capabilities?.[key];
+    if (limit === undefined) {
+      // USB hello v1 and hachi-audio-v2 have published legacy ceilings.
+      if (key === "widgetWasmAudioMaxBytes") limit = 512 * 1024;
+      else if (transport === "USB") limit = {widgetWasmMaxBytes: 65536, widgetWasmMemoryPages: 2}[key];
+    }
+    if (!Number.isSafeInteger(limit)) return `当前 ${transport} 设备未报告有效的 ${key}，请刷新能力或更新固件。`;
+    if (needed > limit) return `此组件需要 ${key} 至少为 ${needed}，当前 ${transport} 设备仅支持 ${limit}。`;
+  }
   return missing.length
-    ? `当前 USB 设备未声明组件所需能力：${missing.map(([key, version]) => `${key}=${version}`).join("、")}。请检查实际固件版本和设备握手。`
+    ? `当前 ${transport} 设备未声明组件所需能力：${missing.map(([key, version]) => `${key}=${version}`).join("、")}。请检查固件版本。`
     : "";
 }

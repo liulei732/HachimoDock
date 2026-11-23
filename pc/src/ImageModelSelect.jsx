@@ -1,13 +1,19 @@
+import { formatModelIssue } from "./lib/model-issue.js";
+import { useModelCatalog } from "./lib/use-model-catalog.js";
 import React, { useEffect, useState } from "react";
 import { imageModelOptions, listImageModelCatalog } from "./lib/image-models.js";
 import { DEFAULT_VOLCANO_IMAGE_MODEL } from "./lib/avatar-pipeline/providers/volcano-image.js";
 
-export default function ImageModelSelect({ value, onChange, apiKey = "", baseUrl, disabled = false, saveHint = "修改后点击保存。" }) {
-  const [revision, setRevision] = useState(0);
+export default function ImageModelSelect({ value, onChange, apiKey = "", baseUrl, disabled = false, autoLoad = true, saveHint = "修改后点击保存。" }) {
+  const { requested, revision, refresh } = useModelCatalog(autoLoad, "image", baseUrl, apiKey);
   const [manual, setManual] = useState(false);
   const [state, setState] = useState({ models: [], shutdownModels: [], unavailableModels: [], loading: false, error: "" });
   useEffect(() => {
     const controller = new AbortController();
+    if (!requested) {
+      setState({ models: [], loading: false, error: "", shutdownModels: [], unavailableModels: [] });
+      return;
+    }
     setState(previous => ({ models: [],
       shutdownModels: previous.apiKey === apiKey && previous.baseUrl === baseUrl ? previous.shutdownModels : [],
       unavailableModels: previous.apiKey === apiKey && previous.baseUrl === baseUrl ? previous.unavailableModels : [],
@@ -16,13 +22,13 @@ export default function ImageModelSelect({ value, onChange, apiKey = "", baseUrl
       if (!apiKey.trim()) return;
       listImageModelCatalog({ apiKey, baseUrl, signal: controller.signal }).then(catalog => {
         if (!controller.signal.aborted) setState({ ...catalog, apiKey, baseUrl, loading: false, error: "" });
-      }).catch(() => {
+      }).catch(error => {
         if (!controller.signal.aborted) setState(previous => ({ ...previous, models: [], loading: false,
-          error: "模型列表暂不可用，可选择内置候选或手动填写；不会替换已选模型。" }));
+          error: formatModelIssue("catalog", "火山方舟", error) + " 可选择内置候选或手动填写，保留已选模型。" }));
       });
     }, 600);
     return () => { clearTimeout(timer); controller.abort(); };
-  }, [apiKey, baseUrl, revision]);
+  }, [apiKey, baseUrl, revision, requested]);
   const models = imageModelOptions(state, value);
   const currentModel = value || DEFAULT_VOLCANO_IMAGE_MODEL;
   const unavailable = new Set([...state.shutdownModels, ...state.unavailableModels]);
@@ -37,7 +43,7 @@ export default function ImageModelSelect({ value, onChange, apiKey = "", baseUrl
         {models.map(id => <option key={id} value={id}>{id}</option>)}
       </select>
       <button type="button" className="btn-ghost btn-sm" disabled={disabled || state.loading || !apiKey.trim()}
-        onClick={() => setRevision(n => n + 1)}>{state.loading ? "获取中…" : "刷新列表"}</button>
+        onClick={refresh}>{state.loading ? "获取中…" : "刷新列表"}</button>
     </div>
     <label className="field-helper"><input type="checkbox" disabled={disabled} checked={manual}
       onChange={event => setManual(event.target.checked)} /> 手动填写模型 / 接入点 ID</label>

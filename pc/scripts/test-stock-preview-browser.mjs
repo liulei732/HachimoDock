@@ -20,10 +20,10 @@ try {
     }};
     const React=(await import('/node_modules/.vite/deps/react.js')).default;
     const dom=await import('/node_modules/.vite/deps/react-dom_client.js');
-    const {default:CandidateCard}=await import('/src/component-center/CandidateCard.jsx');
+    const {default:StockPreview}=await import('/src/component-center/StockScreenPreview.jsx');
     const css=document.createElement('link');css.rel='stylesheet';css.href='/src/styles.css';document.head.append(css);
     const root=(dom.createRoot||dom.default.createRoot)(document.getElementById('root'));
-    root.render(React.createElement('div',{style:{width:'min(430px, 100%)'}},React.createElement(CandidateCard,{component:{id:'stock-watchlist',name:'自选股行情',dashboard:{visualStyle:'clean',visualLayout:'tool'},goal:'预览默认股票，在详情中管理实际自选股。'},kind:'tool',onClick:()=>{}})));
+    root.render(React.createElement('div',{style:{width:'min(430px, 100%)'}},React.createElement(StockPreview,{active:true})));
   });
   await page.getByText('小米集团',{exact:true}).waitFor();
   await page.getByText('阿里巴巴',{exact:true}).waitFor();

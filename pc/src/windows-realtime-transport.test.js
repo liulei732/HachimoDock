@@ -33,7 +33,7 @@ test("CH343 live audio retains 64-byte bursts and never drains or pauses RX", ()
   const live = rust("usb_serial/live_audio_pacing.rs").split("#[cfg(test)]\nmod tests")[0];
   assert.doesNotMatch(live, /writer\.flush\(/);
   assert.match(source, /let audio_frame = topic.starts_with\("audio\/"\) \|\| topic.starts_with\("media\/"\) \|\| topic == "ui\/conversation";/);
-  assert.match(source, /let live_frame = audio_frame \|\| topic == "widget\/data" \|\| topic == "app\/snapshot" \|\| topic == "ui\/text-pixels"\s*\|\| \(!bulk_frame && conn.capture_active.load\(Ordering::Acquire\)\);/);
+  assert.match(source, /let live_frame = audio_frame \|\| voice_feedback \|\| topic == "widget\/data" \|\| topic == "app\/snapshot" \|\| topic == "ui\/text-pixels"\s*\|\| \(!bulk_frame && conn.capture_active.load\(Ordering::Acquire\)\);/);
   assert.match(source, /let bounded_frame = serial_frame_is_bounded\(topic, live_frame\);/);
   const classify=source.split("fn serial_frame_is_bounded(")[1].split("fn flush_serial_writer")[0];
   assert.match(classify, /live_frame \|\| matches!\(topic, "system\/heartbeat" \| "diagnostics\/query"\)/);
@@ -62,7 +62,7 @@ test("device rejection logs allowlisted topic and reason without provider payloa
 test("failed audio writes stop playback and do not advance the sent-byte counter", () => {
   const source = rust("realtime_chat.rs");
   const chunk = source.slice(source.indexOf("let flush_chunk ="), source.indexOf("while let Ok((expected, cmd))"));
-  assert.match(chunk, /let result = send_session_board\(\s*usb, &session,/);
+  assert.match(chunk, /let result = send_playback\(usb, &session, turn_id, PlaybackFrame::Pcm/);
   assert.match(chunk, /"playback_tx"/);
   assert.match(chunk, /if let Err\(error\) = result \{[\s\S]*?request_failure\(&session, "playback_write_failed", Some\("[^"\n]+"\)\);\s+return;/);
   const failure = source.slice(source.indexOf("fn request_failure("), source.indexOf("fn start_guard("));

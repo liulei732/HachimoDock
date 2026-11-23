@@ -19,6 +19,10 @@ use std::{
 mod sprite;
 #[path = "petui_data_link.rs"]
 mod data_link;
+#[path = "petui_features.rs"]
+pub(crate) mod features;
+#[path = "petui_inspection.rs"]
+mod inspection;
 
 static PREPARE: Mutex<()> = Mutex::new(());
 const MAX_PACKAGE_BYTES: usize = 7 * 1024 * 1024;
@@ -487,15 +491,14 @@ fn pack_with_trace(
             .rsplit_once('.')
             .map(|(_, ext)| ext.to_ascii_lowercase())
             .unwrap_or_default();
-        if component_library::FORBIDDEN_COMPONENT_SUFFIXES.contains(&suffix.as_str())
+        if (component_library::FORBIDDEN_COMPONENT_SUFFIXES.contains(&suffix.as_str())
+            && name != crate::component_python::PATH)
             || (suffix == "wasm" && name != WASM)
         {
             return Err(format!("组件内不允许该文件：{name}"));
         }
     }
-    if !files.contains_key(clawpkg::HACHI_COVER_PATH) {
-        return Err("交付包缺少封面 pc/cover.png".into());
-    }
+    clawpkg::require_publication_cover(files.get(clawpkg::HACHI_COVER_PATH).map(Vec::as_slice))?;
     let compiled_source = compiled.is_some();
     let module = compiled.or_else(|| files.remove(WASM));
     let parse = |name: &str| -> Result<Value, String> {
@@ -525,6 +528,7 @@ fn pack_with_trace(
     clawpkg::complete_p4_runtime_containers(&mut widget);
     clawpkg::validate_p4_runtime_shell(&Value::Object(widget.clone()))?;
     let require_game = compiled_source && component["kind"] == "game";
+    clawpkg::validate_network_declaration(&Value::Object(widget.clone()), module.as_deref())?;
     if let Some(module) = module {
         let (canvas, host, _, _, audio) =
             clawpkg::wasm_profile_details(&module).ok_or("WASM 格式、宿主导入或固定内存无效")?;
@@ -567,6 +571,11 @@ fn pack_with_trace(
     }
     if share_default.is_some() {
         files.insert("share.json".into(), serde_json::to_vec(&share).map_err(|e| e.to_string())?);
+    }
+    let widget = Value::Object(widget);
+    let preview_path = "negative-screen.json";
+    if let Some(preview) = clawpkg::initial_host_preview(&widget, files.get(preview_path).map(Vec::as_slice))? {
+        files.insert(preview_path.into(), preview);
     }
     files.insert(WIDGET.into(), serde_json::to_vec(&widget).map_err(|e| e.to_string())?);
     files.insert(
@@ -684,10 +693,11 @@ pub(super) fn cli(args: &[OsString]) -> Result<String, String> {
     match args {
         [command, source] if command == "publish-json" => {
             let home=crate::get_home_dir()?;
-            let entry=component_library::publish_source(&home,Path::new(source))?;
+            let entry=component_library::publish_authored(&home,Path::new(source))?;
             serde_json::to_string(&entry).map_err(|e|e.to_string())
         }
-        [command] if command == "tool-info" => Ok(json!({"version":env!("CARGO_PKG_VERSION"),"protocol":2,"target":target()}).to_string()),
+        [command] if command == "tool-info" => Ok(json!({"version":env!("CARGO_PKG_VERSION"),"protocol":2,"target":target(),"pythonPlugin":"petui-python-v1","scopedWrite":"p4-scoped-write-v1","featureManifest":1,"inspection":["compatibility","first-data","install-rehearsal"]}).to_string()),
+        [command, args @ ..] if matches!(command.to_str(), Some("compatibility" | "first-data" | "install-rehearsal")) => inspection::run(command.to_str().unwrap(), args),
         [command, args @ ..] if command == "data-link" => {
             let [runtime, report, scope @ ..] = args else { return Err(data_link::USAGE.into()); };
             data_link::run(Path::new(runtime), Path::new(report), scope)
@@ -737,10 +747,34 @@ pub(super) fn cli(args: &[OsString]) -> Result<String, String> {
             check_package_wasm(Path::new(package), None, false)?;
             Ok("组件包校验通过".into())
         }
+        [command, package, fixture] if command == "python-preview" => {
+            let package = Path::new(package);
+            let checked = clawpkg::validate_clawpkg_at_path(package)?;
+            if !checked.ok { return Err(checked.errors.join("；")); }
+            let inputs = clawpkg::read_clawpkg_source_file(Path::new(fixture), 24 * 1024)?;
+            let input = serde_json::from_slice(&inputs).map_err(|_| "预览输入需为 JSON")?;
+            let code = if package.is_dir() {
+                clawpkg::read_clawpkg_source_file(&package.join(crate::component_python::PATH), crate::component_python::MAX_SOURCE as u64)?
+            } else {
+                let mut zip = zip::ZipArchive::new(fs::File::open(package).map_err(|_| "无法打开组件包")?)
+                    .map_err(|_| "组件包无效")?;
+                let mut code = Vec::new();
+                zip.by_name(crate::component_python::PATH).map_err(|_| "组件未声明 Python")?
+                    .take((crate::component_python::MAX_SOURCE + 1) as u64).read_to_end(&mut code)
+                    .map_err(|_| "无法读取 Python 入口")?;
+                code
+            };
+            let code = crate::component_python::validate_source(&code)?;
+            let value = crate::component_python::run(&local_resources()?, code, input, || false)?;
+            serde_json::to_string(&value).map_err(|_| "无法输出预览结果".into())
+        }
         [command, package] if command == "publish" => {
             let path = Path::new(package);
+            if !path.is_file() || !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("hachiapp") || ext.eq_ignore_ascii_case("clawpkg")) {
+                return Err("请选择组件包文件".into());
+            }
             let entry = crate::get_home_dir()
-                .and_then(|home| component_library::import_hachiapp(&home, path))
+                .and_then(|home| component_library::publish_authored(&home, path))
                 .map_err(|error| format!(
                     "发布到本地组件库失败：{error}。请保留 {}，在 Pet Manager「组件中心 → 导入组件」中导入。正式目录由客户端生成，请勿手动写入。",
                     path.display()
@@ -749,11 +783,11 @@ pub(super) fn cli(args: &[OsString]) -> Result<String, String> {
             if let Some(reason) = entry.sync_requirements.blocked_reason {
                 result.push_str(&format!("\n该包暂不可同步：{reason}"));
             } else if entry.sync_requirements.requires_usb_capabilities() {
-                result.push_str("\n同步前请在组件中心连接目标设备，由 USB 握手核对所需服务能力。");
+                result.push_str("\n同步前请在组件中心通过 USB 或受信 Wi-Fi 核对当前设备的组件能力。");
             }
             Ok(result)
         }
-        _ => Err(format!("用法：petui doctor | build <app.c> <package> <输出.hachiapp> | pack <package> <输出.hachiapp> | sprite <源.png> <精灵.bin> | verify-wasm <组件包> [--trace <game.trace>] | validate <组件包> | publish <组件包>\n{}", data_link::USAGE)),
+        _ => Err(format!("用法：petui doctor | build <app.c> <package> <输出.hachiapp> | pack <package> <输出.hachiapp> | sprite <源.png> <精灵.bin> | verify-wasm <组件包> [--trace <game.trace>] | validate <组件包> | publish <组件包>\n{}\n{}", data_link::USAGE, inspection::USAGE)),
     }
 }
 
@@ -777,10 +811,90 @@ mod tests {
         ] {
             fs::write(source.join(name), serde_json::to_vec(&value).unwrap()).unwrap();
         }
-        image::RgbImage::new(320, 240)
+        image::RgbImage::from_fn(320, 240, |x,y| image::Rgb([24, if x<60 && y<60 {180} else {40}, 80]))
             .save(source.join("pc/cover.png"))
             .unwrap();
         source
+    }
+
+    #[test]
+    fn inspect_clean_install_and_same_id_upgrade_through_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = source(tmp.path());
+        let original = tmp.path().join("old.hachiapp");
+        let update = tmp.path().join("new.hachiapp");
+        pack(&source, None, &original).unwrap();
+        let run = |command: &str, options: &[&OsStr]| -> Result<Value, String> {
+            let mut args = vec![OsString::from(command), original.as_os_str().to_owned()];
+            args.extend(options.iter().map(|s| s.to_os_string()));
+            serde_json::from_str(&cli(&args)?).map_err(|e| e.to_string())
+        };
+        let compat = run("compatibility", &[]).unwrap();
+        assert_eq!(compat["canRunAllListedFeaturesWithoutPc"], true);
+        let imported = component_library::import_hachiapp(tmp.path(), &original).unwrap();
+        assert_eq!(imported.feature_manifest.as_ref(), compat.get("featureManifest"));
+        assert_eq!(compat["featureStatus"][0]["paths"]["device"], "unconfirmed");
+        let diag = tmp.path().join("diag.json");
+        fs::write(&diag, br#"{"activeWidgetId":"another-widget"}"#).unwrap();
+        let data = run("first-data", &[OsStr::new("--diagnostics"), diag.as_os_str()]).unwrap();
+        assert_eq!(data["activeComponent"], "different");
+        let manifest = source.join("component.json");
+        let mut component: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        component["version"] = "1.0.1".into();
+        fs::write(&manifest, component.to_string()).unwrap();
+        pack(&source, None, &update).unwrap();
+        let rehearsal = run("install-rehearsal", &[OsStr::new("--upgrade"), update.as_os_str()]).unwrap();
+        assert_eq!(rehearsal["upgrade"]["version"], "1.0.1");
+        assert!(run("install-rehearsal", &[OsStr::new("--upgrade"), original.as_os_str()]).is_err());
+    }
+
+    #[test]
+    fn shipped_examples_pack_validate_and_publish_through_cli_in_isolated_library() {
+        const FLAG: &str = "PETUI_TEST_COVER_EXAMPLES";
+        let Some(scratch) = env::var_os(FLAG) else {
+            let tmp = tempfile::tempdir().unwrap();
+            let status = Command::new(env::current_exe().unwrap()).args(["--exact",
+                "petui_authoring::tests::shipped_examples_pack_validate_and_publish_through_cli_in_isolated_library","--nocapture"])
+                .env(FLAG, tmp.path())
+                .env(if cfg!(windows) { "USERPROFILE" } else { "HOME" }, tmp.path())
+                .status().unwrap();
+            assert!(status.success());
+            assert_eq!(fs::read_dir(component_library::library_root(tmp.path())).unwrap().count(),5);
+            return;
+        };
+        let root=Path::new(env!("CARGO_MANIFEST_DIR")).join("../skills/petui/examples");
+        for id in ["mic-level-meter","quiet-room-check","ble-accessory-battery","ble-room-temperature","local-notebook"] {
+            let source=root.join(id);
+            let output=Path::new(&scratch).join(format!("{id}.hachiapp"));
+            cli(&["pack".into(),source.into_os_string(),output.clone().into_os_string()]).unwrap();
+            cli(&["validate".into(),output.clone().into_os_string()]).unwrap();
+            let receipt=cli(&["publish".into(),output.into_os_string()]).unwrap();
+            assert!(receipt.contains("已发布到本地组件库"),"{id}: {receipt}");
+        }
+    }
+
+    #[test]
+    fn new_publication_requires_visible_cover_and_legacy_import_still_works() {
+        let tmp=tempfile::tempdir().unwrap();
+        let seed=tmp.path().join("seed.hachiapp");
+        pack(&source(tmp.path()),None,&seed).unwrap();
+        let source=tmp.path().join("old");
+        crate::component_library::extract_zip_safe(&seed,&source).unwrap();
+        fs::create_dir_all(source.join("assets")).unwrap();
+        let file=source.join("pc/cover.png");
+        fs::remove_file(&file).unwrap();
+        let out=tmp.path().join("sample.hachiapp");
+        let home=tmp.path().join("isolated");
+        assert!(pack(&source,None,&out).unwrap_err().contains("缺少封面"));
+        assert!(component_library::publish_authored(&home,&source).unwrap_err().contains("缺少封面"));
+        assert!(component_library::publish_source(&home,&source).unwrap().valid);
+        fs::write(source.join("hachiapp.json"),br#"{"format":"hachiapp/1","id":"rust-authoring-test"}"#).unwrap();
+        for alpha in [0,255] {
+            image::RgbaImage::from_fn(320,240, |x,_| image::Rgba([if alpha==0 {x as u8} else {12},34,56,alpha])).save(&file).unwrap();
+            assert!(pack(&source,None,&out).unwrap_err().contains("纯色"));
+            assert!(component_library::publish_authored(&home,&source).unwrap_err().contains("纯色"));
+        }
+        assert!(!out.exists());
     }
 
     #[test]
@@ -821,6 +935,41 @@ mod tests {
         fs::write(source.join("pc/cover.png"), b"invalid PNG").unwrap();
         assert!(pack(&source, None, &output).is_err());
         assert_eq!(fs::read(&output).unwrap(), original);
+    }
+
+    #[test]
+    fn host_pack_derives_matching_static_preview_without_editing_the_draft() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source = source(scratch.path());
+        fs::write(
+            source.join("component.json"),
+            br#"{"id":"rust-authoring-test","name":"Rust PetUI","version":"1.0.0","kind":"tool"}"#,
+        ).unwrap();
+        let dashboard = json!({"title":"Quota","headline":"Waiting","footer":"Refresh",
+            "metricValue":"—","note":"Authorization required"});
+        let widget = json!({
+            "schema_version":1, "engine":"p4-bounded-runtime-v4", "host":true,
+            "states":["ready"], "initial_state":"ready", "tick":[], "transitions":[],
+            "vars":{"label":{"type":"string","init":"Waiting"}}, "dashboard":dashboard,
+            "surface":{"engine":"p4-app-surface-v1","graphics":"p4-app-graphics-v1",
+                "bindings":"p4-variable-bindings-v1","background":0,
+                "elements":[{"type":"text","x":20,"y":20,"w":200,"h":32,"color":65535,"var_bind":"label"}]}
+        });
+        fs::write(source.join(WIDGET), serde_json::to_vec(&widget).unwrap()).unwrap();
+        fs::write(source.join("pc/application.json"), serde_json::to_vec(&json!({
+            "schemaVersion":1,"engine":"pc-app-composition-v1","service":"composition","actions":{},
+            "content":[{"sources":{"usage":{"kind":"local-telemetry","source":"codex.accounts"}},
+                "bindings":{"label":{"source":"usage","pointer":"/account","fallback":"Waiting"}}}]
+        })).unwrap()).unwrap();
+        let path = source.join("negative-screen.json");
+        let draft = br#"{"dashboard":{"title":"Old","badge":"Legacy"}}"#;
+        fs::write(&path, draft).unwrap();
+        let output = scratch.path().join("quota.hachiapp");
+        pack(&source, None, &output).unwrap();
+        let mut zip = zip::ZipArchive::new(fs::File::open(output).unwrap()).unwrap();
+        let preview: Value = serde_json::from_reader(zip.by_name("negative-screen.json").unwrap()).unwrap();
+        assert_eq!(preview["dashboard"], widget["dashboard"]);
+        assert_eq!(fs::read(path).unwrap(), draft);
     }
 
     #[test]

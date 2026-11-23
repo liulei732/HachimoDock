@@ -25,6 +25,8 @@
 #include "pet_p4_wifi_data_cache.h"
 #include "pet_p4_wifi_data_roots.h"
 #include "pet_p4_wifi_http.h"
+#include "pet_p4_community_config.h"
+#include "esp_crt_bundle.h"
 
 #define STOCK_INTERVAL_MS 15000
 /* Persist the first good snapshot, then checkpoint periodically to limit NVS wear. */
@@ -47,6 +49,7 @@ typedef struct {
   esp_tls_t *tls;
   uint64_t deadline;
   size_t cursor, available;
+  char *private_buffer;
   pet_live_tls_current_fn current;
   void *context;
 } https_reader_t;
@@ -83,6 +86,7 @@ bool pet_wifi_data_feed_init(pet_wifi_data_feed_t *out, const char *component_id
   if (!out || !component_id || !*component_id ||
       (connection ? (http || !pet_private_feed_parse(&feed.private, &feed.endpoint, component_id, url, connection))
                   : !pet_wifi_endpoint_parse(url, &feed.endpoint)) ||
+      (pet_feed_is_write(feed.private.kind) && response_map) ||
       !pet_wifi_feed_map_parse(response_map, &feed.response_map) ||
       !pet_wifi_feed_http_parse(http, &feed.http)) return false;
   char identity[sizeof(feed.source) + sizeof(feed.endpoint) + 6 +
@@ -162,9 +166,10 @@ static void request_yield(void) {
 
 static bool tls_read_exact(void *ctx, char *out, size_t bytes) {
   https_reader_t *reader = ctx;
+  char *buffer = reader->private_buffer ? reader->private_buffer : receive_buffer;
   while (bytes && now_ms() < reader->deadline && reader->current(reader->context)) {
     if (reader->cursor == reader->available) {
-      ssize_t n = esp_tls_conn_read(reader->tls, receive_buffer, sizeof(receive_buffer));
+      ssize_t n = esp_tls_conn_read(reader->tls, buffer, sizeof(receive_buffer));
       if (tls_waitable(n)) {
         request_yield();
         continue;
@@ -175,7 +180,7 @@ static bool tls_read_exact(void *ctx, char *out, size_t bytes) {
     }
     size_t count = reader->available - reader->cursor;
     if (count > bytes) count = bytes;
-    memcpy(out, receive_buffer + reader->cursor, count);
+    memcpy(out, buffer + reader->cursor, count);
     reader->cursor += count;
     out += count;
     bytes -= count;
@@ -187,7 +192,7 @@ static bool tls_send_request(const https_reader_t *reader, const char *host, con
                              const char *accept, const char *etag, const char *bearer) {
   char request[PET_WIFI_DATA_URL_MAX + 176 + PET_WIFI_HTTP_ETAG_SIZE + PET_PRIVATE_TOKEN_MAX];
   int length = snprintf(request, sizeof(request),
-    "GET %s HTTP/1.1\r\nHost: %s\r\nAccept-Encoding: identity\r\nConnection: close\r\n"
+    "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: HachimoDock\r\nAccept-Encoding: identity\r\nConnection: close\r\n"
     "%s%s%s%s%s%s%s%s%s\r\n", path, host,
     accept ? "Accept: " : "", accept ? accept : "", accept ? "\r\n" : "",
     etag ? "If-None-Match: " : "", etag ? etag : "", etag ? "\r\n" : "",
@@ -198,7 +203,13 @@ static bool tls_send_request(const https_reader_t *reader, const char *host, con
   }
   int sent = 0;
   while (sent < length && now_ms() < reader->deadline && reader->current(reader->context)) {
+#if PET_P4_SCOPED_WRITE
+    if (bearer && !pet_write_guard(((feed_run_t *)reader->context)->credential_epoch)) break;
+#endif
     ssize_t n = esp_tls_conn_write(reader->tls, request + sent, (size_t)(length - sent));
+#if PET_P4_SCOPED_WRITE
+    if (bearer) pet_write_unlock();
+#endif
     if (n > 0) sent += (int)n;
     else if (tls_waitable(n)) request_yield();
     else break;
@@ -216,6 +227,30 @@ static bool read_response(https_reader_t *reader, const char *host, const char *
     && now_ms() < reader->deadline && reader->current(reader->context);
   if (ok) pet_device_wifi_note_https(PET_WIFI_HTTPS_READY, 0);
   esp_tls_conn_destroy(reader->tls);
+  return ok;
+}
+
+bool pet_community_https(const char *path, char *body, size_t limit, size_t *length,
+    bool (*current)(void *), void *ctx) {
+  if (!current(ctx) || time(NULL)<MIN_TLS_EPOCH) return false;
+  char buffer[sizeof(receive_buffer)];
+  https_reader_t reader = {.deadline=now_ms()+15000, .private_buffer=buffer, .current=current, .context=ctx};
+  const esp_tls_cfg_t config = {.non_block=true, .timeout_ms=7000,
+#ifdef PET_COMMUNITY_CA_PEM
+    .cacert_buf=(const unsigned char *)PET_COMMUNITY_CA_PEM, .cacert_bytes=sizeof(PET_COMMUNITY_CA_PEM)
+#else
+    .crt_bundle_attach=esp_crt_bundle_attach
+#endif
+  };
+  reader.tls=pet_live_tls_connect_port(PET_COMMUNITY_HOST,PET_COMMUNITY_PORT,&config,reader.deadline,current,ctx);
+  if (!reader.tls) return false;
+  char authority[sizeof(PET_COMMUNITY_HOST)+6];
+  int len=snprintf(authority,sizeof(authority),"%s:%u",PET_COMMUNITY_HOST,(unsigned)PET_COMMUNITY_PORT);
+  bool ok=len>0 && (size_t)len<sizeof(authority) &&
+    tls_send_request(&reader,authority,path,NULL,NULL,NULL) &&
+    pet_wifi_http_response_bytes(tls_read_exact,&reader,body,limit,length,NULL,NULL,true) &&
+    now_ms()<reader.deadline && current(ctx);
+  esp_tls_conn_destroy(reader.tls);
   return ok;
 }
 
@@ -322,12 +357,16 @@ static bool save_watchlist(const pet_wifi_watchlist_t *list) {
   return ok;
 }
 
-static void accept_mqtt_value(const char *body, size_t length, void *ctx) {
+static bool accept_mqtt_value(const char *body, size_t length, void *ctx) {
   feed_run_t *run = ctx;
   cJSON *snapshot = pet_wifi_feed_snapshot(run->feed->source, body, length, &run->feed->response_map);
-  if (snapshot && feed_current(run)) (void)pet_p4_widget_data_apply_local(snapshot, now_ms(), 0);
-  if (!feed_current(run)) pet_p4_widget_data_clear_feed(run->feed->source);
+  bool applied = snapshot && feed_current(run) && pet_p4_widget_data_apply_local(snapshot, now_ms(), 0);
+  if (!feed_current(run)) {
+    pet_p4_widget_data_clear_feed(run->feed->source);
+    applied = false;
+  }
   cJSON_Delete(snapshot);
+  return applied;
 }
 
 static void wifi_data_worker(void *unused) {
@@ -340,7 +379,8 @@ static void wifi_data_worker(void *unused) {
   uint64_t stock_cache_after = 0, news_cache_after = 0;
   char scheduled_feed[sizeof(visible_feed.source)] = {0};
   uint32_t last_credential_epoch = 0;
-  uint64_t next_feed_attempt = 0, feed_cache_after = 0;
+  uint64_t next_feed_attempt = 0;
+  pet_wifi_feed_cache_t feed_cache = {0};
   char feed_etag[PET_WIFI_HTTP_ETAG_SIZE] = {0};
   char *body = NULL;
   for (;;) {
@@ -380,7 +420,7 @@ static void wifi_data_worker(void *unused) {
       news_restored = true;
       pet_wifi_data_cache_restore(PET_WIFI_DATA_NEWS, NULL, now, 0);
     }
-    if (source == SOURCE_NONE) continue;
+    if (source == SOURCE_NONE || (source == SOURCE_FEED && pet_feed_is_write(feed.private.kind))) continue;
     schedule_t *job = &schedule[source];
     feed_run_t run = {.generation = generation, .credential_epoch = pet_private_storage_epoch(), .feed = &feed};
     if (source == SOURCE_FEED && (strcmp(feed.source, scheduled_feed) ||
@@ -390,7 +430,7 @@ static void wifi_data_worker(void *unused) {
       *job = (schedule_t){0};
       strcpy(scheduled_feed, feed.source);
       feed_etag[0] = 0;
-      if (feed.http.persist) pet_wifi_data_cache_restore(feed.source, NULL, now, 0);
+      if (!feed.private.kind && feed.http.persist) pet_wifi_data_cache_restore(feed.source, NULL, now, 0);
     }
     /* A user refresh respects a short minimum interval and failure backoff. */
     if (manual && !job->failures && job->due > now + MANUAL_INTERVAL_MS)
@@ -455,7 +495,8 @@ static void wifi_data_worker(void *unused) {
       continue;
     }
     const bool good_feed = source == SOURCE_FEED && pet_wifi_data_cache_good_feed(snapshot);
-    const bool keep_feed = good_feed && feed.http.persist && !metadata.no_store;
+    const bool keep_feed = good_feed && !feed.private.kind && feed.http.persist &&
+      !metadata.no_store && pet_wifi_data_snapshot_date(snapshot, utc);
     if (keep_feed) cJSON_DeleteItemFromObjectCaseSensitive(snapshot, "clearOnExpire");
     bool ok = snapshot && (source != SOURCE_FEED || !feed.http.persist || good_feed)
       && pet_p4_widget_data_apply_local(snapshot, now, list_revision);
@@ -476,9 +517,8 @@ static void wifi_data_worker(void *unused) {
     } else if (ok && source == SOURCE_NEWS && now >= news_cache_after) {
       const bool saved = pet_wifi_data_cache_save(PET_WIFI_DATA_NEWS, NULL, snapshot);
       news_cache_after = now + (saved ? CACHE_SAVE_INTERVAL_MS : CACHE_RETRY_INTERVAL_MS);
-    } else if (ok && keep_feed && now >= feed_cache_after) {
-      const bool saved = pet_wifi_data_cache_save(feed.source, NULL, snapshot);
-      feed_cache_after = now + (saved ? CACHE_SAVE_INTERVAL_MS : CACHE_RETRY_INTERVAL_MS);
+    } else if (ok && keep_feed) {
+      (void)pet_wifi_data_cache_save_feed(&feed_cache, feed.source, snapshot, now, utc);
     }
     cJSON_Delete(snapshot);
     uint32_t delay;

@@ -43,11 +43,11 @@ HachimoDock（哈基米机）是一台与电脑协作的桌面小伙伴：让 AI
 
 | 项目 | 版本 | 下载 |
 | --- | --- | --- |
-| Windows x64 | **0.1.245** | [下载安装包](https://github.com/ai-maker-lab/HachimoDock/releases/download/v0.1.245/HachimiDock_0.1.245_Windows-x64-setup.exe) |
-| macOS Apple silicon | **0.1.245** | [下载安装包](https://github.com/ai-maker-lab/HachimoDock/releases/download/v0.1.245/HachimiDock_0.1.245_macOS-arm64.dmg) |
-| 配套设备固件 | **0.7.107-p4-r292 / R292** | 客户端内置 OTA · [完整烧录包](https://github.com/ai-maker-lab/HachimoDock/releases/tag/v0.1.245) |
+| Windows x64 | **0.1.260** | [下载安装包](https://github.com/ai-maker-lab/HachimoDock/releases/download/v0.1.260/HachimiDock_0.1.260_Windows-x64-setup.exe) |
+| macOS Apple silicon | **0.1.260** | [下载安装包](https://github.com/ai-maker-lab/HachimoDock/releases/download/v0.1.260/HachimiDock_0.1.260_macOS-arm64.dmg) |
+| 配套设备固件 | **0.7.121-p4-r310 / R310** | 客户端内置 OTA · [完整烧录包](https://github.com/ai-maker-lab/HachimoDock/releases/tag/v0.1.260) |
 
-更新说明见 [0.1.245 发布页](https://github.com/ai-maker-lab/HachimoDock/releases/tag/v0.1.245)。客户端内置 WiFi6 与 Pico 的 v1、v3 四种 R292 OTA 固件；Wi-Fi 按键与对话状态同步需要同时更新客户端和固件。Wi-Fi 配对后可脱离电脑 USB 数据连接，设备仍需供电，电脑协同功能仍需管理端运行；Pico 固件不包含 Wi-Fi／蓝牙。下载后可核对 Release 页面显示的 SHA-256。
+更新说明见 [0.1.260 发布页](https://github.com/ai-maker-lab/HachimoDock/releases/tag/v0.1.260)。客户端内置 WiFi6 与 Pico 的 v1、v3 四种 R310 OTA 固件；Wi-Fi 按键与对话状态同步需要同时更新客户端和固件。Wi-Fi 配对后可脱离电脑 USB 数据连接，设备仍需供电，电脑协同功能仍需管理端运行；Pico 固件不包含 Wi-Fi／蓝牙。下载后可核对 Release 页面显示的 SHA-256。
 
 完整烧录包用于新设备或恢复出厂，会清除设置、形象和组件；请同时核对板型和芯片修订版，WiFi6 与 Pico、v1 与 v3 不可混刷。日常升级优先使用客户端内置 OTA。
 
@@ -55,14 +55,14 @@ HachimoDock（哈基米机）是一台与电脑协作的桌面小伙伴：让 AI
 
 ### 按板型和芯片修订版下载完整烧录包
 
-**第一次烧录，建议直接用 ChatGPT、WorkBuddy 等 AI 工具协助。** 下载并解压下表中与设备匹配的完整包，把包内的 `FLASH.md` 交给工具，并告诉它你的电脑系统和板型。可以这样问：「请先帮我核对连接的设备和固件包是否匹配，再按这份说明带我完成首次烧录，并检查写入结果。」
+**第一次烧录，建议直接用 ChatGPT、WorkBuddy 等 AI 工具协助。** 下载并解压下表中与设备匹配的完整包，把包内的 `README-FLASHING-CN.md` 交给工具，并告诉它你的电脑系统和板型。可以这样问：「请先帮我核对连接的设备和固件包是否匹配，再按这份说明带我完成首次烧录，并检查写入结果。」
 
-| 板型 | 芯片修订版 | R292 完整烧录包 |
+| 板型 | 芯片修订版 | R310 完整烧录包 |
 | --- | --- | --- |
-| WiFi6 | v1 | [下载 WiFi6 v1](https://github.com/ai-maker-lab/HachimoDock/releases/download/v0.1.245/HachimiDock_0.1.245_wifi6-v1_FULL-FACTORY.zip) |
-| WiFi6 | v3 | [下载 WiFi6 v3](https://github.com/ai-maker-lab/HachimoDock/releases/download/v0.1.245/HachimiDock_0.1.245_wifi6-v3_FULL-FACTORY.zip) |
-| Pico | v1 | [下载 Pico v1](https://github.com/ai-maker-lab/HachimoDock/releases/download/v0.1.245/HachimiDock_0.1.245_pico-v1_FULL-FACTORY.zip) |
-| Pico | v3 | [下载 Pico v3](https://github.com/ai-maker-lab/HachimoDock/releases/download/v0.1.245/HachimiDock_0.1.245_pico-v3_FULL-FACTORY.zip) |
+| WiFi6 | v1 | [下载 WiFi6 v1](https://github.com/ai-maker-lab/HachimoDock/releases/download/v0.1.260/HachimiDock_0.1.260_wifi6-v1_FULL-FACTORY.zip) |
+| WiFi6 | v3 | [下载 WiFi6 v3](https://github.com/ai-maker-lab/HachimoDock/releases/download/v0.1.260/HachimiDock_0.1.260_wifi6-v3_FULL-FACTORY.zip) |
+| Pico | v1 | [下载 Pico v1](https://github.com/ai-maker-lab/HachimoDock/releases/download/v0.1.260/HachimiDock_0.1.260_pico-v1_FULL-FACTORY.zip) |
+| Pico | v3 | [下载 Pico v3](https://github.com/ai-maker-lab/HachimoDock/releases/download/v0.1.260/HachimiDock_0.1.260_pico-v3_FULL-FACTORY.zip) |
 
 ## 你可以用它做什么
 
@@ -143,7 +143,7 @@ macOS 安装受阻时，先检查下载来源和校验值，再按系统“隐�
 
 ### 新设备或恢复出厂
 
-[v0.1.245 Release](https://github.com/ai-maker-lab/HachimoDock/releases/tag/v0.1.245) 提供 WiFi6 v3 和 Pico v3 原底板的完整烧录包。包内包含 Bootloader、应用固件、形象、组件及双平台烧录工具。请同时核对板型和实际芯片修订版；微雪 ESP32-P4-WIFI6-M 的 M 不代表芯片版本。同一芯片的固件由 Windows/macOS 共用。完整镜像会覆盖设备现有数据。
+[v0.1.260 Release](https://github.com/ai-maker-lab/HachimoDock/releases/tag/v0.1.260) 提供 WiFi6、Pico 两种底板各自的 v1 和 v3 完整烧录包。包内包含 Bootloader、应用固件、形象、组件及双平台烧录工具。请同时核对板型和实际芯片修订版；微雪 ESP32-P4-WIFI6-M 的 M 不代表芯片版本。同一芯片的固件由 Windows/macOS 共用。完整镜像会覆盖设备现有数据。
 
 **v1 与 v3 烧录包不可互刷，具体版本可以咨询客服进行确认。** 包内脚本需要 Python 3.10+，自动安装 esptool **5.4.0**。屏幕连接 **DSI**，不是 CSI；请断电后插拔排线。详细版本和步骤见 [固件构建与烧录指南](firmware/BUILD.md)。
 
@@ -207,7 +207,7 @@ macOS 安装受阻时，先检查下载来源和校验值，再按系统“隐�
 
 ### 源码与发布对应关系
 
-`main` 和 `v0.1.245` 标签提供 0.1.245 / R292 的公开源码。安装包和固件的 SHA-256 见 [发布元数据](latest-release.json)。
+`main` 和 `v0.1.260` 标签提供 0.1.260 / R310 的公开源码。安装包和固件的 SHA-256 见 [发布元数据](latest-release.json)。
 
 资源保存在普通 Git 中，克隆不依赖 Git LFS。构建以锁定依赖和目标平台配置为准；不同发布包的源码对应关系以各 Release 说明为准。自行编译请查阅下列构建文档，并按实际板型选择配置。
 

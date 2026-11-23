@@ -1,0 +1,115 @@
+/* Application journal and SDK VFS hooks run on the synthetic NOR fixture. */
+typedef struct {spiffs *fs;} esp_spiffs_t;
+static esp_spiffs_t ctx;
+#define ESP_OK 0
+/* SDK_VFS */
+
+static const struct {const char *id;uint8_t hash[32];} identities[] = {/* ID_DIGESTS */};
+static void mbedtls_sha256(const uint8_t *id,size_t len,uint8_t hash[32],int mode){
+  assert(!mode);
+  for(size_t i=0;i<2;i++){
+    if(len==strlen(identities[i].id)&&!memcmp(id,identities[i].id,len)){
+      memcpy(hash,identities[i].hash,32);return;
+    }
+  }
+  abort();
+}
+#define PET_APP_SAVE_ROOT "/spiffs"
+static const char *mounted(const char *path){
+  assert(!strncmp(path,"/spiffs/",8));
+  return path+7;
+}
+static int open_fd(const char *path,spiffs_flags flags){
+  int fd=SPIFFS_open(ctx.fs,mounted(path),flags,0);
+  if(fd<0){errno=spiffs_res_to_errno(SPIFFS_errno(ctx.fs));SPIFFS_clearerr(ctx.fs);}
+  return fd;
+}
+typedef struct {int fd;bool error;} Stream;
+static Stream stream;
+static const char *unreadable;
+static Stream *open_stream(const char *path,const char *mode){
+  assert(!stream.fd);
+  int fd=open_fd(path,!strcmp(mode,"rb")?SPIFFS_RDONLY:SPIFFS_CREAT|SPIFFS_TRUNC|SPIFFS_WRONLY);
+  if(fd<0)return NULL;
+  stream=(Stream){fd,unreadable&&!strcmp(path,unreadable)};
+  return &stream;
+}
+static size_t read_bytes(Stream *s,void *buf,size_t n){
+  if(s->error)return 0;
+  int rc=SPIFFS_read(ctx.fs,s->fd,buf,n);
+  if(rc<0){s->error=true;return 0;}return (size_t)rc;
+}
+static int close_stream(Stream *s){int rc=SPIFFS_close(ctx.fs,s->fd);s->fd=0;return rc;}
+#define FILE Stream
+#define fread(p,width,n,s) read_bytes(s,p,(width)*(n))
+#define fseek(s,o,w) (SPIFFS_lseek(ctx.fs,(s)->fd,o,w)<0?-1:0)
+#define ftell(s) SPIFFS_tell(ctx.fs,(s)->fd)
+#include "pet_p4_file_read.h"
+#define fopen open_stream
+#define fclose close_stream
+#define fwrite(p,width,n,s) ((size_t)SPIFFS_write(ctx.fs,(s)->fd,(void *)(p),(width)*(n)))
+#define fflush(s) ((void)(s),0)
+#define fsync(fd) vfs_spiffs_fsync(&ctx,fd)
+#define fileno(s) ((s)->fd)
+#define ferror(s) ((s)->error)
+#define unlink(p) vfs_spiffs_unlink(&ctx,mounted(p))
+#define rename(p,q) vfs_spiffs_rename(&ctx,mounted(p),mounted(q))
+
+#define PET_FS_ACTIVITY_SCOPE(...)
+#define PET_WIDGET_TRACE_SCOPE(...)
+typedef bool pet_resource_lease_t;
+#define pet_resources_device_current(lease) (lease)
+/* STORE */
+
+static void put(const char *path,uint32_t value){
+  int fd=open_fd(path,SPIFFS_CREAT|SPIFFS_TRUNC|SPIFFS_WRONLY);assert(fd>=0);
+  assert(SPIFFS_write(ctx.fs,fd,&value,sizeof(value))==(int)sizeof(value));
+  assert(fsync(fd)==0&&SPIFFS_close(ctx.fs,fd)==0);
+}
+static bool contains(const char *path,uint32_t value){
+  int fd=open_fd(path,SPIFFS_RDONLY);
+  if(fd<0){assert(errno==ENOENT);return false;}
+  uint32_t readback=0;assert(SPIFFS_read(ctx.fs,fd,&readback,sizeof(readback))==(int)sizeof(value));
+  assert(SPIFFS_close(ctx.fs,fd)==0);return readback==value;
+}
+int main(void){
+  const char *id=identities[0].id,*other=identities[1].id;
+  spiffs fs;spiffs_config config;format_new(&fs,&config);ctx.fs=&fs;
+  uint32_t domains[]={0,1,UINT32_MAX};
+  for(unsigned d=0;d<3;d++){
+    uint32_t domain=domains[d],epoch=0;unsigned marker;
+    char old[64],historical[80],fresh[64],peer[64],peer_id[64],anchor[64],tmp[64];
+    scoped_path_for(id,domain,0,old);
+    snprintf(historical,sizeof(historical),"%s-e00000001",old);
+    assert(strlen(mounted(historical))==(domain?41u:32u));
+    assert(unlink(historical)==-1&&errno==ENAMETOOLONG);
+    assert(open_fd(historical,SPIFFS_CREAT|SPIFFS_RDWR)<0&&errno==ENAMETOOLONG);
+    put(old,42);
+    epoch_path_for(id,domain,0,0,fresh);assert(!strcmp(old,fresh));
+    epoch_path_for(id,domain,0,1,fresh);epoch_path_for(other,domain,0,1,peer_id);
+    epoch_path_for(id,domain,1,UINT32_MAX,peer);
+    assert(strlen(mounted(fresh))==31&&strlen(mounted(peer))==31&&strcmp(fresh,peer)&&strcmp(fresh,peer_id));
+    put(peer_id,123);put(fresh,77); /* stale future bytes must not resurrect */
+    scoped_path_for(id,domain,2,anchor);scoped_path_for(id,domain,4,tmp);
+    save_epoch_t zero={.magic=0x41534531};strcpy(zero.id,id);
+    zero.check=checksum((const char*)&zero,sizeof(zero));
+    assert(write_epoch_record(id,domain,4,&zero,true)&&rename(tmp,anchor)==0);
+    SPIFFS_unmount(&fs);mount_new(&fs,&config); /* R302 failed after publishing epoch zero */
+    assert(read_epoch(id,domain,&epoch,&marker,true,true,0)&&epoch==0&&marker==2&&contains(old,42));
+    assert(write_forget_epoch(id,domain,&epoch,true,0)&&epoch==1);
+    SPIFFS_unmount(&fs);mount_new(&fs,&config);
+    assert(read_epoch(id,domain,&epoch,&marker,true,false,0)&&epoch==1);
+    assert(!contains(fresh,77)&&contains(peer_id,123));
+    put(fresh,101);SPIFFS_unmount(&fs);mount_new(&fs,&config);
+    assert(contains(fresh,101));
+    /* Never advance from an older valid peer if the newer marker had an IO error. */
+    char latest[64];scoped_path_for(id,domain,marker,latest);unreadable=latest;
+    assert(!write_forget_epoch(id,domain,&epoch,true,0));unreadable=NULL;
+    assert(read_epoch(id,domain,&epoch,&marker,true,false,0)&&epoch==1&&contains(fresh,101));
+    assert(write_forget_epoch(id,domain,&epoch,true,0)&&epoch==2);
+    SPIFFS_unmount(&fs);mount_new(&fs,&config);
+    assert(read_epoch(id,domain,&epoch,&marker,true,false,0)&&epoch==2&&!contains(fresh,101)&&contains(peer_id,123));
+  }
+  SPIFFS_unmount(&fs);
+  return 0;
+}

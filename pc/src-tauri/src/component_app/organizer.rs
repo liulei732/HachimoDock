@@ -24,7 +24,10 @@ pub(super) fn controls(id:&str,dir:&Path,d:&Declaration,s:&State)->Result<Value,
     else {
         // Switching away cannot hide an unsaved draft or a recording in progress.
         if !matches!(mode,1|4|6){ops.push("tasks");}
-        if mode==5 {ops.extend(["up","down","previous","next"]);}
+        if mode==5 {
+            if ops.contains(&"next") { ops.extend(["up","down"]); }
+            ops.extend(["previous","next"]);
+        }
         if mode==4 {ops.extend(["previous","next"]);}
     }
     let actions:Vec<_>=d.actions.iter().filter(|(_,op)|ops.contains(&op.as_str())).map(|(key,_)|key.as_str()).collect();
@@ -56,7 +59,7 @@ pub(super) fn apply(id:&str,dir:&Path,s:&mut State,op:&str,input:&Value,usb:&cra
     if matches!(phase,4|5){
         let count=chunks(note["note"].as_str().unwrap_or("")).len().div_ceil(2);
         if operation=="previous"{s.organizer_page=s.organizer_page.saturating_sub(1);}
-        if operation=="next"{s.organizer_page=(s.organizer_page+1).min(count-1);}
+        if operation=="next"{s.organizer_page=s.organizer_page.saturating_add(1).min(count-1);}
         note["metricValue"]=if phase==4{"转写完成 · 待保存"}else{"已保存的想法"}.into();
         page(&mut note,&mut s.organizer_page);
     } else {s.organizer_page=0;}
@@ -88,6 +91,24 @@ pub(super) fn apply(id:&str,dir:&Path,s:&mut State,op:&str,input:&Value,usb:&cra
     }
     #[test]fn old_state_defaults_preserve_unified_todo_and_note_identity(){
         let s:State=serde_json::from_value(json!({"selected":2})).unwrap();assert!(!s.organizer_tasks);assert_eq!(s.organizer_page,0);assert_eq!(s.selected,2);
+    }
+    #[test]fn confirmed_delete_selects_the_neighbor_and_rejects_replay(){
+        let package=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../builtin-clawpkgs/hachimi-notes");
+        let runtime=crate::component_library::inspect(&package).unwrap().app_runtime.unwrap();
+        let d=app_services::parse(&std::fs::read(package.join("pc/application.json")).unwrap(),&runtime).unwrap();
+        let dir=tempfile::tempdir().unwrap();let file=dir.path().join("notes.json");
+        let items:Vec<_>=["first","second","third"].iter().map(|id|json!({"id":id,"text":id,"created":"2026-11-13T00:00:00Z","todo":"existing-task"})).collect();
+        std::fs::write(&file,serde_json::to_vec(&json!({"items":items,"selected":1})).unwrap()).unwrap();
+        let usb=crate::usb_serial::UsbSerialManager::new();let mut state=State::default();
+        let ui=controls("delete-test",dir.path(),&d,&state).unwrap();
+        assert!(ui["actions"].as_array().unwrap().contains(&json!("host.delete")));
+        let mut input=json!({"context":ui["context"]});
+        let mut delete=|input:&Value|apply("delete-test",dir.path(),&mut state,"delete",input,&usb,&mut json!({}));
+        let before=std::fs::read(&file).unwrap();assert!(delete(&input).is_err());assert_eq!(std::fs::read(&file).unwrap(),before);
+        input["confirm"]=true.into();delete(&input).unwrap();let after=std::fs::read(&file).unwrap();
+        let saved:Value=serde_json::from_slice(&after).unwrap();assert_eq!(saved["selected"],1);
+        assert_eq!(saved["items"],json!([items[0],items[2]]));
+        assert!(delete(&input).is_err());assert_eq!(std::fs::read(file).unwrap(),after);
     }
     #[test]fn unconfigured_workspace_never_starts_capture_on_status(){
         let dir=tempfile::tempdir().unwrap();let usb=crate::usb_serial::UsbSerialManager::new();let mut s=State::default();let mut v=json!({});

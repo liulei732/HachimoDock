@@ -37,7 +37,7 @@ function normalizedUsbStatus(status) {
   };
 }
 
-export default function DeviceSetup({ onComplete } = {}) {
+export default function DeviceSetup({ onComplete, onOpenPairing } = {}) {
   const [phase, setPhase] = useState("scanning");
   const [message, setMessage] = useState("正在自动查找已连接的桌宠…");
   const [device, setDevice] = useState(null);
@@ -158,6 +158,7 @@ export default function DeviceSetup({ onComplete } = {}) {
           </span>
           <h2>请在 Pet Manager 客户端中连接设备</h2>
           <p>浏览器预览不支持 USB 设备发现。</p>
+          {onOpenPairing && <button type="button" className="btn-secondary" onClick={onOpenPairing}>Wi-Fi 设备配对</button>}
         </section>
       </div>
     );
@@ -179,7 +180,7 @@ export default function DeviceSetup({ onComplete } = {}) {
         <div className="usb-setup-card__copy">
           <span className="usb-setup-card__eyebrow">USB 自动连接</span>
           <h2>{phase === "connected" ? "已发现桌宠" : "连接你的桌宠"}</h2>
-          <p>{message}</p>
+          <p>{phase === "error" ? "请检查数据线连接，然后重新扫描。" : message}</p>
         </div>
 
         {device ? (
@@ -209,6 +210,11 @@ export default function DeviceSetup({ onComplete } = {}) {
           {busy ? <Loader2 size={16} className="spin" /> : <RefreshCw size={16} />}
           {busy ? "正在检测" : "重新扫描"}
         </button>
+
+        {onOpenPairing && <div className="usb-setup-alternative">
+          <p>电脑和桌宠已连入同一局域网？</p>
+          <button type="button" className="btn-secondary" onClick={onOpenPairing}>Wi-Fi 设备配对</button>
+        </div>}
 
         {phase === "error" ? (
           <p className="usb-setup-card__error">检测失败：{message}</p>

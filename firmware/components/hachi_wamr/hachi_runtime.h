@@ -50,7 +50,12 @@ enum { HACHI_HOST_UNAVAILABLE, HACHI_HOST_READY, HACHI_HOST_STALE };
 #define HACHI_HOST_PROFILE "hachi-host-v1"
 typedef int (*hachi_host_read_fn)(int kind, hachi_snapshot_t *out);
 
+typedef int (*hachi_service_fn)(void *,unsigned,const void *,unsigned,void *,unsigned);
+
 typedef struct {
+    hachi_service_fn service;
+    void *service_context;
+    unsigned service_calls;
     hachi_host_read_fn host_read;
     uint32_t (*host_random)(void);
     uint16_t *screen;
@@ -85,6 +90,9 @@ bool hachi_open(hachi_runtime_t *runtime, uint8_t *wasm, uint32_t size,
 bool hachi_open_host(hachi_runtime_t *runtime, uint8_t *wasm, uint32_t size,
                      uint16_t *screen, size_t screen_pixels, hachi_saves_t *saves,
                      hachi_host_read_fn read, uint32_t (*random)(void), char *error, size_t error_size);
+bool hachi_open_services(hachi_runtime_t *,uint8_t *,uint32_t,uint16_t *,size_t,hachi_saves_t *,
+                        hachi_host_read_fn,uint32_t (*)(void),hachi_service_fn,void *,char *,size_t);
+bool hachi_module_network_profile(const uint8_t *,size_t,bool *);
 bool hachi_event_run(hachi_runtime_t *runtime, int type, int a, int b);
 bool hachi_frame_run(hachi_runtime_t *runtime, int elapsed_ms);
 void hachi_close(hachi_runtime_t *runtime);

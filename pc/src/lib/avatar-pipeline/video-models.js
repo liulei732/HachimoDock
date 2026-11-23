@@ -39,13 +39,13 @@ export async function discoverDefaultVideoModel(config, fetcher = pipelineFetch)
 }
 
 export async function listVideoModels({ apiKey, baseUrl = DEFAULT_VOLCANO_BASE_URL, signal }, fetcher = pipelineFetch) {
-  if (!apiKey?.trim()) throw new Error("请先在 API 配置中填写火山 API Key。");
+  if (!apiKey?.trim()) throw new Error("请先在模型配置中填写火山 API Key。");
   const response = await fetcher(`${baseUrl.replace(/\/+$/, "")}/api/v3/models`, {
     method: "GET", signal, timeoutMs: 15000, headers: { Authorization: `Bearer ${apiKey.trim()}` },
   });
   if (signal?.aborted) throw new DOMException("aborted", "AbortError");
   if (!response.ok) {
-    if ([401, 403].includes(response.status)) throw new Error("模型列表鉴权失败，请检查 API Key 权限。");
+    if ([401, 403].includes(response.status)) throw new Error(`模型列表鉴权失败（HTTP ${response.status}），请检查 API Key 权限。`);
     throw new Error(`模型列表获取失败（HTTP ${response.status}），请刷新重试。`);
   }
   const json = await response.json();

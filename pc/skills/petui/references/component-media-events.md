@@ -9,7 +9,7 @@
 `runtime.sequence` 声明 `engine:"p4-sequence-v1"`，需要 `widgetSequence`
 精确匹配。字段为 `engine,bpm,volume,tracks`，可选布尔 `loop`：
 
-- bpm 40–240，整体音量 0–100，1–2 条轨道。
+- bpm 40–240，整体音量 0–100，新组件默认80（用户指定值优先），1–2 条轨道。
 - 每条轨道精确包含 `wave,volume,notes`；wave 为 square/triangle/noise，
   轨道音量 0–100，1–64 个音符。
 - 音符是 `[midi,beats]`；midi 为 36–96 或休止符 0，beats 为整数 1–16。
@@ -27,6 +27,8 @@
 `engine,volume,items`。items 为 1–4 个唯一 `{id,asset:"assets/<id>.wav"}`，
 id 为 1–15 位安全 ASCII 字母、数字、点、短横线或下划线。transition 或
 tick.then 用 `sample:"<id>"` 触发，不能引用未声明采样。
+
+新组件的 `samples.volume` 默认80，用户明确指定时沿用指定值；不调整设备系统音量。
 
 PC 在安装事务中将实际源文件预编译为 16 kHz 单声道 PCM；每项编译后最多
 64 KiB，合计最多 256 KiB。源读取、格式、输出长度和解码时限仍受真实校验，

@@ -1,7 +1,7 @@
-//! Read-only native search adapters. Only the public query is sent, never persona,
-//! conversation history, home inventory or another provider's credential.
+//! Read-only search adapters. Independent search services receive only the public query.
 //! Sources: MiMo web-search docs; Ark SDK responses/web_search_tool_param.py;
 //! DeepSeek standalone Search API. No arbitrary URL fetching or redirects.
+pub(crate) mod native_voice;
 use crate::persona_llm::LlmConfig;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -137,8 +137,15 @@ pub fn explicit_query(text: &str) -> Option<&str> {
     let query = [
         "帮我联网搜索", "请联网搜索", "联网搜索", "帮我联网查一下", "请联网查一下", "联网查一下",
         "帮我上网查一下", "请上网查一下", "上网查一下", "联网查", "上网搜一下", "上网搜索",
-        "请联网核实", "联网核实", "联网搜一下", "联网搜", "上网查", "请使用 web_search 联网核实", "Search the web for ", "search the web for ",
-    ].into_iter().find_map(|prefix| text.strip_prefix(prefix))?
+        "请联网核实", "联网核实", "联网搜一下", "联网搜", "联网检索", "帮我联网检索", "请联网检索", "上网查", "请使用 web_search 联网核实", "Search the web for ", "search the web for ",
+    ].into_iter().find_map(|prefix| text.strip_prefix(prefix)).or_else(|| {
+        // These complete public-news requests are unambiguous. Do not guess
+        // the intent of arbitrary "latest" text, local tasks or follow-ups.
+        let plain = text.trim_end_matches(['。', '？', '?', '！', '!']);
+        matches!(plain, "今天有什么新闻" | "今天有哪些新闻" | "今天有什么科技新闻"
+            | "今天有哪些科技新闻" | "今日新闻" | "最新新闻" | "最新科技新闻")
+            .then_some(text)
+    })?
         .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '，' | ',' | '：' | ':'))
         .trim_end();
     // Quotes stay on the dedicated market-data path.
@@ -384,7 +391,7 @@ fn collect_sources_with_limit(value: &Value, depth: usize, out: &mut Vec<Source>
     if depth>16 || out.len()>=limit {return;}
     match value {
         Value::Object(map)=>{
-            if matches!(map.get("type").and_then(Value::as_str),Some("url_citation"|"web_search_result")) {
+            if matches!(map.get("type").and_then(Value::as_str),Some("url_citation"|"web_search_result"|"url")) {
                 let item=map.get("url_citation").unwrap_or(value);
                 if let Some(url)=item["url"].as_str().and_then(public_source_url) {
                     if !out.iter().any(|s|s.url==url) {
@@ -520,7 +527,8 @@ mod tests {
     fn live_native_search_agent() {
         let id=std::env::var("PET_TEST_SEARCH_PROVIDER").expect("explicit provider required");
         let preset=crate::voice_chat_settings::llm_preset(&id).expect("known provider");
-        let raw:Value=serde_json::from_slice(&std::fs::read(std::env::var("PET_TEST_VOICE_SETTINGS_FILE").expect("explicit credential file")).unwrap()).unwrap();
+        let path=std::path::PathBuf::from(std::env::var("PET_TEST_VOICE_SETTINGS_FILE").expect("explicit credential file"));
+        let raw:Value=serde_json::from_str(&crate::secure_config::read(&path,"voice-chat").unwrap().unwrap()).unwrap();
         let key=raw["llmApiKeys"][&id].as_str().filter(|s|!s.is_empty())
             .or_else(||if raw["llmProvider"]==id {raw["llmApiKey"].as_str().filter(|s|!s.is_empty())} else {None})
             .or_else(||if id=="doubao" {raw["arkApiKey"].as_str().filter(|s|!s.is_empty())} else {None})
@@ -533,19 +541,59 @@ mod tests {
         }
         crate::llm_network::configure_storage_dir(network.path().to_owned()).unwrap();
         let mut source_count=0; let mut failed=None; let mut spoken=String::new();
+        let started=std::time::Instant::now(); let mut first=None;
         let result=tauri::async_runtime::block_on(async {
             tokio::time::timeout(Duration::from_secs(90),crate::persona_llm::stream_chat_with_search(&cfg,
-                "你是桌面宠物，用一句简短中文回答。",&[],
-                "请使用 web_search 联网核实 Xiaomi MiLoCo 的开源仓库地址。",None,
-                |delta|spoken.push_str(delta),|event|match event {
+                "你是桌面小狗，称呼我船长，用两句简短口语回答。",&[crate::persona_llm::ChatTurn{role:"user".into(),content:"我们刚才在聊阿波罗十一号。".into()}],
+                "帮我联网查一下，它是哪一年登月的？那次是谁先踏上月面的？",None,
+                |delta|{first.get_or_insert(started.elapsed());spoken.push_str(delta)},|event|match event {
                     Event::Finished(result)=>source_count+=result.sources.len(),
                     Event::Failed(error)=>failed=Some(error),_=>{}
                 })).await
         });
         assert!(matches!(result,Ok(Ok(_))),"live request failed: {}",match &result {Ok(Err(e))=>e.as_str(),Err(_)=>"timeout",_=>"unknown"});
         assert!(source_count>0,"no verified sources: {}",failed.unwrap_or_else(||"model did not search".into()));
-        assert!(!spoken.trim().is_empty()); assert!(!spoken.contains("https://"));
-        eprintln!("live native search PASS: provider={id}, sources={source_count}, spoken_chars={}",spoken.chars().count());
+        assert!(spoken.contains("船长") && spoken.contains("1969") && spoken.contains("阿姆斯特朗"));
+        assert!(!spoken.contains("https://") && !spoken.contains("<tool_call"));
+        eprintln!("provider={id} first_sentence_ms={} total_ms={} sources={source_count} answer={spoken}",first.unwrap().as_millis(),started.elapsed().as_millis());
+    }
+    #[test]
+    #[ignore = "one paid request for the explicitly named saved provider; prints metadata only"]
+    fn live_native_weather_public_receipt() {
+        let id = std::env::var("PET_TEST_WEATHER_PROVIDER").expect("specify mimo, doubao or deepseek");
+        let kind = match id.as_str() {
+            "mimo" => Provider::Mimo,
+            "doubao" => Provider::Doubao,
+            "deepseek" => Provider::DeepSeek,
+            _ => panic!("unsupported weather probe provider"),
+        };
+        let dir = std::path::PathBuf::from(std::env::var_os("PET_TEST_APP_DATA_DIR").expect("app data required"));
+        // Refuse legacy plaintext settings: the regular reader would migrate them on load.
+        #[derive(Deserialize)]
+        struct Envelope { format: Option<String> }
+        let envelope: Envelope = serde_json::from_reader(std::fs::File::open(dir.join("voice-chat-settings.json"))
+            .expect("existing settings required")).expect("invalid settings envelope");
+        assert!(envelope.format.as_deref() == Some("pet-manager-aes256gcm-v1"), "encrypted settings required");
+        crate::voice_chat_settings::configure_storage_dir(dir.clone()).expect("settings scope unavailable");
+        crate::llm_network::configure_storage_dir(dir).expect("network scope unavailable");
+        let (mut saved, _) = crate::voice_chat_settings::load().expect("saved selection unavailable");
+        assert!(saved.llm_provider == "mimo" && saved.llm_model == "mimo-v2.6-flash"
+            && saved.llm_base_url == crate::voice_chat_settings::llm_preset("mimo").unwrap().base_url,
+            "expected the saved metered MiMo selection");
+        let preset = crate::voice_chat_settings::llm_preset(&id).unwrap();
+        let model = saved.llm_models.remove(&id).filter(|s| !s.trim().is_empty()).expect("no saved model for this provider");
+        let key = saved.llm_api_keys.remove(&id).filter(|v| !v.trim().is_empty()
+            && !crate::voice_chat_settings::credential_placeholder(v)).expect("no saved key for this provider");
+        let cfg = LlmConfig {base_url:preset.base_url.into(),model,api_key:key,web_search:true,search:Default::default()};
+        assert_eq!(provider(&cfg), Some(kind));
+        let query = "上海今天天气怎么样？";
+        let messages = json!([{"role":"system","content":"请简短回答，涉及实时事实时请根据可核验的公开来源作答。"},
+                              {"role":"user","content":query}]);
+        check_query(&cfg,query).expect("public query check failed");
+        let mut receipt = tauri::async_runtime::block_on(native_voice::tests::weather_receipt(&cfg,kind,messages));
+        receipt["model"] = if cfg.model == preset.model || (kind == Provider::DeepSeek && matches!(cfg.model.as_str(), "deepseek-v4-pro" | "deepseek-v4-flash" | "deepseek-flash" | "deepseek-chat" | "deepseek-reasoner")) { cfg.model.as_str() } else { "saved provider alias" }.into();
+        eprintln!("weather_receipt {receipt}");
+        assert_eq!(receipt["accepted"], true, "production parser did not accept the response; see receipt");
     }
     fn config(url:&str)->LlmConfig {LlmConfig{search: Default::default(),base_url:url.into(),model:"test-model".into(),api_key:"test-secret-key".into(),web_search:true}}
     #[test]
@@ -596,6 +644,10 @@ mod tests {
     fn explicit_search_recognizes_commands_without_intercepting_local_or_market_queries() {
         assert_eq!(explicit_query(" 请联网查一下：今天有哪些科技新闻"), Some("今天有哪些科技新闻"));
         assert_eq!(explicit_query("联网搜一下上海明天的天气"), Some("上海明天的天气"));
+        assert_eq!(explicit_query("帮我联网检索：今天的官方公告"), Some("今天的官方公告"));
+        assert_eq!(explicit_query("今天有什么科技新闻？"), Some("今天有什么科技新闻？"));
+        assert_eq!(explicit_query("提醒我明天看最新新闻"), None);
+        assert_eq!(explicit_query("搜索我电脑里的最新新闻文件"), None);
         assert_eq!(explicit_query("查一下我电脑的状态"), None);
         assert_eq!(explicit_query("联网查一下茅台股价"), None);
         assert_eq!(explicit_query("翻译‘请联网搜索’"), None);

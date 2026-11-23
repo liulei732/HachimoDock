@@ -115,9 +115,18 @@ def test_all_independent_spiffs_entrypoints_are_observed():
     assert scope < override < playback.index("wav_seek_pcm")
     assert "pet_p4_asset_fs_path(request.logical_path" not in playback
     store=(ROOT/"main/pet_p4_app_store.c").read_text()
-    for name,scope in (("read_slot","storage_read"),("write_slot","storage_write")):
+    for name,scope in (("read_slot","storage_read"),("write_slot_data","storage_write"),
+                       ("read_epoch","epoch_read")):
         body=function(store,name)
-        assert body.index(f"PET_FS_ACTIVITY_SCOPE({scope})") < body.index("fopen(")
+        assert body.index(f"PET_FS_ACTIVITY_SCOPE({scope})") < body.index("fopen(") < body.index("fclose(")
+    # Both scratch-storage variants delegate their whole I/O lifetime.
+    writer=function(store,"write_slot")
+    assert writer.count("return write_slot_data(")==2 and "fopen(" not in writer
+    epoch=function(store,"write_forget_epoch")
+    record=function(store,"write_epoch_record")
+    assert epoch.index("PET_FS_ACTIVITY_SCOPE(epoch_write)") < epoch.index("write_epoch_record(")
+    assert store.count("write_epoch_record(")==epoch.count("write_epoch_record(")+1
+    assert record.index("fopen(") < record.index("fclose(")
     miniapp=(ROOT/"main/pet_p4_miniapp.c").read_text()
     images=function(miniapp,"pet_p4_miniapp_get_surface_images")
     assert "surface_images_locked(out,revision)" in images
@@ -205,3 +214,51 @@ int main(void){
     subprocess.run(["cc","-std=c11","-Wall","-Wextra","-Werror","-fsanitize=address,undefined",
                     "-I",str(tmp_path),"-I",str(ROOT/"main"),str(path),"-o",str(binary)],check=True)
     subprocess.run([str(binary)],cwd=tmp_path,check=True,timeout=20)
+
+
+def test_font_worker_and_expiration_guard_real_io_until_task_exit(tmp_path):
+    font = (ROOT / "main/pet_p4_font_delivery.inc").read_text()
+    header = tmp_path / "freertos/FreeRTOS.h"
+    header.parent.mkdir()
+    header.write_text("#define portMUX_TYPE int\n#define portMUX_INITIALIZER_UNLOCKED 0\n"
+                      "#define portENTER_CRITICAL(m) ((void)(m))\n#define portEXIT_CRITICAL(m) ((void)(m))\n")
+    source = r'''
+#define PET_FS_ACTIVITY_TEST 1
+#include <assert.h>
+#include <stdbool.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include "pet_p4_fs_activity.c"
+#define FONT_STAGE "stage"
+static atomic_bool font_loading;
+static bool verified;
+static unsigned removals;
+static struct {void *file; bool writing; int64_t last_us;} font_upload;
+static int64_t esp_timer_get_time(void){return 15000001;}
+static void observed(void){uint64_t e;assert(!pet_fs_activity_idle_epoch(&e));}
+static void font_upload_close(void){observed();font_upload.file=NULL;}
+static int remove(const char *p){assert(p);observed();removals++;return 0;}
+static bool pet_shared_font_activate_staged(const char *p){assert(p);observed();return verified;}
+static void vTaskDelete(void *task){uint64_t e;assert(!task&&!font_loading&&pet_fs_activity_idle_epoch(&e));}
+''' + function(font, "pet_p4_font_delivery_expire") + "\n" + function(font, "font_load_worker") + r'''
+int main(void){
+ pet_fs_activity_enable_observation();
+ uint64_t before,after;
+ assert(pet_fs_activity_idle_epoch(&before));
+ pet_p4_font_delivery_expire();
+ assert(pet_fs_activity_idle_epoch(&after)&&after==before);
+ font_upload.file=&font_upload;
+ pet_p4_font_delivery_expire();
+ assert(removals==1&&pet_fs_activity_idle_epoch(&after)&&after==before+2);
+ for(unsigned i=0;i<2;i++){
+  before=after;verified=i;font_loading=true;font_load_worker(NULL);
+  assert(removals==2&&pet_fs_activity_idle_epoch(&after)&&after==before+2);
+ }
+}
+'''
+    path = tmp_path / "font-worker.c"
+    path.write_text(source)
+    exe = tmp_path / "font-worker"
+    subprocess.run(["cc", "-std=c11", "-Wall", "-Werror", "-fsanitize=address,undefined",
+                    "-I", tmp_path, "-I", ROOT / "main", path, "-o", exe], check=True)
+    subprocess.run([exe], check=True)

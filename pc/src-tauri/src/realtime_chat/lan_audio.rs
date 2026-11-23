@@ -16,6 +16,20 @@ const PLAY_END: u8 = 5;
 const PLAY_FLUSH: u8 = 6;
 pub(super) const HUD_BYTES: usize = 644;
 const HUD: u8 = 7;
+const CAPTION: u8 = 9;
+const CAPTION_TEXT: usize = 512;
+
+// Payload after the turn number: big-endian PCM byte offset and a fixed UTF-8 field.
+pub(super) fn caption_body(offset: u32, text: &str) -> Result<Zeroizing<Vec<u8>>, String> {
+    let text = text.split('\0').next().unwrap_or("");
+    if offset % 2 != 0 || text.is_empty() { return Err("无效的实时对话字幕".into()); }
+    let mut size = text.len().min(CAPTION_TEXT - 1);
+    while !text.is_char_boundary(size) { size -= 1; }
+    let mut body = Zeroizing::new(vec![0; 4 + CAPTION_TEXT]);
+    body[..4].copy_from_slice(&offset.to_be_bytes());
+    body[4..4+size].copy_from_slice(&text.as_bytes()[..size]);
+    Ok(body)
+}
 
 /// Fixed UTF-8 fields have exactly the same byte limits as the device's USB
 /// conversation state. Never serialize arbitrary JSON into the audio lane.
@@ -53,6 +67,7 @@ pub(crate) enum Record {
 #[derive(Clone, Copy)]
 pub(super) enum Playback {
     Begin,
+    Caption,
     Pcm,
     End,
     Flush,
@@ -147,14 +162,15 @@ impl LanAudio {
         turn: u32,
         pcm: &[u8],
     ) -> Option<Zeroizing<Vec<u8>>> {
-        if turn == 0
-            || (matches!(action, Playback::Pcm) && pcm.len() != PCM)
-            || (!matches!(action, Playback::Pcm) && !pcm.is_empty())
-        {
-            return None;
-        }
+        let expected = match action {
+            Playback::Pcm => PCM,
+            Playback::Caption => 4 + CAPTION_TEXT,
+            _ => 0,
+        };
+        if turn == 0 || pcm.len() != expected { return None; }
         let kind = match action {
             Playback::Begin => PLAY_BEGIN,
+            Playback::Caption => CAPTION,
             Playback::Pcm => AUDIO,
             Playback::End => PLAY_END,
             Playback::Flush => PLAY_FLUSH,
@@ -233,6 +249,20 @@ mod tests;
 #[cfg(test)]
 mod hud_tests {
     use super::*;
+    #[test]
+    fn timed_caption_is_bounded_utf8_and_rejects_non_sample_offsets() {
+        let body = caption_body(960, &"蛙".repeat(300)).unwrap();
+        assert_eq!(body.len(), 516);
+        assert_eq!(&body[..4], &960u32.to_be_bytes());
+        assert_eq!(std::str::from_utf8(&body[4..514]).unwrap(), "蛙".repeat(170));
+        assert_eq!(&body[514..], &[0, 0]);
+        assert!(caption_body(1, "x").is_err());
+        assert!(caption_body(0, "").is_err());
+        let mut codec = LanAudio::new(Zeroizing::new([42;16]));
+        assert!(codec.seal_playback(Playback::Caption, 1, &body[..515]).is_none());
+        assert!(codec.seal_playback(Playback::Caption, 0, &body).is_none());
+    }
+
     #[test]
     fn hud_utf8_limits_and_authenticated_record_lifecycle() {
         let payload = serde_json::json!({"sessionId":"rtc-one", "state":"listening",

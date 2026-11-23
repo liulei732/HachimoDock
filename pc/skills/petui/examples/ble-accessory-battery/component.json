@@ -1,0 +1,8 @@
+{
+  "id": "ble-accessory-battery",
+  "name": "配件电量",
+  "version": "1.0.0",
+  "kind": "tool",
+  "description": "在设备上逐次允许读取指定配件的电量百分比。",
+  "author": "PetUI"
+}

@@ -1,0 +1,7 @@
+{
+  "id": "records-checkin-fixture",
+  "name": "Check-in log",
+  "kind": "tool",
+  "version": "1.0.0",
+  "description": "Record the day of year and activity for four check-ins. Browse or erase a selected row."
+}

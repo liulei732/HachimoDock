@@ -27,6 +27,7 @@ static uint64_t g_ext_alarm_policy_revision;
 static char g_ext_notice_id[PET_CEV_WIDGET_ID_MAX], g_ext_notice_alarm[PET_CEV_NAME_MAX];
 static char g_ext_notice_title[64], g_ext_notice_text[PET_CEV_ALARM_TEXT_MAX];
 static bool g_ext_notice_pending;
+#include "pet_p4_local_alarm.inc"
 static ext_alarm_entry_t *ext_alarm_entry(const char *widget_id, bool create) {
   ext_alarm_entry_t *free_slot = NULL;
   for (unsigned i = 0; i < PET_CEV_COMPONENTS; i++) {
@@ -42,7 +43,7 @@ void pet_p4_miniapp_alarm_policy(bool background_notify) {
   ext_lock();
   if (g_ext_alarm_policy_revision != UINT64_MAX) { g_ext_alarm_policy_revision++; g_ext_background_notify = background_notify; }
   else if (!background_notify) g_ext_background_notify = false;
-  if (!background_notify) { g_ext_notice_pending = false; g_ext_notice_id[0] = 0; }
+  if (!background_notify && !local_alarm_mode(g_ext_notice_id)) { g_ext_notice_pending = false; g_ext_notice_id[0] = 0; }
   ext_unlock();
 }
 bool pet_p4_miniapp_alarm_notification(char title[64], char text[PET_CEV_ALARM_TEXT_MAX]) {
@@ -65,6 +66,7 @@ bool pet_p4_miniapp_alarm_cancel(const char *widget_id, const char *alarm_id) {
   }
   ext_alarm_entry_t *entry = ext_alarm_entry(widget_id, false);
   if (entry && entry->revision!=UINT64_MAX) for (unsigned i = 0; i < entry->alarms.count; i++) if (!strcmp(entry->alarms.items[i].id, alarm_id)) { pet_cev_alarms_cancel(&entry->alarms, i); entry->dirty=true;entry->revision++;cancelled = true; }
+  local_alarm_cancel_job(widget_id, alarm_id);
   if (!strcmp(g_ext_notice_id, widget_id) && !strcmp(g_ext_notice_alarm, alarm_id)) { g_ext_notice_pending = false; g_ext_notice_id[0] = 0; }
   ext_unlock();
   miniapp_runtime_unlock();
@@ -149,6 +151,17 @@ void miniapp_ext_audio_apply_snapshot(const pet_cext_audio_t *audio, const pet_s
 #endif
 }
 #if PET_P4_EVENTS
+/* Alarm bookkeeping. Caller holds ext mutex while reserving a delivery. */
+static bool ext_alarm_due(const char *id, const char *title, unsigned index, const pet_cev_alarm_t *alarm) {
+  if (local_alarm_mode(id)) return local_alarm_offer(id, title, index, alarm);
+  if (!g_ext_background_notify || g_ext_notice_pending || local_job.pending) return false;
+  copy_utf8(g_ext_notice_title, sizeof(g_ext_notice_title), title);
+  copy_utf8(g_ext_notice_text, sizeof(g_ext_notice_text), alarm->text);
+  copy_utf8(g_ext_notice_id, sizeof(g_ext_notice_id), id);
+  copy_utf8(g_ext_notice_alarm, sizeof(g_ext_notice_alarm), alarm->id);
+  g_ext_notice_pending = true;
+  return true;
+}
 /* Alarm bookkeeping for the active runtime (model lock held by the caller). */
 static void ext_alarms_observe_locked(uint64_t now_ms,const pet_cev_clock_snapshot_t *clock) {
   pet_cev_alarm_set_t *set = &g_runtime.cext.alarms;
@@ -175,19 +188,22 @@ static void miniapp_ext_process(uint64_t now_ms, bool visible) {
       ext_lock();
       for (unsigned i = 0; i < g_runtime.cext.alarms.count; i++) {
         pet_cev_alarm_t *alarm = &g_runtime.cext.alarms.items[i];
-        if (alarm->pending && !alarm->waiting_for_clock && alarm->background && g_ext_background_notify && !g_ext_notice_pending) {
-          copy_utf8(g_ext_notice_title, sizeof(g_ext_notice_title), g_runtime.view.title);
-          copy_utf8(g_ext_notice_text, sizeof(g_ext_notice_text), alarm->text);
-          copy_utf8(g_ext_notice_id, sizeof(g_ext_notice_id), g_runtime.widget_id);
-          copy_utf8(g_ext_notice_alarm, sizeof(g_ext_notice_alarm), alarm->id);
-          g_ext_notice_pending = true; alarm->pending = false;
-        }
+        if (alarm->pending && !alarm->waiting_for_clock && alarm->background &&
+            ext_alarm_due(g_runtime.widget_id, g_runtime.view.title, i, alarm))
+          alarm->pending = false;
       }
       ext_unlock();
     }
     if (visible) {
-      unsigned due = pet_cev_alarms_take_pending(&g_runtime.cext.alarms);
-      for (unsigned i = 0; i < g_runtime.cext.alarms.count; i++) if (due & (1u << i)) copy_utf8(actions[action_count++], PET_P4_MINIAPP_ACTION_MAX, g_runtime.cext.alarms.items[i].action);
+      ext_lock();
+      for (unsigned i = 0; i < g_runtime.cext.alarms.count; i++) {
+        pet_cev_alarm_t *a = &g_runtime.cext.alarms.items[i];
+        if (a->pending && !a->waiting_for_clock && local_alarm_foreground(active_id,i,a)) {
+          copy_utf8(actions[action_count++],PET_P4_MINIAPP_ACTION_MAX,a->action);
+          a->pending = false;
+        }
+      }
+      ext_unlock();
     }
   }
   miniapp_runtime_unlock();
@@ -204,8 +220,13 @@ static void miniapp_ext_process(uint64_t now_ms, bool visible) {
     uint32_t prior=e->alarms.clock_changes;
     (void)pet_cev_alarms_tick_clock(&e->alarms, now_ms,&clock);
     if(prior!=e->alarms.clock_changes&&e->revision!=UINT64_MAX){e->dirty=true;e->revision++;}
-    for (unsigned a = 0; a < e->alarms.count; a++) if (e->alarms.items[a].pending && !e->alarms.items[a].waiting_for_clock && e->alarms.items[a].background && g_ext_background_notify && !g_ext_notice_pending) {
-      copy_utf8(g_ext_notice_title, sizeof(g_ext_notice_title), e->title); copy_utf8(g_ext_notice_text, sizeof(g_ext_notice_text), e->alarms.items[a].text); copy_utf8(g_ext_notice_id, sizeof(g_ext_notice_id), e->widget_id); copy_utf8(g_ext_notice_alarm, sizeof(g_ext_notice_alarm), e->alarms.items[a].id); g_ext_notice_pending = true; e->alarms.items[a].pending = false;if(e->revision!=UINT64_MAX){e->dirty=true;e->revision++;}
+    for (unsigned a = 0; a < e->alarms.count; a++) {
+      pet_cev_alarm_t *alarm = &e->alarms.items[a];
+      if (alarm->pending && !alarm->waiting_for_clock && alarm->background &&
+          ext_alarm_due(e->widget_id, e->title, a, alarm)) {
+        alarm->pending = false;
+        if (e->revision != UINT64_MAX) { e->dirty = true; ++e->revision; }
+      }
     }
   }
   ext_unlock();
@@ -310,13 +331,18 @@ static void miniapp_ext_installed(const miniapp_runtime_t *next) {
   (void) next;
 #endif
 }
-static void miniapp_ext_removed(const char *widget_id, size_t slot) {
 #if PET_P4_EVENTS
+static void miniapp_ext_forget_events(const char *widget_id) {
   ext_lock();
   if (!strcmp(g_ext_notice_id, widget_id)) { g_ext_notice_pending = false; g_ext_notice_id[0] = 0; }
   pet_cev_bus_unsubscribe(&g_ext_bus, widget_id);
   ext_alarm_entry_t *e = ext_alarm_entry(widget_id, false); if (e) memset(e, 0, sizeof(*e));
   ext_unlock();
+}
+#endif
+static void miniapp_ext_removed(const char *widget_id, size_t slot) {
+#if PET_P4_EVENTS
+  miniapp_ext_forget_events(widget_id);
 #else
   (void) widget_id;
 #endif

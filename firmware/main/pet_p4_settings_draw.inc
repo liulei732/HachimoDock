@@ -15,32 +15,91 @@ static void render_settings_page(const pet_settings_view_t *settings) {
 
   if (settings->screen == PET_SETTINGS_HOME) {
     draw_text_line_vcenter("系统设置", 139, 16, 54, 450, ink, 2, true);
-    static const char *const labels[] = {"WIFI 配置", "电脑配对", "时区设置", "蓝牙键盘"};
-    const unsigned count = 4;
+    static const char *const labels[] = {"WIFI 配置", "电脑配对", "时区设置", "蓝牙键盘", "组件社区", "声音与显示"};
+    const unsigned count = sizeof(labels)/sizeof(*labels);
     const int step = pet_settings_home_step(settings);
     for (unsigned i = 0; i < count; ++i) {
-      int y = 103 + step * (int)i;
-      fill_round_rect_outline(24, y, 592, step - 16, 17, panel, settings->selected == i ? accent : outline);
-      draw_text_line_vcenter(labels[i], 42, y, step - 16, 502, ink, 2, true);
-      draw_text_center(">", 587, y + (step - 16) / 3, 27, accent, 2);
+      int y = 103 + step * (int)(i > 4 ? 4 : i);
+      int x = i == 5 ? 328 : 24, w = i >= 4 ? 288 : 592;
+      fill_round_rect_outline(x, y, w, step - 16, 17, panel, settings->selected == i ? accent : outline);
+      draw_text_line_vcenter(labels[i], x+18, y, step - 16, w-64, ink, 2, true);
+      draw_text_center(">", x+w-29, y + (step - 16) / 3, 27, accent, 2);
     }
     return;
   }
 
-  if (settings->screen == PET_SETTINGS_BLE) {
-    draw_text_line_vcenter("蓝牙键盘",139,16,54,450,ink,2,true);
-    const char *message=settings->ble_available<0?"蓝牙暂不可用":
-      !settings->ble_available?"正在准备蓝牙":settings->ble_paired?"已配对":
-      settings->ble_pairing?"在电脑蓝牙设置中选 HachimiDock":"选择开始配对";
-    draw_text_line_vcenter(message,24,98,72,592,ink,2,true);
-    if (settings->ble_code) {
-      char code[10];
-      snprintf(code,sizeof(code),"%06u",settings->ble_code);
-      draw_text_center(code,320,235,590,accent,2);
+  if (settings->confirm_remove || settings->screen == PET_SETTINGS_AV || settings->screen == PET_SETTINGS_BLE) {
+    const bool remove = settings->confirm_remove, av = settings->screen == PET_SETTINGS_AV;
+    const char *title = remove ? (settings->screen == PET_SETTINGS_FEED ? "移除服务授权？" : "解除配对？") :
+                         av ? "声音与显示" : "蓝牙键盘";
+    draw_text_line_vcenter(title,139,16,54,450,ink,2,true);
+    const char *left = "取消", *right = "确认移除", *message = "";
+    unsigned base = 0;
+    if (av) {
+      for (unsigned i=0; i<2; ++i) {
+        int value = i ? settings->brightness : settings->volume, y = 130 + (int)i*80;
+        char label[64];
+        const char *storage = i ? (settings->brightness_saved ? " 已保存" : "") :
+          settings->volume_storage == PET_AV_SAVING ? " 待保存" :
+          settings->volume_storage == PET_AV_SAVE_FAILED ? " 保存失败" :
+          settings->volume_storage == PET_AV_SAVED ? " 已保存" : "";
+        if (value >= 0) snprintf(label,sizeof(label),"%s  %d%%%s",i?"亮度":"音量",value,storage);
+        else snprintf(label,sizeof(label),"%s",i?"亮度不可调":"音量暂不可用");
+        draw_text_center(label,320,y+17,354,ink,2);
+        for (int k=0; k<2; ++k) {
+          int x=k?510:24;
+          fill_round_rect_outline(x,y,106,60,13,panel,settings->selected==i?accent:outline);
+          draw_text_center(k?"+":"-",x+53,y+17,96,value<0?muted:accent,2);
+        }
+      }
+      left="保存"; right="刷新"; base=2;
+      message=settings->av_pending?"正在读取或保存":settings->av_failed?"操作未完成，请刷新":
+              settings->av_applied?"已应用":"左右调节，保存后生效";
+    } else if (!remove) {
+      left=settings->ble_enabled?"关闭键盘":"启用键盘";
+      right=settings->ble_paired?"解除配对":settings->ble_pairing?"取消配对":"开始配对";
+      message=settings->request_busy?"设置失败，请重试":settings->ble_available<0?"蓝牙暂不可用":
+        !settings->ble_available?"正在准备蓝牙":settings->ble_connected?"键盘已连接":
+        settings->ble_paired?"已配对，等待连接":settings->ble_pairing?"在电脑蓝牙设置中选 HachimiDock":
+        settings->ble_enabled?"选择开始配对":"键盘已关闭";
+      if (settings->ble_code) {
+        char code[12];
+        snprintf(code,sizeof(code),"%06u",settings->ble_code);
+        draw_text_center(code,320,230,592,accent,2);
+      }
     }
-    if (settings->ble_available>0 && !settings->ble_pairing) {
-      fill_round_rect_outline(24,392,592,60,13,faint,outline);
-      draw_text_center(settings->ble_paired?"解除配对":"开始配对",320,412,540,ink,1);
+    draw_text_line_vcenter(message,24,av?300:100,62,592,muted,1,true);
+    for (unsigned i=0; i<2; ++i) {
+      int x=i?328:24;
+      bool focused=settings->selected==base+i;
+      bool enabled=remove || av || (settings->ble_available>0 && (!i || settings->ble_enabled || settings->ble_paired));
+      fill_round_rect_outline(x,392,288,60,13,focused?faint:panel,focused?accent:outline);
+      draw_text_center(i?right:left,x+144,412,270,enabled?ink:muted,1);
+    }
+    return;
+  }
+
+  if (settings->screen == PET_SETTINGS_COMMUNITY) {
+    const pet_community_view_t *v=&settings->community;
+    const bool confirm=settings->community_confirm;
+    draw_text_line_vcenter(v->installed?"我的社区组件":"组件社区",139,16,54,450,ink,2,true);
+    char title[148];
+    snprintf(title,sizeof(title),"%s  %s",v->title,v->version);
+    draw_text_line_vcenter(title,24,85,54,592,ink,2,true);
+    char index[72]="";
+    if (v->count) snprintf(index,sizeof(index),"%u / %u%s    %s",v->index+1,v->count,v->more?" +":"",v->id);
+    draw_text_line_vcenter(index,24,140,32,592,muted,1,true);
+    draw_text_line_vcenter(v->status?v->status:"",24,171,30,592,muted,1,true);
+    const char *prompt=confirm && settings->community_delete?"删除组件并保留存档？":
+      !v->count || v->installed?"":v->privileges?(v->added_save?"新增权限：保存组件本地数据":"权限：保存组件本地数据"):"权限：无";
+    draw_text_line_vcenter(prompt,24,203,32,592,accent,1,true);
+    const char *labels[]={"上一个","下一个",v->remove?"更新":"安装","删除",v->installed?"社区目录":"我的组件","刷新"};
+    if (confirm) { labels[0]="取消"; labels[1]=settings->community_delete?"确认删除":"确认安装"; }
+    for (unsigned i=0;i<(confirm?2u:6u);i++) {
+      int x=24+(int)(i%2)*304, y=241+(int)(i/2)*70;
+      bool enabled=!v->busy && (confirm || (i<2?v->count!=0:i==2?v->install:i==3?v->remove:true));
+      fill_round_rect_outline(x,y,288,60,14,settings->selected==i?faint:panel,settings->selected==i?accent:outline);
+      draw_text_center(labels[i],x+144,y+19,270,enabled?ink:muted,1);
     }
     return;
   }
@@ -97,13 +156,29 @@ static void render_settings_page(const pet_settings_view_t *settings) {
       settings->feed_result == PET_PRIVATE_ABSENT ? "已清除" :
       settings->feed_result == PET_PRIVATE_STORAGE_ERROR ? "凭证存储已满或不可用" :
       "授权后在此组件查看私人数据";
+#if PET_P4_SCOPED_WRITE
+    if (pet_feed_is_write(settings->feed_kind) && settings->feed_can_save && !settings->request_busy) {
+      if (settings->feed_result == PET_WRITE_UNKNOWN) status = "结果未知，先核对服务，再移除授权";
+      else if (settings->feed_result == PET_WRITE_SPENT) status = "上次已确认，请重新授权";
+      else if (settings->feed_result == PET_WRITE_ACCEPTED) status = "服务已确认接收";
+      else if (settings->write_submitted) status = settings->feed_result == PET_PRIVATE_BUSY ?
+        "正在发送" : "未发送，请检查授权和网络";
+      else if (!settings->feed_submitted) status = "授权仅限本次发送";
+    }
+#endif
     draw_text_line_vcenter(status, 25, 200, 44, 590, accent, 1, true);
     if (settings->feed_can_save) {
       static const char *const actions[] = {"连接账号", "移除授权"};
-      for (unsigned i = 0; i < 2; ++i) {
+      const unsigned count = pet_settings_feed_actions(settings);
+      for (unsigned i = 0; i < count; ++i) {
         int y = 280 + 70 * (int)i;
         fill_round_rect_outline(24, y, 592, 58, 13, panel, settings->selected == i ? accent : outline);
-        draw_text_center(actions[i], 320, y + 20, 540, ink, 1);
+        const char *action =
+#if PET_P4_SCOPED_WRITE
+          i == 2 ? settings->write_label :
+#endif
+          actions[i];
+        draw_text_center(action, 320, y + 20, 540, ink, 1);
       }
     }
     return;
@@ -112,7 +187,7 @@ static void render_settings_page(const pet_settings_view_t *settings) {
   if (settings->screen == PET_SETTINGS_PASSWORD || settings->screen == PET_SETTINGS_FEED_ENTRY) {
     const bool feed = settings->screen == PET_SETTINGS_FEED_ENTRY;
     const char *label = !feed ? "输入密码" : settings->feed_username ? "服务账号" :
-        settings->feed_kind == PET_PRIVATE_MQTT ? "服务密码" : "输入 Token";
+        (settings->feed_kind == PET_PRIVATE_MQTT || settings->feed_kind == PET_MQTT_PUBLISH) ? "服务密码" : "输入 Token";
     draw_text_line_vcenter(label, 139, 16, 54, 450, ink, 2, true);
     draw_text_line_vcenter(feed ? settings->feed_host : settings->target.ssid, 27, 71, 29, 586, muted, 1, true);
     fill_round_rect_outline(24, 102, 592, 43, 12, panel, outline);
@@ -124,7 +199,9 @@ static void render_settings_page(const pet_settings_view_t *settings) {
       masked[length] = 0;
       draw_text_line_vcenter(masked, 39, 102, 43, 455, ink, 1, true);
     } else draw_text_line_vcenter(label, 39, 102, 43, 455, muted, 1, true);
-    if (settings->short_password)
+    if (settings->entry_full)
+      draw_text_line_vcenter("已达上限", 455, 102, 43, 140, accent, 1, true);
+    else if (settings->short_password)
       draw_text_line_vcenter(feed ? "请核对后重试" : "至少 8 位", 455, 102, 43, 140, accent, 1, true);
     else if (settings->request_busy)
       draw_text_line_vcenter("请稍候", 496, 102, 43, 100, accent, 1, true);
@@ -152,35 +229,54 @@ static void render_settings_page(const pet_settings_view_t *settings) {
     return;
   }
 
-  draw_text_line_vcenter("WIFI配置", 139, 16, 54, 450, ink, 2, true);
   const pet_wifi_snapshot_t *wifi = &settings->wifi;
-  const char *status = "请选择网络";
-  if (settings->request_busy) status = "请稍候";
-  else if (settings->unsupported) status = "此网络暂不支持";
-  else if (wifi->status == PET_WIFI_UNAVAILABLE) status = "无线模块不可用";
-  else if (wifi->status == PET_WIFI_SCANNING) status = "正在扫描";
-  else if (wifi->status == PET_WIFI_CONNECTING) status = "正在连接";
-  else if (wifi->status == PET_WIFI_FAILED) {
-    switch (wifi->join_reason) {
-      case 201: case 212: status = "未找到热点，请重新扫描"; break;
-      case 15: case 204: status = "热点握手超时"; break;
-      case 202: status = "热点认证未完成"; break;
-      case 210: case 211: status = "热点加密方式不兼容"; break;
-      default: status = "操作失败，请重试"; break;
-    }
-  }
-  else if (wifi->connected[0]) status = "已连接";
-  else if (!wifi->count) status = "未找到网络，请重新扫描";
-  draw_text_line_vcenter(status, 26, 74, 40, 307, wifi->connected[0] ? green : muted, 1, true);
+  const bool saved_list = settings->screen == PET_SETTINGS_WIFI_SAVED;
+  const bool network = settings->screen == PET_SETTINGS_WIFI_NETWORK;
+  const bool confirm = settings->screen == PET_SETTINGS_WIFI_FORGET;
+  draw_text_line_vcenter(confirm ? "忘记网络？" : saved_list || network ? "已保存网络" : "WIFI配置",
+                         139, 16, 54, 450, ink, 2, true);
+  const char *status = pet_settings_wifi_status(settings);
+  draw_text_line_vcenter(status, 26, 74, 40, wifi->connected[0] ? 307 : 586,
+                         wifi->status == PET_WIFI_CONNECTED ? green : muted, 1, true);
   if (wifi->connected[0])
     draw_text_right(wifi->connected, 612, 85, 284, green, 1);
+  if (network || confirm) {
+    draw_text_line_vcenter(settings->target.ssid, 26, 106, 40, 450, ink, 1, true);
+    draw_text_right(settings->target.security == PET_WIFI_OPEN ? "开放" :
+      settings->target.security == PET_WIFI_WPA3 ? "WPA3" : "WPA2", 612, 118, 120, muted, 1);
+    if (settings->saved_target < 0) return;
+    const bool auto_join = wifi->saved[settings->saved_target].auto_join;
+    const char *const actions[] = {"连接", auto_join ? "[x] 自动连接" : "[ ] 自动连接", "忘记网络", "修改密码并连接"};
+    const char *const confirmation[] = {"取消", "确认忘记"};
+    const unsigned count = confirm ? 2 : 3 + (settings->target.security != PET_WIFI_OPEN);
+    for (unsigned row = 0; row < count; ++row) {
+      const int y = PET_SETTINGS_WIFI_ACTION_TOP + (int)row * PET_SETTINGS_WIFI_ACTION_STEP;
+      const bool focused = row == settings->selected;
+      fill_round_rect_outline(24, y, 592, PET_SETTINGS_WIFI_ACTION_HEIGHT, 13,
+                              focused ? faint : panel, focused ? accent : outline);
+      draw_text_line_vcenter(confirm ? confirmation[row] : actions[row], 43, y,
+                             PET_SETTINGS_WIFI_ACTION_HEIGHT, 540, ink, 1, true);
+    }
+    return;
+  }
+
+  const unsigned list_count = saved_list ? wifi->saved_count : wifi->count;
   for (unsigned row = 0; row < PET_SETTINGS_WIFI_ROWS; ++row) {
     const unsigned index = settings->list_start + row;
-    if (index >= wifi->count) break;
-    const pet_wifi_ap_t *ap = &wifi->aps[index];
+    if (index >= list_count) break;
     const bool focused = index == settings->selected;
     const int y = 126 + (int)row * 64;
     fill_round_rect_outline(24, y, 592, 58, 13, focused ? faint : panel, focused ? accent : outline);
+    if (saved_list) {
+      const pet_wifi_saved_network_t *entry = &wifi->saved[index];
+      draw_text_line_vcenter(entry->ssid, 43, y, 58, 348, ink, 1, true);
+      draw_text_line_vcenter(entry->security == PET_WIFI_OPEN ? "开放" :
+        entry->security == PET_WIFI_WPA3 ? "WPA3" : "WPA2", 398, y, 58, 58, muted, 1, true);
+      draw_text_right(entry->current ? "已连接" : entry->auto_join ? "自动连接" : "手动连接",
+                      600, y + 20, 132, entry->current ? green : muted, 1);
+      continue;
+    }
+    const pet_wifi_ap_t *ap = &wifi->aps[index];
     draw_text_line_vcenter(ap->ssid, 43, y, 58, 420, ink, 1, true);
     draw_text_line_vcenter(ap->security == PET_WIFI_OPEN ? "开放" :
       ap->security == PET_WIFI_UNSUPPORTED ? "不支持" : "加密", 484, y, 58, 68, muted, 1, true);
@@ -190,24 +286,24 @@ static void render_settings_page(const pet_settings_view_t *settings) {
                 bar < strength ? accent : outline);
   }
   fill_round_rect_outline(24, 395, 186, 60, 13,
-    settings->selected == wifi->count ? faint : panel, outline);
-  draw_text_center("重新扫描", 117, 416, 164, ink, 1);
-  if (wifi->saved) {
+    settings->selected == list_count ? faint : panel, outline);
+  draw_text_center(saved_list ? "扫描结果" : "重新扫描", 117, 416, 164, ink, 1);
+  if (!saved_list) {
     fill_round_rect_outline(230, 395, 185, 60, 13,
       settings->selected > wifi->count ? faint : panel, outline);
-    draw_text_center("忘记网络", 322, 416, 164, ink, 1);
+    draw_text_center("已保存网络", 322, 416, 164, ink, 1);
   }
-  if (wifi->count > PET_SETTINGS_WIFI_ROWS) {
+  if (list_count > PET_SETTINGS_WIFI_ROWS) {
     const unsigned current_page = settings->list_start / PET_SETTINGS_WIFI_ROWS + 1;
-    const unsigned pages = (wifi->count + PET_SETTINGS_WIFI_ROWS - 1) / PET_SETTINGS_WIFI_ROWS;
+    const unsigned pages = (list_count + PET_SETTINGS_WIFI_ROWS - 1) / PET_SETTINGS_WIFI_ROWS;
     char navigation[48];
     snprintf(navigation, sizeof(navigation), "%s %u/%u",
              current_page < pages ? "下一页" : "回到第1页", current_page, pages);
     fill_round_rect_outline(435, 395, 181, 60, 13, panel, outline);
     draw_text_center(navigation, 525, 416, 163, ink, 1);
-  } else if (wifi->count) {
+  } else if (list_count) {
     char count[32];
-    snprintf(count, sizeof(count), "共 %u 个网络", (unsigned)wifi->count);
+    snprintf(count, sizeof(count), "共 %u 个网络", list_count);
     draw_text_center(count, 525, 416, 163, muted, 1);
   }
 }

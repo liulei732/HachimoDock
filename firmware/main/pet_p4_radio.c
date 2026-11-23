@@ -18,6 +18,7 @@
 #define RADIO_HOST "lhttp.qingting.fm"
 #define RADIO_CONNECT_MS 6000
 #define RADIO_PROGRESS_MS 6000
+#define RADIO_STABLE_SAMPLES (60u * PET_RADIO_PCM_RATE)
 #define RADIO_WIFI_RECOVERY_MS 30000
 #define RADIO_FINITE_MAX_BYTES (256u * 1024u * 1024u)
 #define RADIO_RECEIVE_BYTES (32 * 1024)
@@ -66,7 +67,7 @@ typedef struct {
   int64_t deadline;
   bool chunked, chunk_crlf, received_http, io_interrupted;
   bool bounded, body_complete, delivered, wifi_lost;
-  uint32_t remaining, body_bytes, body_limit;
+  uint32_t remaining, body_bytes, body_limit, delivered_samples;
   unsigned chunk_remaining;
   pet_network_audio_format_t format;
   size_t pos, received;
@@ -287,6 +288,8 @@ static bool deliver(radio_stream_t *s, size_t samples) {
     pet_radio_write_t result = pet_p4_media_radio_write(s->generation, s->pcm, samples);
     if (result == PET_RADIO_WRITTEN) {
       s->delivered = true;
+      if (s->delivered_samples < RADIO_STABLE_SAMPLES)
+        s->delivered_samples += (uint32_t)samples;
       s->deadline = now_ms() + RADIO_PROGRESS_MS;
       return true;
     }
@@ -432,7 +435,8 @@ static void radio_task(void *arg) {
     pet_radio_error_t error = PET_RADIO_OUT_OF_MEMORY;
     radio_stream_t *s = heap_caps_calloc(1, sizeof(*s), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (s) {
-      for (unsigned attempt = 0; attempt < 2; ++attempt) {
+      bool retried = false;
+      for (;;) {
         s->generation = job.generation;
         if (!connect_stream(s, &job)) {
           error = s->failure;
@@ -448,13 +452,17 @@ static void radio_task(void *arg) {
           (job.live_stream && s->delivered && s->body_complete);
         if (error == PET_RADIO_COMPLETE || error == PET_RADIO_FORMAT_UNSUPPORTED) break;
         if (offline) error = PET_RADIO_WIFI_DISCONNECTED;
-        if (attempt || (!offline && !interrupted) || (!job.live_stream && (offline || s->delivered)))
+        // A minute of accepted PCM replenishes one live reconnect. Short-lived
+        // connections never replenish it; finite audio cannot replay a prefix.
+        if (job.live_stream && s->delivered_samples >= RADIO_STABLE_SAMPLES) retried = false;
+        if (retried || (!offline && !interrupted) || (!job.live_stream && (offline || s->delivered)))
           break;
         if (job.live_stream && !pet_p4_media_radio_reconnecting(job.generation)) break;
         if (!wait_for_wifi(job.generation)) {
           if (!pet_device_wifi_online()) error = PET_RADIO_WIFI_DISCONNECTED;
           break;
         }
+        retried = true;
         memset(s, 0, sizeof(*s));
       }
       heap_caps_free(s);

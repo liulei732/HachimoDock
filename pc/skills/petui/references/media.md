@@ -19,7 +19,7 @@
 - 受控动作：media.toggle、media.queue、media.previous、media.next、media.up、media.down、media.select、media.lyrics。
 - media.lyrics 需要额外能力 widgetLyrics=p4-lrc-v1（0.7.67-p4 起）。仅此播放器动作允许绑定 button.sw1.long_press；其他组件仍保留 SW 长按给全局操作。
 - 使用真实 buttons 映射；需包含播放/暂停、列表切换、确认选择，方向键用于切歌、音量、列表移动。
-- 保留产品全局退出和长按语音；离开媒体组件可继续后台播放。0.7.69-p4 起，在宠物主页再次按配置的全局退出键停止音乐并取消 PC 播放准备，保留曲库。不额外绑定组件退出键；实时对话仍优先处理退出及语音暂停。
+- 使用产品全局退出和长按语音。离开媒体组件时停止播放并取消 PC 播放准备，曲库保留。实时对话优先处理退出及语音暂停。
 - Dashboard 可用 clean/ember/tool/music 表达预览语义；原生播放器负责实际封面、信息、时间和控制布局。
 
 ## 已实现交互

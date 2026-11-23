@@ -2,18 +2,34 @@
 //! No session history, package-selected paths or credentials leave this service.
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeMap,
     fs,
     io::Read,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 const STALE_MS: i64 = 300_000;
 #[path = "local_telemetry/accounts.rs"]
 pub mod accounts;
-pub fn registered(source: &str) -> bool {
-    source == "codex.accounts"
+const PROVIDERS: &str = include_str!("../../skills/petui/scripts/local_telemetry_sources.json");
+
+#[derive(serde::Deserialize)]
+struct Provider<'a> {
+    #[serde(borrow)]
+    actions: Vec<&'a str>,
 }
-pub fn operations(_: &str) -> &'static [&'static str] {
-    accounts::token_panel::OPERATIONS
+
+fn provider(source: &str) -> Option<&'static Provider<'static>> {
+    static REGISTRY: OnceLock<BTreeMap<&'static str, Provider<'static>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| serde_json::from_str(PROVIDERS).expect("built-in telemetry registry"))
+        .get(source)
+}
+
+pub fn registered(source: &str) -> bool {
+    provider(source).is_some()
+}
+pub fn operations(source: &str) -> &'static [&'static str] {
+    provider(source).map_or(&[], |provider| provider.actions.as_slice())
 }
 fn directory(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
@@ -76,9 +92,19 @@ fn window(limits: &Value, minutes: i64, at: i64, now: i64) -> Value {
     }
     unknown_window()
 }
-pub fn snapshot(source: &str, now: i64, refresh: bool) -> Result<Value, String> {
-    if !registered(source) {
-        return Err("未注册的本机数据源".into());
+pub fn snapshot(source: &str, selection: &mut u8, now: i64, action: Option<&str>) -> Result<Value, String> {
+    let contract = provider(source).ok_or("未注册的本机数据源")?;
+    if action.is_some_and(|action| !contract.actions.contains(&action)) {
+        return Err("本机数据源不支持此动作".into());
     }
-    accounts::managed_snapshot(&mut 1, now, refresh.then_some("refresh"))
+    match source {
+        "codex.accounts" if !cfg!(target_os = "macos") => Err("Codex 额度账号管理需要 macOS".into()),
+        "codex.accounts" => {
+            if !(1..=accounts::settings::MAX_ACCOUNTS).contains(selection) {
+                return Err("本机数据源的选择存档无效，原数据保留".into());
+            }
+            accounts::managed_snapshot(selection, now, action)
+        },
+        _ => Err("本机数据源的适配器不可用".into()),
+    }
 }

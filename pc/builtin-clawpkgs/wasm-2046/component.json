@@ -1,1 +1,1 @@
-{"id":"wasm-2046","name":"2048","version":"1.4.2","kind":"game","description":"选一个方向，让整盘方块向那边滑。相同数字合并，合出 2048 达标，无路可走时本局结束。","author":"PetUI"}
+{"id":"wasm-2046","name":"2048","version":"1.5.0","kind":"game","description":"向四个方向滑动，合并相同数字，挑战 2048。可撤回本次打开后的上一步；无路可走时结算。","author":"PetUI","wasmTouch":true}

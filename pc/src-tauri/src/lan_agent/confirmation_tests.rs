@@ -1,20 +1,50 @@
 use super::*;
 use std::net::TcpListener;
 
-fn accept(listener: &TcpListener) -> TcpStream {
+pub(super) fn accept(listener: &TcpListener) -> TcpStream {
+    listener.set_nonblocking(true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match listener.accept() {
-            Ok((stream, _)) => { stream.set_nonblocking(false).unwrap(); stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap(); return stream; }
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                let timeout = Some(Duration::from_secs(3));
+                stream.set_read_timeout(timeout).unwrap();
+                stream.set_write_timeout(timeout).unwrap();
+                stream.set_nodelay(true).unwrap();
+                return stream;
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
             Err(e) => panic!("test peer did not connect: {e}"),
         }
     }
 }
 
-fn confirmed_roundtrip(drop_ack: bool) {
+// Call after the synchronous client returns. Any replay is already ahead of
+// this marker in the original loopback listener's pending connection queue.
+pub(super) fn assert_no_replay(listener: TcpListener) {
+    let address = listener.local_addr().unwrap();
+    let marker = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+    let next = accept(&listener);
+    assert_eq!(
+        next.peer_addr().unwrap(),
+        marker.local_addr().unwrap(),
+        "unexpected replay connection"
+    );
+}
+
+#[test]
+#[should_panic(expected = "unexpected replay connection")]
+fn replay_check_detects_an_already_queued_connection() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
+    let _replay = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    assert_no_replay(listener);
+}
+
+enum Interruption { None, PairAck, FirstProbe }
+
+fn confirmed_roundtrip(interruption: Interruption) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
         let mut stream = accept(&listener);
@@ -44,8 +74,20 @@ fn confirmed_roundtrip(drop_ack: bool) {
         let master = hmac::Key::new(hmac::HMAC_SHA256,secret.as_ref()); let mut transcript=hmac::Context::with_key(&master);
         transcript.update(b"P4LAN1");transcript.update(&cn);transcript.update(&sn);
         let mut stored=[0;16];stored.copy_from_slice(&transcript.sign().as_ref()[..16]);
-        if !drop_ack {stream.write_all(sha512(&[&public_a,&proof,secret.as_ref()]).as_ref()).unwrap();}
+        if !matches!(interruption, Interruption::PairAck) {stream.write_all(sha512(&[&public_a,&proof,secret.as_ref()]).as_ref()).unwrap();}
         drop(stream);
+        if matches!(interruption, Interruption::FirstProbe) {
+            let mut probe = accept(&listener);
+            let mut nonce = [0; 16];
+            probe.read_exact(&mut nonce).unwrap();
+            probe.write_all(&[0x42; 16]).unwrap();
+            let mut header = [0; 3];
+            probe.read_exact(&mut header).unwrap();
+            assert_eq!(header, [PROBE, 0, 0]);
+            let mut tag = [0; 16];
+            probe.read_exact(&mut tag).unwrap();
+            // Drop the first probe before sending its authenticated receipt.
+        }
         // Client must authenticate a fresh read-only probe before returning success.
         let mut stream = accept(&listener); let mut cn=[0;16]; stream.read_exact(&mut cn).unwrap(); let sn=[0x41;16];stream.write_all(&sn).unwrap();
         let mut header=[0;3];stream.read_exact(&mut header).unwrap();assert_eq!(header,[PROBE,0,0]);
@@ -59,15 +101,19 @@ fn confirmed_roundtrip(drop_ack: bool) {
 }
 
 #[test]
-fn automatic_pairing_proofs_and_readonly_probe_succeed() { confirmed_roundtrip(false); }
+fn automatic_pairing_proofs_and_readonly_probe_succeed() { confirmed_roundtrip(Interruption::None); }
 #[test]
-fn lost_final_ack_is_recovered_only_by_authenticated_probe() { confirmed_roundtrip(true); }
+fn lost_final_ack_is_recovered_only_by_authenticated_probe() { confirmed_roundtrip(Interruption::PairAck); }
+
+#[test]
+fn committed_pairing_survives_a_dropped_first_verification_socket() {
+    confirmed_roundtrip(Interruption::FirstProbe);
+}
 
 #[test]
 fn address_recovery_requires_original_key_and_uses_only_read_only_probes() {
     fn mock_peer(master: [u8; 16]) -> (SocketAddr, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let worker = std::thread::spawn(move || {
             let mut stream = accept(&listener);
@@ -105,7 +151,6 @@ fn address_recovery_requires_original_key_and_uses_only_read_only_probes() {
 #[test]
 fn volume_acceptance_and_result_use_authenticated_frames() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
     let master = [0x73; 16];
     let peer = Peer { address: listener.local_addr().unwrap(), key: Zeroizing::new(master) };
     let id = [0x25; 16];
@@ -143,7 +188,6 @@ fn volume_acceptance_and_result_use_authenticated_frames() {
 fn device_status_requires_the_paired_key_and_authenticates_the_response() {
     fn request(tamper: bool) -> io::Result<Vec<u8>> {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let peer = Peer {
             address: listener.local_addr().unwrap(),
             key: Zeroizing::new([7; 16]),
@@ -186,7 +230,6 @@ fn component_delivery_rejects_tampered_results_and_never_reopens_the_connection(
     let fixture = b"0123456789abcdef\x04\0\x02\0\x02demo[]{}";
     for outcome in [Some(false), Some(true), None] {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let master = [0x71; 16];
         let peer = Peer { address: listener.local_addr().unwrap(), key: Zeroizing::new(master) };
         let worker = std::thread::spawn(move || {
@@ -214,8 +257,7 @@ fn component_delivery_rejects_tampered_results_and_never_reopens_the_connection(
                 stream.write_all(&reply).unwrap();
             }
             drop(stream);
-            std::thread::sleep(Duration::from_millis(50));
-            assert_eq!(listener.accept().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+            listener
         });
         let result = exchange_response_with_timeout(&peer, 9, fixture, Some(1), Duration::from_secs(1));
         if outcome == Some(false) {
@@ -223,6 +265,27 @@ fn component_delivery_rejects_tampered_results_and_never_reopens_the_connection(
         } else {
             assert!(result.is_err());
         }
-        worker.join().unwrap();
+        assert_no_replay(worker.join().unwrap());
     }
+}
+
+#[test]
+fn paired_status_distinguishes_transport_authentication_and_decode_failures() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer = Peer { address: listener.local_addr().unwrap(), key: Zeroizing::new([4; 16]) };
+    let worker = std::thread::spawn(move || {
+        let mut stream = accept(&listener);
+        let mut client = [0u8;16];
+        stream.read_exact(&mut client).unwrap();
+        stream.write_all(&[8u8;16]).unwrap();
+        let mut request = [0u8;19];
+        stream.read_exact(&mut request).unwrap();
+        // Disconnect after the challenge, before the authenticated response.
+    });
+    let error = exchange(&peer, PROBE, &[]).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    assert!(error.to_string().contains("认证回执"));
+    worker.join().unwrap();
+    assert!(exchange(&peer, PROBE, &[]).unwrap_err().to_string().contains("TCP"));
+    assert!(decode_status(b"{}").err().unwrap().to_string().contains("状态格式"));
 }

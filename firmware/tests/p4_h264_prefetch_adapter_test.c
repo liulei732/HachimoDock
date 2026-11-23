@@ -93,14 +93,19 @@ static void scale_h264_frame_cpu(const uint8_t *in,int w,int h,int stride,int sh
  assert(in==decoded&&w==16&&h==16&&stride==16&&sh==16&&g_h264_prefetch_lifetime.phase==PET_PREFETCH_CONSUMING);interleave(3);memset(framebuffer,0,sizeof(framebuffer));
 }
 static bool h264_frame_supports_ppa_yuv420(int w,int h){return !(w%16)&&!(h%16);}
+static unsigned conversions;
 static bool scale_h264_frame_ppa(const uint8_t *in,int w,int h,int storage_h){
- assert(in==packed_pixels&&w==16&&h==16&&storage_h==16);
+ ++conversions; assert(in==packed_pixels&&w==16&&h==16&&storage_h==16);
  uint8_t before[sizeof(packed_pixels)];memcpy(before,in,sizeof(before));
  pet_h264_packed_view_t view;assert(pet_h264_packed_view_init(&view,in,sizeof(packed_pixels),24,16,16,16));
  expected_pixel=pet_h264_packed_pixel(&view,0,0);
  /* Decode N+1 after packing N, before a failed PPA conversion's CPU fallback. */
  (void)h264_prefetch_worker();assert(!memcmp(before,in,sizeof(before)));return false;
 }
+static uint16_t rgb_cache[PET_P4_UI_WIDTH * PET_P4_UI_HEIGHT];
+static uint16_t *g_jpeg_output = rgb_cache;
+static size_t g_jpeg_output_capacity = sizeof(rgb_cache);
+static bool g_h264_rgb_cached;
 #include "pet_p4_h264_prefetch.inc"
 static void interleave(unsigned at){
  if(hook==at){hook=0;assert(!pet_p4_renderer_program_window_begin());
@@ -128,7 +133,12 @@ int main(void){
  assert(g_h264_prefetch_lifetime.phase==PET_PREFETCH_READY&&!g_asset_cache[0].decoder_readers);
  assert(render_h264_asset_frame_async(&asset,"a",&g_asset_cache[0],300));
  assert(g_h264_presented_frame==0&&framebuffer[0]==expected_pixel&&g_h264_prefetch_job.frame==1);
- assert(render_h264_asset_frame_async(&asset,"a",&g_asset_cache[0],300));assert(g_h264_presented_frame==0); /* no early next-frame display */
+ unsigned before_repeat=conversions;
+ static uint16_t clean_frame[sizeof(framebuffer)/sizeof(framebuffer[0])];
+ memcpy(clean_frame,framebuffer,sizeof(framebuffer));
+ memset(framebuffer,0xcd,sizeof(framebuffer)); /* overlays dirtied the previous frame */
+ assert(render_h264_asset_frame_async(&asset,"a",&g_asset_cache[0],300));
+ assert(conversions==before_repeat && !memcmp(framebuffer,clean_frame,sizeof(framebuffer)) && g_h264_presented_frame==0); /* no early next-frame display */
  now_us=(g_h264_first_presented_ms+100)*1000;assert(render_h264_asset_frame_async(&asset,"a",&g_asset_cache[0],300));assert(g_h264_presented_frame==1);
  now_us=(g_h264_first_presented_ms+300)*1000;assert(render_h264_asset_frame_async(&asset,"a",&g_asset_cache[0],300));assert(g_h264_presented_frame==2);
  assert(g_metrics.prefetch.presented_frames==3&&g_metrics.prefetch.decoded_frames==3);

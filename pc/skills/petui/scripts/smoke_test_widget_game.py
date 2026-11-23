@@ -650,6 +650,13 @@ def smoke_test_game(widget_dir: Path) -> dict[str, Any]:
     runtime = load_json(widget_dir / "runtime" / "widget.json")
     manifest = load_json(widget_dir / "component.json")
     buttons = load_json(widget_dir / "buttons.json")
+    if "accessory" in runtime:
+        return {"ok": True, "mode": "foreground-ble-read", "measurement": runtime["accessory"],
+                "consent": "physical-short-press", "deviceVerified": False}
+    if "hardware" in runtime:
+        return {"ok": True, "mode": "foreground-hardware-contract",
+                "service": runtime["hardware"]["service"], "consent": "physical-short-press",
+                "quietBelow": runtime["hardware"].get("quiet_below"), "deviceVerified": False}
     if runtime.get('scene',{}).get('engine')=='p4-side-scene-v1':
         import subprocess,shutil
         node=shutil.which('node')
@@ -680,7 +687,7 @@ def smoke_test_game(widget_dir: Path) -> dict[str, Any]:
         if not node:return {'ok':False,'errors':['游戏画面层需要 Node.js 运行同源游戏核心']}
         result=subprocess.run([node,str(Path(__file__).with_name('smoke_classic.mjs')),str(widget_dir/'runtime/widget.json'),str(widget_dir/'buttons.json')],capture_output=True,text=True,timeout=30)
         return json.loads(result.stdout) if result.returncode==0 else {'ok':False,'errors':[result.stderr[-1500:]]}
-    if runtime.get('surface',{}).get('engine')=='p4-app-surface-v1' and not any(k in runtime for k in ('scene','data')):
+    if runtime.get('surface',{}).get('engine')=='p4-app-surface-v1' and not any(k in runtime for k in ('scene','data','media')):
         from bounded_app import smoke
         return smoke(runtime,buttons)
     if runtime.get("scene", {}).get("engine") == "p4-touch-slice-v1":

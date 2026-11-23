@@ -1,0 +1,12 @@
+{
+  "dashboard": {
+    "title": "配件电量",
+    "headline": "等待设备授权",
+    "note": "在设备上逐次允许读取指定配件的电量百分比。",
+    "footer": "摇杆选择地址，SW1 读取一次",
+    "visualStyle": "clean",
+    "visualPalette": "ocean",
+    "visualLayout": "tool",
+    "visualSprite": "gauge"
+  }
+}

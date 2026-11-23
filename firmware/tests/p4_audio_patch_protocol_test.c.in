@@ -10,6 +10,9 @@
 #include <unistd.h>
 #include "pet_p4_protocol.h"
 #include "pet_p4_audio_patch.h"
+#if PET_P4_SYSTEM_WIFI
+#include "pet_p4_lan.h"
+#endif
 #define EXT_RAM_BSS_ATTR
 #define PET_P4_PACK_ID_MAX 65
 static pet_appearance_session_t g_appearance_session;
@@ -51,13 +54,27 @@ bool pet_resources_device_current(pet_resource_lease_t l){return !lease_invalid&
 pet_resource_finish_t pet_resources_device_finish(pet_resource_lease_t l){return pet_resources_finish(&broker,l);}
 void pet_resources_device_revoke(pet_resource_owner_t o){(void)pet_resources_owner_revoke(&broker,o);}
 static bool read_ready_slot_pack_id(int slot,char *out,size_t n){assert(!held);ready_reads++;assert(n>=65);if(slot<0||slot>1)return false;memcpy(out,pack,65);return true;}
+#if PET_P4_SYSTEM_WIFI
+static bool peer_live=true;
+bool pet_p4_lan_appearance_current(void *route){return route==(void*)2 && peer_live;}
+void pet_p4_lan_appearance_reply(const char *line,void *route){(void)line;(void)route;}
+#endif
 static void send_topic_payload(pet_p4_send_line_fn send,void *route,const char *topic,cJSON *p){
- assert(!held);assert(send==pet_p4_native_usb_send_json_line&&route==(void*)1);assert(!strcmp(topic,"asset/ack"));cJSON_Delete(last_ack);last_ack=cJSON_Duplicate(p,true);cJSON_Delete(p);assert(last_ack);acks++;
+ assert(!held);
+#if PET_P4_SYSTEM_WIFI
+ if(send==pet_p4_lan_appearance_reply)assert(pet_p4_lan_appearance_current(route));
+ else
+#endif
+ {assert(send==pet_p4_native_usb_send_json_line&&route==(void*)1);}
+ assert(!strcmp(topic,"asset/ack"));cJSON_Delete(last_ack);last_ack=cJSON_Duplicate(p,true);cJSON_Delete(p);assert(last_ack);acks++;
 }
+#ifdef PET_TEST_REAL_BASE64
+int mbedtls_base64_decode(unsigned char *,size_t,size_t *,const unsigned char *,size_t);
+#else
 static int mbedtls_base64_decode(unsigned char *out,size_t capacity,size_t *olen,const unsigned char *in,size_t n){
  const char *expected="UklGRiYAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQIAAAABAA==";if(n!=strlen(expected)||memcmp(in,expected,n)||capacity<sizeof(wave))return -1;memcpy(out,wave,sizeof(wave));*olen=sizeof(wave);return 0;
 }
-
+#endif
 
 bool pet_p4_appearance_active(void){return g_appearance_session.active;}
 static bool slot_is_valid(int slot){return slot>=0&&slot<2;}

@@ -1,5 +1,7 @@
 # 通用绑定与 PC 服务组合 v1
 
+数据源 `python` 使用 [PetUI 桌面 Python 插件](python-plugins.md) 契约，支持按 JSON Pointer 绑定结果。用户在组件详情授权输入并启用后，宿主才会安排脚本运行。
+
 ## 有界稳定 ID 集合视图
 
 组合 v2/v3 可声明 `collection` 数据源，字段为 `kind`、`expression`、`view`。
@@ -95,6 +97,10 @@ v2 仍是本地事务流程，尚未开放网络写入、鉴权、朗读、录�
 结构/单元测试不代表设备已支持，必须再验收版本上下文、实际输入、显示与重连。
 
 本能力是有界声明式框架，不执行组件内代码，不按组件 ID 选择逻辑。旧 `pc-app-services-*` 包、旧 dashboard 绑定和存档继续兼容。新包必须协商 `widgetVariableBindings=p4-variable-bindings-v1`，缺少能力时阻止同步，不能依靠固件版本号猜测。
+
+本机数据源的名称与动作由 `scripts/local_telemetry_sources.json` 中的产品注册表定义，桌面端和社区预检均读取该文件。组件用 `local-telemetry` 声明已注册的源，再选择需要显示的字段和动作。账户、凭据和实时数据由宿主维护，包内初始值使用公开占位文案。
+
+使用命名绑定的宿主界面可直接在 runtime 声明静态 `dashboard`。运行 `petui pack` 时，打包器从这一份声明生成 `negative-screen.json.dashboard`。桌面社区预检也会为已安装的同类组件生成一致的发布预览，本地组件源和存档继续由原路径管理。
 
 PC 同样必须支持 pc-app-composition-v1；只有新固件而旧客户端时不能执行组合服务。作者不传能力文件才使用离线创作默认值，显式传入空能力对象不会自动获得新能力。离线默认值不能作为真实设备支持的证据。
 

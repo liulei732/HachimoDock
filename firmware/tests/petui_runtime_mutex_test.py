@@ -60,6 +60,26 @@ def test_runtime_task_mutex_contended_snapshots_and_fail_closed_guards(tmp_path)
             locked=section.split('miniapp_runtime_unlock();',1)[0]
             assert all(op not in locked for op in ('catalog_cursor_write(','storage_scope_','fopen(','malloc(','g_catalog_cursor_schedule('))
         census=census.replace(scope,'',1)
+    for name in ('pet_p4_miniapp_hardware_guard','pet_p4_miniapp_hardware_key','pet_p4_miniapp_write_if_active'):
+        scope=function(code,name)
+        assert scope.count('miniapp_runtime_lock();') == scope.count('miniapp_runtime_unlock();') == 1
+        assert not any(op in scope for op in ('esp_codec_dev_read','malloc(','fopen('))
+        census=census.replace(scope,'',1)
+    repair = function(code, 'commit_thumb_repair')
+    assert repair.count('miniapp_runtime_lock();') == repair.count('miniapp_runtime_unlock();') == 1
+    locked = repair.split('miniapp_runtime_lock();')[1].split('miniapp_runtime_unlock();')[0]
+    assert 'g_catalog[at].center_thumb_checksum' in locked
+    assert all(op not in locked for op in ('write_catalog_snapshot_at(', 'stage_center_thumb(', 'fopen(', 'malloc('))
+    census = census.replace(repair, '', 1)
+    write = function(code, 'pet_p4_miniapp_write_if_active')
+    assert write.index('miniapp_runtime_lock();') < write.index('g_runtime.active') < write.index('!memcmp(scope,')
+    assert write.index('!memcmp(scope,') < write.index('send(context)') < write.index('miniapp_runtime_unlock();') < write.index('return result;')
+    policy = function(code, 'pet_p4_wasm_network_policy')
+    assert policy.count('miniapp_runtime_lock();') == policy.count('miniapp_runtime_unlock();') == 1
+    locked = policy.split('miniapp_runtime_lock();', 1)[1].split('miniapp_runtime_unlock();', 1)[0]
+    assert 'revision && g_runtime.active && revision == g_image_revision + 1' in locked
+    assert 'cJSON_Parse(g_runtime.wasm_network)' in locked
+    census = census.replace(policy, '', 1)
     # 65: includes the merged WASM package/speech and filtered-center accessors.
     # Preserve an exact census while the contention test below exercises snapshots.
     assert census.count('miniapp_runtime_lock();') == 65
@@ -89,12 +109,14 @@ def test_runtime_task_mutex_contended_snapshots_and_fail_closed_guards(tmp_path)
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "pet_p4_private_feed.h"
 typedef struct {pthread_mutex_t mutex;} StaticSemaphore_t;
 typedef StaticSemaphore_t *SemaphoreHandle_t;
 #define pdTRUE 1
 #define portMAX_DELAY 0xffffffffu
 #define configASSERT(condition) ((void)0)
 static _Thread_local bool in_isr,in_critical;
+static _Thread_local unsigned runtime_depth;
 static bool fail_init,fail_take,fail_give;
 static atomic_uint waiting,progress,reader_done;
 static atomic_bool stop_ticker;
@@ -109,9 +131,12 @@ static SemaphoreHandle_t xSemaphoreCreateRecursiveMutexStatic(StaticSemaphore_t 
 }
 static int xSemaphoreTakeRecursive(SemaphoreHandle_t s,unsigned timeout){
  assert(timeout==portMAX_DELAY&&!in_isr&&!in_critical);if(fail_take)return 0;
- atomic_fetch_add(&waiting,1);int result=pthread_mutex_lock(&s->mutex);atomic_fetch_sub(&waiting,1);return result==0;
+ atomic_fetch_add(&waiting,1);int result=pthread_mutex_lock(&s->mutex);atomic_fetch_sub(&waiting,1);if(!result)++runtime_depth;return result==0;
 }
-static int xSemaphoreGiveRecursive(SemaphoreHandle_t s){if(fail_give)return 0;return pthread_mutex_unlock(&s->mutex)==0;}
+static int xSemaphoreGiveRecursive(SemaphoreHandle_t s){
+ if(fail_give||pthread_mutex_unlock(&s->mutex))return 0;
+ assert(runtime_depth);--runtime_depth;return 1;
+}
 static _Noreturn void rejected(void){_Exit(79);}
 #define abort rejected
 ''' + lock + r'''
@@ -122,11 +147,38 @@ static _Noreturn void rejected(void){_Exit(79);}
 ''' + sprites + r'''
 /* The actual sprite pack layout is used. Extra bounded runtime bytes ensure
  * the copied object spans the same large-data class as the target runtime. */
-typedef struct {pet_p4_miniapp_sprite_pack_t sprites;uint8_t other[80*1024];} miniapp_runtime_t;
+typedef struct {
+ pet_p4_miniapp_sprite_pack_t sprites;
+ bool active;
+ struct { pet_private_feed_t private; } wifi_feed;
+ uint8_t other[80*1024];
+} miniapp_runtime_t;
 static miniapp_runtime_t g_runtime;
+static bool storage_busy;
+static bool pet_p4_miniapp_storage_busy(void) { return storage_busy; }
+''' + write + r'''
+static int protected_send(void *ctx) {
+ assert(runtime_depth==1);
+ return ++*(int *)ctx;
+}
+static void check_scoped_send(void) {
+ uint8_t scope[32]={1};
+ int result=-2;
+ g_runtime.wifi_feed.private.kind=PET_HTTPS_SUBMIT;
+ memcpy(g_runtime.wifi_feed.private.id,scope,sizeof(scope));
+ assert(pet_p4_miniapp_write_if_active(scope,protected_send,&result)==-1 && result==-2 && !runtime_depth);
+ g_runtime.active=true; storage_busy=true;
+ assert(pet_p4_miniapp_write_if_active(scope,protected_send,&result)==-1 && result==-2 && !runtime_depth);
+ storage_busy=false; scope[0]=2;
+ assert(pet_p4_miniapp_write_if_active(scope,protected_send,&result)==-1 && result==-2 && !runtime_depth);
+ scope[0]=1;
+ assert(pet_p4_miniapp_write_if_active(scope,protected_send,&result)==-1 && result==-1 && !runtime_depth);
+ assert(pet_p4_miniapp_write_if_active(scope,protected_send,&result)==0 && result==0 && !runtime_depth);
+}
 static uint32_t g_image_revision=1;
 static size_t g_catalog_selected;
 static struct {bool published;} g_activation;
+static void hardware_leave_locked(void) {} /* isolated publication fixture */
 static void publish_next(miniapp_runtime_t *next,size_t index,uint64_t token){
 ''' + publish + r'''
 }
@@ -168,6 +220,7 @@ int main(int argc,char **argv){
   miniapp_runtime_unlock();return 1;
  }
  assert(miniapp_runtime_lock_init()&&miniapp_runtime_lock_init()&&creates==1);
+ check_scoped_send();
  miniapp_runtime_lock();miniapp_runtime_lock();miniapp_runtime_unlock();miniapp_runtime_unlock();
  miniapp_runtime_t *next=malloc(sizeof(*next));assert(next);prepare(next,1);publish_next(next,4,1);assert(g_activation.published&&g_catalog_selected==4);
  pthread_t independent,blocked;assert(!pthread_create(&independent,NULL,ticker,NULL));
@@ -185,7 +238,8 @@ int main(int argc,char **argv){
     src.write_text(source)
     exe = tmp_path / 'runtime-lock'
     subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O1',
-                    '-fsanitize=address,undefined', '-pthread', str(src), '-o', str(exe)], check=True)
+                    '-fsanitize=address,undefined', '-pthread', '-DPET_P4_SYSTEM_WIFI=1', '-DPET_P4_SCOPED_WRITE=1',
+                    '-I', str(ROOT/'main'), '-I', str(ROOT/'tests/vendor/cjson'), str(src), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True, timeout=15)
     for case in ('uninitialized', 'init_failure', 'isr', 'critical', 'take_failure', 'give_failure', 'foreign_unlock'):
         result = subprocess.run([str(exe), case], timeout=5)

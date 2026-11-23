@@ -95,7 +95,7 @@ test('preview capabilities remain specific to the declared engine',()=>{
 });
 test('page visibility reaches mixed/nonmixed previews; readonly journey/default and service lifecycle remain',()=>{
  const center=src('../ComponentCenter.jsx'),modal=src('./ComponentPreviewModal.jsx'),panel=src('./ComponentAppPanel.jsx'),surface=src('./AppSurface.jsx');
- assert.match(center,/<ComponentPreviewModal\s+active=\{active\}/);
+ assert.match(center,/<ComponentPreviewModal\b[^<>]*?\sactive=\{active\}/);
  assert.match(modal,/<ComponentAppPanel[^\n]+active=\{active\}/);
  assert.match(modal,/<DeviceScreenPreview[^\n]+active=\{active\}/);
  assert.match(panel,/<ComponentAppPreview component=\{component\} active=\{active\}/);

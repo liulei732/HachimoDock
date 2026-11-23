@@ -125,7 +125,7 @@ test("current-Agent P4 session visibility is always on and follows adjacent snap
   assert.match(sessionFeed, /buildP4ConversationQueue\(/);
   assert.match(source, /useAgentSessionFeed\(\{[\s\S]*displayEnabled: true,/);
   assert.match(source, /useP4SessionSync\(\{[\s\S]*displayEnabled: true,/);
-  assert.match(source, /<ChannelMatrixCard \/>/);
+  assert.match(source, /<ChannelMatrixCard\b/);
   assert.doesNotMatch(source, /showSessionDisplaySetting/);
   assert.doesNotMatch(source, /sessionDisplayEnabled/);
   assert.doesNotMatch(source, /onSessionDisplayEnabledChange/);
@@ -224,7 +224,7 @@ test("voice button configuration groups physical controls before device sync", (
   assert.match(css, /\.board-button-panel__toolbar\s*\{/);
 });
 
-test("dashboard keeps the client button map authoritative across reconnect and firmware OTA", () => {
+test("dashboard compares the button maps on reconnect and writes only on explicit sync", () => {
   const dashboard = readSource("DeviceDashboard.jsx");
   const rust = readRepoFile("src-tauri", "src", "lib.rs");
   const usb = readRepoFile("src-tauri", "src", "usb_serial.rs");
@@ -233,8 +233,8 @@ test("dashboard keeps the client button map authoritative across reconnect and f
 
   assert.match(dashboard, /invoke\("usb_get_button_config"/);
   assert.match(dashboard, /boardButtonConfigMatchesClient\(clientConfig, boardConfig, usb\.runtime, usb\.capabilities/);
-  assert.match(dashboard, /await syncClientConfig\(\)/);
-  assert.match(dashboard, /已同步并核对设备按钮配置/);
+  assert.doesNotMatch(dashboard, /await syncClientConfig\(\)/);
+  assert.match(dashboard, /采用设备配置/);
   const queryFailure=dashboard.slice(dashboard.indexOf("} catch (error) {",dashboard.indexOf("const refreshButtonConfigFromBoard")),dashboard.indexOf("}, [",dashboard.indexOf("const refreshButtonConfigFromBoard")));
   assert.match(queryFailure, /已停止自动写入/);
   assert.doesNotMatch(queryFailure, /await syncClientConfig/);
@@ -439,7 +439,7 @@ test("board audio enable starts local runtimes and targets the active board", ()
   const source = readSource("DeviceDashboard.jsx");
   const rust = readRepoFile("src-tauri", "src", "lib.rs");
 
-  assert.match(source, /const targetBoardDeviceId = onlineBoardDeviceId \|\| usb\.boardDeviceId \|\| binding\.boardDeviceId;/);
+  assert.match(source.slice(source.indexOf("const toggleAudioBridge =")), /const targetBoardDeviceId = wifiTarget\?\.boardDeviceId \|\| usb\.boardDeviceId;/);
   assert.match(source, /if \(action === "start"\) \{[\s\S]*ensureBridgeRuntime\(\)/);
   assert.match(source, /ensure_device_voice_runtime/);
   assert.match(source, /p4VoiceRuntime \? "ensure_device_voice_runtime" : "ensure_voice_runtime"/);
@@ -605,7 +605,7 @@ test("Button-selected conversations are temporary and bound to status and input 
   assert.match(sessionSync, /onSessionChange\("auto"\)/);
   assert.match(sessionSync, /p4SessionActivitySignature/);
   assert.match(sessionSync, /sessions: buildP4DeviceSessionTransportPayload\(deviceSessions\)/);
-  assert.match(sessionService, /session\?\.model[\s\S]*codex-auto-review/);
+  assert.match(sessionService, /isInternalCodexSession\(session\)/);
   assert.match(sessionFeed, /eventsInFlight/);
   assert.doesNotMatch(sessionFeed, /catch[\s\S]*sessions:\s*\[\]/);
   assert.match(sessionSync, /deviceSessionsSignature,[\s\S]*usbConnected/);
@@ -980,17 +980,12 @@ test("managed Node runtimes clear inspector options and bind the expected lifecy
   assert.match(rust, /VOICE_SERVICE_AGENT_ID_FILE_NAME/);
 });
 
-test("voice bus polling stays active in the background and skips unchanged render updates", () => {
+test("background Bridge recovery uses a fresh feed while session routing keeps polling", () => {
   const source = readSource("DeviceDashboard.jsx");
   const sessionFeed = readSource("dashboard/useAgentSessionFeed.js");
-  const statusStart = source.indexOf("// Poll voice-bus status.");
-  const runtimeStart = source.indexOf("// Poll voice-runtime.", statusStart);
-  const sessionsEnd = source.indexOf("// Reflect board-originated voice_input", runtimeStart);
-  const statusEffect = source.slice(statusStart, runtimeStart);
-  const sessionsEffect = source.slice(runtimeStart, sessionsEnd);
-
-  assert.doesNotMatch(statusEffect, /document\.visibilityState/);
-  assert.doesNotMatch(sessionFeed, /document\.visibilityState/);
+  assert.ok(source.includes("(!active || document.hidden) && agentSessionFeedFresh(selectedAgentId, 2 * P4_SESSION_EVENT_POLL_MS)"));
+  assert.match(source, /const id = setInterval\(check, 5000\)/);
+  assert.doesNotMatch(sessionFeed, /document\.(?:hidden|visibilityState)/);
   assert.match(source, /fingerprint === state\.busStatusFingerprint/);
   assert.match(sessionFeed, /fingerprint === state\.fingerprint/);
 });
@@ -1001,7 +996,8 @@ test("voice runtime polling preserves cadence, avoids overlap, and deduplicates 
   assert.match(helper, /inFlight = false/);
   assert.match(helper, /if \(!current\(\) \|\| inFlight\) return/);
   assert.match(helper, /finally \{ inFlight = false/);
-  assert.match(source, /setInterval\(\(\)=>poller\.poll\(\),5000\)/);
+  assert.match(source, /voiceTarget.kind === "legacy"[\s\S]*?setInterval\(poller.poll, 5000\)/);
+  assert.match(source, /pollWhileVisible\(poller.poll, 5000\)/);
   assert.match(source, /poller\.cancel\(\)/);
   assert.doesNotMatch(helper, /document\.visibilityState/);
   assert.match(source, /fingerprint === state\.voiceRuntimeFingerprint/);
@@ -1046,11 +1042,9 @@ test("appearance OTA syncs done and error WAV cues beside the matching videos", 
 test("manual P4 appearance recovery carries the exact board identity", () => {
   const source = readSource("DeviceDashboard.jsx");
 
-  assert.match(
-    source,
-    /invoke\("usb_sync_appearance", \{[\s\S]*appearanceId,[\s\S]*boardDeviceId: p4TargetBoardDeviceId/,
-  );
-  assert.match(source, /\[p4TargetBoardDeviceId, push\]/);
+  assert.match(source, /useAppearanceDelivery\(\s*usb, wifi, binding\?\.boardDeviceId, recoveryAppearanceId/);
+  assert.match(source, /onForceSyncAppearance=\{canDeliverAppearance && !appearanceSync\?\.pending/);
+  assert.match(source, /const message = await sendAppearance\(\)/);
 });
 
 // ---- NEW: 4-section IA tests (added in Step 1) ----
@@ -1060,7 +1054,7 @@ test("button configuration only renders on the keyboard page", () => {
   const home = source.slice(source.indexOf("{active && <PageShell"));
   assert.match(source, /\{keyboardActive && <KeyboardConfiguration[\s\S]*<BoardButtonPanel[\s\S]*<\/KeyboardConfiguration>/);
   assert.doesNotMatch(home, /<BoardButtonPanel/);
-  assert.match(home, /<DeviceStatusBar[\s\S]*<ChannelMatrixCard[\s\S]*<VoiceAssistantPanel/);
+  assert.match(home, /<ChannelMatrixCard\b[\s\S]*<DeviceStatusBar[\s\S]*<\/ChannelMatrixCard>[\s\S]*<VoiceAssistantPanel/);
 });
 
 test("dashboard pulls device state from useDeviceContext (no local polling)", () => {
@@ -1083,7 +1077,8 @@ test("dashboard freezes the P4 target board when diagnostics or firmware modal o
   const diagnosticsModal = source.match(/<DeviceDiagnosticsModal[\s\S]*?\/>/);
   assert.ok(firmwareModal, "expected FirmwareUpdateModal");
   assert.ok(diagnosticsModal, "expected DeviceDiagnosticsModal");
-  assert.match(source, /setFirmwareTargetBoardDeviceId\(usb\.boardDeviceId \|\| ""\)/);
+  assert.match(source, /setFirmwareTargetBoardDeviceId\(usb\.connected \? usb\.boardDeviceId : wifi\.boardDeviceId\)/);
+  assert.match(firmwareModal[0], /expectedWifiBootId=\{firmwareWifiBootId\}/);
   assert.match(source, /setDiagnosticsTargetBoardDeviceId\(wifiControlReady \? wifi\.boardDeviceId : usb\.boardDeviceId \|\| ""\)/);
   assert.match(diagnosticsModal[0], /wifiTarget=\{diagnosticsWifiTarget\}/);
   assert.match(firmwareModal[0], /expectedBoardDeviceId=\{firmwareTargetBoardDeviceId\}/);

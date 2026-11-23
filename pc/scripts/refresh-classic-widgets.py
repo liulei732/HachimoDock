@@ -124,6 +124,7 @@ def tomato(root,art):
 
 def tokens(root,art):
     r=json.loads((root/'runtime/widget.json').read_text());r['engine']='p4-bounded-runtime-v4'
+    r['vars']['headline_text']['init']='等待用量统计'
     r['dashboard'].update(visualStyle='clean',visualPalette='ocean',footer='主键总量  副键输入  摇杆右输出  全局键退出')
     ink='#edf0ff';paper='#101728';muted='#a2b1cf';accent='#bcb9f5'
     n=[icon('agent',28,24,ink),label('title',59,20,310,28,18,ink,weight=600),
@@ -142,7 +143,7 @@ def tokens(root,art):
         if node.get('text') in ('SW1','SW2'):
             node['key_for']='stats.show_total' if node['text']=='SW1' else 'stats.show_input';node['text']='—'
     r['surface']=background(paper,n)
-    finish(root,r,art,'token-usage','2.3.0','展示当前 Agent 提供的真实 Token 统计，可切换总量、输入和输出；没有统计时显示等待，不生成模拟消耗。支持触屏与实体按键。')
+    finish(root,r,art,'token-usage','2.3.1','展示当前 Agent 提供的真实 Token 统计，可切换总量、输入和输出；没有统计时显示等待，不生成模拟消耗。支持触屏与实体按键。')
 
 def build(output,art,ids):
     if output.exists() and any(output.iterdir()):raise ValueError('Use an empty output directory')

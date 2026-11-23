@@ -4,10 +4,51 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      verify_installers:
+        description: Verify the staged release installers
+        type: boolean
+        default: false
 permissions:
   contents: read
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
 jobs:
+  staged-assets:
+    if: github.event_name == 'workflow_dispatch' && inputs.verify_installers
+    runs-on: ubuntu-latest
+    # GitHub only lists drafts for identities with push access. This job runs
+    # no checkout, candidate binaries, repository scripts or contributor actions.
+    permissions:
+      contents: write
+    steps:
+      - name: Retrieve the five audited Windows and firmware inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api -H 'Accept: application/vnd.github.raw+json' "repos/$GITHUB_REPOSITORY/contents/latest-release.json?ref=$GITHUB_SHA" > release.json
+          tag=$(jq -er '.releaseTag | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' release.json)
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name == \"$tag\") | .assets[]" | jq -s . > assets.json
+          mkdir candidates
+          jq -r '.artifacts[] | select(.role == "windows" or (.role | startswith("factory-"))) | [.file,.sha256] | @tsv' release.json > expected.tsv
+          test "$(wc -l < expected.tsv)" -eq 5
+          while IFS=$'\t' read -r name sha; do
+            [[ "$name" =~ ^[a-zA-Z0-9._-]+$ && "$sha" =~ ^[0-9a-f]{64}$ ]]
+            id=$(jq -er --arg name "$name" --arg digest "sha256:$sha" '.[] | select(.name==$name and .state=="uploaded" and .digest==$digest) | .id' assets.json)
+            gh api -H 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$id" > "candidates/$name"
+            echo "$sha  candidates/$name" | sha256sum --check
+          done < expected.tsv
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: audited-regression-inputs
+          path: candidates/
+          retention-days: 1
+          compression-level: 0
   desktop:
+    needs: staged-assets
+    if: always() && !cancelled() && (needs.staged-assets.result == 'success' || needs.staged-assets.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
@@ -19,24 +60,124 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '22'
+          node-version: '26.13.1'
           cache: npm
           cache-dependency-path: pc/package-lock.json
+      - name: Check official desktop Node.js binary
+        run: node --input-type=module -e "import { verifyNodeRuntime } from './pc/scripts/dependency-license-resources.mjs'; verifyNodeRuntime(process.execPath)"
       - run: node pc/scripts/check-source-safety.mjs
       - run: node --test pc/scripts/check-source-safety.test.mjs
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
-      - run: python pc/scripts/stage-release-firmware.py
+      - name: Download staged release assets for installer regression
+        if: inputs.verify_installers
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: audited-regression-inputs
+          path: ${{ runner.temp }}/release-assets
+      - name: Stage verified firmware for all four board profiles
+        shell: bash
+        env:
+          VERIFY_INSTALLERS: ${{ inputs.verify_installers }}
+        run: |
+          if [[ "$VERIFY_INSTALLERS" == true ]]; then
+            python pc/scripts/stage-release-firmware.py --assets-dir "$RUNNER_TEMP/release-assets"
+          else
+            python pc/scripts/stage-release-firmware.py
+          fi
+      - name: Install and start the Windows release
+        id: windows-installer
+        continue-on-error: true
+        if: runner.os == 'Windows' && inputs.verify_installers
+        shell: pwsh
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          $release = Get-Content latest-release.json -Raw | ConvertFrom-Json
+          $asset = $release.artifacts | Where-Object role -eq windows
+          $installer = Join-Path (Join-Path $env:RUNNER_TEMP 'release-assets') $asset.file
+          ./pc/scripts/smoke-release-windows.ps1 -Installer $installer -ExpectedSha256 $asset.sha256 -Version $release.desktopVersion
+      - name: Report installed-client checks
+        if: runner.os == 'Windows' && inputs.verify_installers && always()
+        shell: pwsh
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP 'windows-smoke-result.json'
+          if (Test-Path -LiteralPath $report) { Get-Content -LiteralPath $report }
+      - name: Save the sanitized installer report
+        if: runner.os == 'Windows' && inputs.verify_installers && always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-installer-report
+          path: ${{ runner.temp }}/windows-smoke-result.json
+          retention-days: 5
       - run: npm ci
         working-directory: pc
       - run: npm test
         working-directory: pc
+      - name: Check desktop packaging and integration tools
+        if: runner.os == 'macOS'
+        shell: bash
+        run: node --test pc/scripts/*.test.mjs integrations/dsh-hachimodock/test/*.test.js server/community/web/app.test.mjs
+      - name: Build and exercise the Win32 ACL verifier
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'Visual C++ x64 toolchain unavailable' }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          $batch = Join-Path $env:RUNNER_TEMP 'build-hachimi-windows-acl.cmd'
+          @"
+          @echo off
+          call "$vcvars"
+          if errorlevel 1 exit /b 1
+          node pc/scripts/build-windows-acl.mjs
+          exit /b %errorlevel%
+          "@ | Set-Content -Encoding ascii $batch
+          & $batch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $helper = 'pc/src-tauri/generated-runtime/windows-acl.exe'
+          New-Item -ItemType Directory -Path 'pc/src-tauri/dsh-bridge' -Force | Out-Null
+          Copy-Item $helper 'pc/src-tauri/dsh-bridge/windows-acl.exe'
+          Copy-Item $helper 'integrations/dsh-hachimodock/windows-acl.exe'
+          node --test integrations/dsh-hachimodock/test/windows-acl.test.js integrations/dsh-hachimodock/test/managed-install.test.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Check Windows composer and focus handling
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./pc/scripts/test-windows-composer.ps1
       - run: npm run test:bridge
         working-directory: pc
         timeout-minutes: 10
       - run: npm run build:web
         working-directory: pc
+      - name: Run full native Windows regression with installed resources
+        if: runner.os == 'Windows' && !cancelled()
+        shell: pwsh
+        env:
+          VERIFY_INSTALLERS: ${{ inputs.verify_installers }}
+          TAURI_CONFIG: '{"bundle":{"resources":[]}}'
+        run: |
+          if ($env:VERIFY_INSTALLERS -eq 'true') {
+            $env:PETUI_TEST_RESOURCES = Join-Path $env:RUNNER_TEMP 'petui-release-resources'
+            ./pc/scripts/test-native-windows.ps1
+          } else {
+            ./pc/scripts/test-native-windows.ps1 -Suites 'shared_font::','openai_tts::','component_python::'
+          }
+      - name: Exercise native fonts, speech, Python components and macOS account storage
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TAURI_CONFIG: '{"bundle":{"resources":[]}}'
+        run: |
+          set -euo pipefail
+          for suite in shared_font:: openai_tts:: component_python:: local_telemetry::accounts::; do
+            cargo test --locked --manifest-path pc/src-tauri/Cargo.toml --lib "$suite"
+          done
+      - name: Require successful Windows installer regression
+        if: always() && steps.windows-installer.outcome == 'failure'
+        shell: pwsh
+        run: throw 'Windows installer regression failed. See the installed-client checks above.'
   firmware-host:
     runs-on: ubuntu-latest
     env:
@@ -59,6 +200,8 @@ jobs:
           /usr/lib/llvm-20/bin/wasm-ld --version
           echo /usr/lib/llvm-20/bin >> "$GITHUB_PATH"
       - run: python -m pip install Pillow pytest platformio==6.1.19
+      - name: Check PetUI authoring and package handling
+        run: python -m pytest -q pc/skills/petui/scripts pc/tests/test_petui_package_traversal.py
       - name: Restore locked SDK downloads
         id: sdk-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4

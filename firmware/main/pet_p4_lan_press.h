@@ -11,14 +11,14 @@
 typedef struct { uint32_t seq; uint64_t until; uint8_t context; } pet_lan_press_event_t;
 typedef struct {
   uint8_t owner[16];
-  uint64_t lease, since;
+  uint64_t lease, since, acknowledged_until;
   uint32_t sequence, acknowledged;
   unsigned count;
   pet_lan_press_event_t events[PET_LAN_PRESS_CAPACITY];
 } pet_lan_press_t;
 
 static inline void pet_lan_press_clear(pet_lan_press_t *q) {
-  q->lease = q->since = 0; q->count = 0; q->acknowledged = 0;
+  q->lease = q->since = q->acknowledged_until = 0; q->count = 0; q->acknowledged = 0;
   memset(q->owner, 0, sizeof(q->owner));
 }
 static inline void pet_lan_press_pop(pet_lan_press_t *q) {
@@ -45,8 +45,17 @@ static inline bool pet_lan_press_poll(pet_lan_press_t *q, uint64_t now,
   if (memcmp(q->owner, owner, 16)) return false;
   if (ack && ack != q->acknowledged) {
     if (!q->count || q->events[0].seq != ack) return false;
+    q->acknowledged_until = q->events[0].until;
     q->acknowledged = ack; pet_lan_press_pop(q);
   }
   q->lease = now + PET_LAN_PRESS_LEASE;
   return true;
+}
+
+/* An unconfigured key can fail before ACK, or native startup can fail just
+ * after ACK. Both share the original physical press expiry. */
+static inline bool pet_lan_press_failure_current(const pet_lan_press_t *q, uint64_t now, uint32_t seq) {
+  return seq && seq == q->sequence && now < q->lease &&
+    ((q->count && q->events[0].seq == seq && now < q->events[0].until) ||
+     (q->acknowledged == seq && now < q->acknowledged_until));
 }

@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import { pollWhileVisible } from "../lib/visible-poll.js";
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import Card from "../shell/Card.jsx";
 import Button from "../shell/Button.jsx";
@@ -8,7 +9,7 @@ import { friendlyControlLabel } from "../lib/usage-help.js";
 import { useExitProtection } from "../lib/exit-protection.js";
 import {
   BLUETOOTH_SHORTCUT_KEYS, BLUETOOTH_KEYBOARD_KEYS, BLUETOOTH_KEYBOARD_MODIFIERS,
-  isKeyboardChordSupported, keyboardChordKey, readKeyboardSnapshot, storeKeyboardSnapshot,
+  isKeyboardChordSupported, keyboardChordKey, readKeyboardSnapshot, storeKeyboardSnapshot, verifiedKeyboardState,
 } from "../lib/bluetooth-shortcut.js";
 
 const pressGestures = ["单击", "双击", "长按"];
@@ -48,7 +49,7 @@ export default function BluetoothShortcutPanel({ usb, wifi, board, active = true
   const wired = usb?.connected === true;
   const connection = wired ? usb.connectionId : wifi?.bootId;
   const supported = wired ? usb.capabilities?.bluetoothKeyboardConfig === "p4-ble-keyboard-config-v1"
-    : Boolean(wifi?.bootId);
+    : Boolean(wifi?.wifiConnected && wifi.controlTrusted && wifi.bootId && wifi.boardDeviceId === board);
   const extended = wired ? usb.capabilities?.bluetoothKeyboardExtendedChords === true : supported;
   const modifierOptions = BLUETOOTH_KEYBOARD_MODIFIERS.filter(({mask}) => extended || mask <= 8);
   const keyOptions = extended ? BLUETOOTH_KEYBOARD_KEYS : BLUETOOTH_SHORTCUT_KEYS;
@@ -69,23 +70,31 @@ export default function BluetoothShortcutPanel({ usb, wifi, board, active = true
   const canEdit = supported && Boolean(config) && !readError;
   const visibleKeys = config?.keys ?? snapshot?.keys;
   const saved = config?.keys?.[slot] || 0;
-  const chord = edit ?? saved;
+  const chord = edit?.chord ?? saved;
+  const conflicted = Boolean(edit && edit.base !== saved && chord !== saved);
+  function draft(value) {
+    setEdit(previous => ({ base: previous && previous.chord !== saved ? previous.base : saved, chord: value }));
+  }
   const dirty = chord !== saved;
   const mask = chord >> 8;
   const usage = chord & 255;
   const activeControl = controls.find(group => group.gestures.some(gesture => gesture.slot === slot))?.id;
   useExitProtection(pending ? "正在保存蓝牙快捷键" : dirty ? "蓝牙快捷键有未保存的修改" : "");
 
-  const requestConfig = useCallback(async (change = {}) => {
+  const requestConfig = useCallback(async (change = {}, conditional) => {
+    const payload = conditional ? { conditional } : change;
     const state = wired
-      ? await invoke("usb_bluetooth_keyboard_config", { boardDeviceId: board, connectionId: connection, ...change })
-      : await invoke("lan_bluetooth_keyboard_config", { boardDeviceId: board, expectedBootId: connection, ...change });
-    if (state?.ok !== true || state.boardDeviceId !== board || typeof state.enabled !== "boolean" ||
-        !Array.isArray(state.keys)) {
-      throw new Error("设备未返回有效的蓝牙快捷键配置。");
+      ? await invoke("usb_bluetooth_keyboard_config", { boardDeviceId: board, connectionId: connection, ...payload })
+      : await invoke("lan_bluetooth_keyboard_config", { boardDeviceId: board, expectedBootId: connection, ...payload });
+    if (conditional && (state?.conditionalUpdate !== "keyboard-cas-v1" || state.conditionalApplied !== true)) {
+      throw new Error("设备未确认条件更新，请重新读取配置。");
     }
-    return state;
+    return verifiedKeyboardState(state, board, change);
   }, [board, connection, wired]);
+
+  const session = useRef(0);
+  const saving = useRef(false);
+  useLayoutEffect(() => () => { session.current++; }, [board, connection, wired, active, supported]);
 
   useEffect(() => {
     if (!active || !supported || !board || !connection || pending) return;
@@ -96,19 +105,19 @@ export default function BluetoothShortcutPanel({ usb, wifi, board, active = true
       reading = true;
       try {
         const state = await requestConfig();
-        if (!cancelled) {
+        if (!cancelled && !saving.current) {
           setConfig(state);
           setReadError("");
         }
       } catch (error) {
-        if (!cancelled) setReadError(error?.message || String(error));
+        if (!cancelled && !saving.current) setReadError(error?.message || String(error));
       } finally {
         reading = false;
       }
     }
     void read();
-    const timer = setInterval(read, 2000);
-    return () => { cancelled = true; clearInterval(timer); };
+    const stop = pollWhileVisible(read, 2000);
+    return () => { cancelled = true; stop(); };
   }, [active, board, connection, supported, pending, requestConfig]);
 
   useEffect(() => {
@@ -156,6 +165,8 @@ export default function BluetoothShortcutPanel({ usb, wifi, board, active = true
         return;
       }
       captured.current = { mask: mods, usage: key.usage };
+    } else if (captured.current?.usage && [...pressed.current.values()].some(down => down?.usage)) {
+      captured.current.mask |= mods;
     } else if (!captured.current?.usage) {
       captured.current = { mask: mods, usage: 0 };
     }
@@ -168,7 +179,7 @@ export default function BluetoothShortcutPanel({ usb, wifi, board, active = true
     const result = captured.current;
     const next = result ? (result.mask << 8) | result.usage : 0;
     if (!captureInvalid.current && next && isKeyboardChordSupported(next, extended)) {
-      setEdit(next);
+      draft(next);
       setNotice({ text: `已录入 ${chordLabel(next)}，保存后生效。` });
       setCapture(false);
     } else {
@@ -179,24 +190,46 @@ export default function BluetoothShortcutPanel({ usb, wifi, board, active = true
   }
 
   async function save(change) {
-    if (!canEdit || pending ||
+    if (!active || !canEdit || saving.current ||
         ("chord" in change && !isKeyboardChordSupported(change.chord, extended))) return;
+    const owner = session.current;
+    saving.current = true;
     setPending(true);
     setNotice(null);
     try {
-      const state = await requestConfig(change);
-      if ("enabled" in change && state.enabled !== change.enabled) {
-        throw new Error("设备未确认蓝牙模式已更改。");
+      const latest = await requestConfig();
+      if (owner !== session.current) return;
+      setConfig(latest);
+      if ("slot" in change && latest.keys[change.slot] !== (edit?.base ?? saved)) {
+        throw new Error("该手势已在设备上更改，请核对最新映射后再编辑。");
       }
+      if ("enabled" in change && (latest.enabled !== config.enabled ||
+          (change.enabled && latest.enabled && (latest.connected || latest.pairing || latest.paired)))) {
+        throw new Error("设备的蓝牙模式或配对状态已变化，请重新核对。");
+      }
+      const supportsConditional = latest.conditionalUpdate === "keyboard-cas-v1";
+      if (config.conditionalUpdate === "keyboard-cas-v1" && !supportsConditional) {
+        throw new Error("设备的条件更新能力已变化，请重新核对配置。");
+      }
+      let conditional;
+      if (supportsConditional) {
+        conditional = "slot" in change
+          ? { slot: change.slot, setChord: change.chord, expectedChord: latest.keys[change.slot] }
+          : { setEnabled: change.enabled, expectedEnabled: latest.enabled };
+      }
+      const state = await requestConfig(change, conditional);
+      if (owner !== session.current) return;
       setConfig(state);
       if ("slot" in change) {
         setEdit(null);
         setNotice({ text: change.chord ? "快捷键已保存。" : "快捷键已清除。" });
       }
     } catch (error) {
-      if ("enabled" in change) setReadError("正在重新读取设备蓝牙模式…");
+      if (owner !== session.current) return;
+      setReadError("正在重新读取设备键盘配置…");
       setNotice({ error: true, text: error?.message || String(error) });
     } finally {
+      saving.current = false;
       setPending(false);
     }
   }
@@ -205,9 +238,10 @@ export default function BluetoothShortcutPanel({ usb, wifi, board, active = true
     actions={canEdit ? <Switch label="蓝牙模式" checked={config.enabled} disabled={pending}
       onCheckedChange={enabled => void save({ enabled })} /> : <span>蓝牙模式状态未确认</span>}>
     <p>开启蓝牙模式后，在电脑的蓝牙设置中配对并连接 HachimiDock。连接成功后，设备本身的按键功能暂停，实体按键和摇杆只向电脑发送这里配置的快捷键。</p>
-    <p>等待连接、断开蓝牙或关闭蓝牙模式时，设备本身的按键功能会生效。初始配置中，1、2、3 键单击分别发送 Ctrl + C、Ctrl + V、Ctrl + A。</p>
+    <p>等待连接、断开蓝牙或关闭蓝牙模式时，设备本身的按键功能会生效。初始配置中，1、2、3 键单击分别发送 Ctrl + C、Ctrl + V、Ctrl + A。为某个键设置双击后，该键的单击会等待约 280 毫秒。清除双击映射即可恢复即时单击。</p>
     {!canEdit && <p role="status">
       {!wired && !wifi ? "可离线查看快捷键。通过 USB 或已配对的 Wi-Fi 连接设备后即可修改。"
+        : !wired && wifi?.controlTrusted !== true ? "请通过 USB 连接同一台设备，授权 Wi-Fi 控制后再修改快捷键。"
         : !supported ? "当前设备固件尚未开放独立的蓝牙键盘配置。"
         : readError || "正在读取配置…"}
       {visibleKeys && ` 当前显示上次读取的设备配置（${config ? board : snapshot.board}）。`}
@@ -268,21 +302,22 @@ export default function BluetoothShortcutPanel({ usb, wifi, board, active = true
                             <div className="bluetooth-shortcut-chord__modifiers">
                               {modifierOptions.map(modifier => <label key={modifier.mask}>
                                 <input type="checkbox" checked={Boolean(mask & modifier.mask)}
-                                  onChange={() => setEdit(((mask ^ modifier.mask) << 8) | usage)} />
+                                  onChange={() => draft(((mask ^ modifier.mask) << 8) | usage)} />
                                 {modifier.label}
                               </label>)}
                             </div>
                             <label>主键
-                              <select value={usage} onChange={event => setEdit((mask << 8) | Number(event.target.value))}>
+                              <select aria-label="主键" value={usage} onChange={event => draft((mask << 8) | Number(event.target.value))}>
                                 <option value={0}>{extended ? "空（只发送修饰键）" : "选择一个键"}</option>
                                 {keyOptions.map(key => <option key={key.usage} value={key.usage}>{key.label}</option>)}
                               </select>
                             </label>
                           </fieldset>
                           <div className="bluetooth-shortcut-actions">
-                            <Button type="submit" variant="primary" disabled={!dirty || capture || !chord || !isKeyboardChordSupported(chord, extended)} loading={pending} loadingLabel="正在保存…">保存快捷键</Button>
+                            {conflicted && <p role="status">设备上的同一手势已更改。取消修改可载入最新映射。</p>}
+                            <Button type="submit" variant="primary" disabled={conflicted || !dirty || capture || !chord || !isKeyboardChordSupported(chord, extended)} loading={pending} loadingLabel="正在保存…">保存快捷键</Button>
                             {dirty && <Button disabled={pending || capture} onClick={() => setEdit(null)}>取消修改</Button>}
-                            {saved !== 0 && <Button disabled={pending || capture} onClick={() => void save({ slot, chord: 0 })}>清除快捷键</Button>}
+                            {saved !== 0 && <Button disabled={pending || capture || conflicted} onClick={() => void save({ slot, chord: 0 })}>清除快捷键</Button>}
                           </div>
                         </div>}
                       </div>

@@ -438,8 +438,12 @@ def test_p4_token_widget_uses_bounded_stats_instead_of_host_readers():
     assert 'object.remove("fetchers")' in desktop
     assert '"P4 mini-apps do not allow fetchers or readers"' in miniapp
     assert "pet_p4_miniapp_sync_stats" in miniapp_header
-    assert 'strcmp(g_runtime.widget_id, "token-usage") == 0' in miniapp
-    assert 'set_string_var(&g_runtime, "headline_text", "今日消耗")' in miniapp
+    sync = function(miniapp, "pet_p4_miniapp_sync_stats")
+    widget = json.loads(read_workspace("pc/builtin-clawpkgs/token-usage/runtime/widget.json"))
+    # The package displays the firmware's status field. The compiled C test in
+    # p4_token_usage_widget_test.py exercises eligibility, validity and resets.
+    assert widget["dashboard"]["headline"] == {"var": "headline_text"}
+    assert widget["vars"]["headline_text"]["init"] == "等待用量统计"
     assert '["dailyTokenUsage", "tokenUsage", "token_usage", "usage"]' in desktop_lib
     assert '"tokenUsagePeriod".to_string()' in desktop_lib
     assert "dailyUsageBySession" in codex_monitor
@@ -454,7 +458,8 @@ def test_p4_token_widget_uses_bounded_stats_instead_of_host_readers():
         "cache_display",
         "breakdown_text",
     ]:
-        assert f'set_string_var(&g_runtime, "{variable}"' in miniapp
+        assert widget["vars"][variable]["type"] == "string"
+        assert f'set_string_var(&g_runtime, "{variable}"' in sync
     assert protocol.count("pet_p4_miniapp_sync_stats(&state->stats)") >= 3
     # Start from the local-action dispatcher; the approval helper also compares
     # configured page_enter/page_back actions earlier in the file.
@@ -679,7 +684,7 @@ def test_p4_component_packages_commit_through_validated_ab_catalog_snapshots():
     miniapp = read_required("main/pet_p4_miniapp.c")
     factory = read_required("tools/build_factory_image.py")
     protocol_doc = read("protocol.md")
-    commit_start = miniapp.index("static bool install_commit_fenced")
+    commit_start = miniapp.rindex("static bool install_commit_fenced(")
     commit = miniapp[
         commit_start:
         miniapp.index("static bool remove_file_if_present", commit_start)
@@ -1184,8 +1189,9 @@ def test_p4_conversation_queue_is_synced_and_rendered_with_pixel_ellipsis():
     assert "rgb565(255, 255, 255)" in renderer
     from p4_render_trace_test import function
     queue_draw = function(renderer, "draw_session_queue_uncached")
-    assert queue_draw.index("session_text(state->current_session_agent, item, now_ms, &text)") < queue_draw.index("draw_bubble_card_title(&text,")
+    assert queue_draw.index("session_text(state->current_session_agent, item, now_ms, &text)") < queue_draw.index("draw_bubble_card_title(&text")
     title_draw = function(renderer, "draw_bubble_card_title")
+    assert "if (view->title_pending) return" not in title_draw
     assert title_draw.index("renderer_bubble_draw_pinned(view, PET_BUBBLE_TITLE") < title_draw.index("draw_bubble_large_line(view, PET_BUBBLE_TITLE, view->title")
     assert "renderer_prefers_resident" not in queue_draw
     assert "pet_bubble_pixels_release(&text)" in queue_draw
@@ -1197,6 +1203,7 @@ def test_p4_conversation_queue_is_synced_and_rendered_with_pixel_ellipsis():
     assert "item->content[0] ? item->content : item->state" in selected_text
     body_draw = function(renderer, "draw_card_body_lines")
     assert body_draw.index("renderer_bubble_draw_pinned") < body_draw.index("draw_text_line_medium_vcenter")
+    assert "body_pending" not in body_draw
     assert "renderer_prefers_resident" not in body_draw
     assert "static const char *draw_text_line_medium(" in renderer
     assert "static const char *draw_text_line_medium_vcenter(" in renderer
@@ -2508,17 +2515,19 @@ def test_p4_device_ptt_stream_is_validated_and_relayed_by_pc():
     )
     assert "esp_codec_dev_read" in audio
     assert "sizeof(encoded), &encoded_len" in audio
-    assert 'send_topic("audio/begin"' in audio
+    capture = function(audio, 'capture_frame')
+    assert 'return note_publish(owner, topic, payload);' in capture
+    assert 'return send_topic_to_transport(topic, payload, live);' in capture
+    assert 'capture_frame(owner, "audio/begin", payload, false)' in audio
     assert 'cJSON_AddBoolToObject(payload, "sessionQueueEmpty", session_queue_empty)' in audio
     assert "g_capture_session_queue_empty" in audio
-    assert 'send_topic_to_transport("audio/chunk", payload, processed && conversation_session[0])' in audio
-    assert "xQueueSend(g_usb_capture_tx_queue, &frame, 0)" in audio
-    assert 'send_topic("audio/end"' in audio
+    assert 'capture_frame(owner, "audio/chunk", payload, processed && conversation_session[0])' in audio
+    assert 'capture_frame(owner, "audio/end", payload, false)' in audio
     assert "PET_P4_AUDIO_MAX_CAPTURE_MS 30000ULL" in audio
     assert 'strcmp(binding->action, "voice_ptt") == 0' in input_source
     assert 'strcmp(gesture, "hold_start") == 0' in input_source
     assert 'strcmp(gesture, "hold_end") == 0' in input_source
-    assert "pet_p4_audio_capture_start(state && state->session_queue_count == 0)" in input_source
+    assert "pet_p4_audio_capture_start_button(state && state->session_queue_count == 0, token)" in input_source
     assert "pet_p4_audio_init" in main
     assert "g_transport_mutex" in main
     assert 'strcmp(topic, "audio/control") == 0' in protocol

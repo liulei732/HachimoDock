@@ -56,7 +56,7 @@ static uint32_t le32(const uint8_t *p){return (uint32_t)p[0]|(uint32_t)p[1]<<8|(
 static uint64_t le64(const uint8_t *p){return (uint64_t)le32(p)|(uint64_t)le32(p+4)<<32;}
 static void put32(uint8_t *p,uint32_t n){for(unsigned i=0;i<4;i++)p[i]=(uint8_t)(n>>(i*8));}
 static void put64(uint8_t *p,uint64_t n){put32(p,(uint32_t)n);put32(p+4,(uint32_t)(n>>32));}
-static bool hex(const char *p,size_t n){if(!p||strlen(p)!=n)return false;for(size_t i=0;i<n;i++)if(!((p[i]>='0'&&p[i]<='9')||(p[i]>='a'&&p[i]<='f')))return false;return true;}
+bool pet_audio_patch_hex(const char *p,size_t n){if(!p||strlen(p)!=n)return false;for(size_t i=0;i<n;i++)if(!((p[i]>='0'&&p[i]<='9')||(p[i]>='a'&&p[i]<='f')))return false;return true;}
 static _Atomic uint32_t global_family_mask;
 static uint32_t global_family_bit(const char *family){
   static const char *const names[]={"welcome","working","idle","done","error","waiting_user",
@@ -76,13 +76,27 @@ static uint32_t global_plan_mask(const patch_plan_t *plan){
 }
 static bool family_valid(const char *p){size_t n=p?strlen(p):0;if(!n||n>=48)return false;for(size_t i=0;i<n;i++)if(!((p[i]>='a'&&p[i]<='z')||(p[i]>='0'&&p[i]<='9')||p[i]=='_'||p[i]=='-'||p[i]=='.'))return false;return true;}
 static bool path_valid(const char *p){size_t n=p?strlen(p):0;return n>7&&n<128&&!strncmp(p,"p4/",3)&&!strcmp(p+n-4,".wav")&&!strstr(p,"..")&&!strchr(p,'\\')&&!strchr(p,':');}
-static bool number(const cJSON *o,const char *key,uint32_t max,uint32_t *out){const cJSON *v=cJSON_GetObjectItemCaseSensitive(o,key);if(!cJSON_IsNumber(v)||!isfinite(v->valuedouble)||v->valuedouble<0||v->valuedouble>max||floor(v->valuedouble)!=v->valuedouble)return false;*out=(uint32_t)v->valuedouble;return true;}
+bool pet_audio_patch_number(const cJSON *object,const char *key,uint32_t maximum,uint32_t *out){
+  const cJSON *v=cJSON_GetObjectItemCaseSensitive(object,key);
+  if(!cJSON_IsNumber(v)||!(v->valuedouble>=0 && v->valuedouble<=maximum))return false;
+  uint32_t n=(uint32_t)v->valuedouble;
+  if((double)n!=v->valuedouble)return false;
+  *out=n;return true;
+}
 static const char *string(const cJSON *o,const char *key){const cJSON *v=cJSON_GetObjectItemCaseSensitive(o,key);return cJSON_IsString(v)?v->valuestring:"";}
 static bool file_path(int slot,int bank,unsigned file,char *out,size_t n){if(slot<0||slot>PET_AUDIO_PATCH_GLOBAL_SLOT||bank<0||bank>1||file>=PET_AUDIO_PATCH_MAX_FILES)return false;int used=snprintf(out,n,PET_AUDIO_PATCH_FS_PREFIX "/ov%d_%d_%u.wav",slot,bank,file);return used>0&&(size_t)used<n;}
 static bool index_path(int slot,int bank,char *out,size_t n){int used=snprintf(out,n,PET_AUDIO_PATCH_FS_PREFIX "/ov%d_%d.idx",slot,bank);return used>0&&(size_t)used<n;}
 static bool close_written(FILE *f){bool ok=fflush(f)==0;if(ok&&PET_AUDIO_PATCH_SYNC(fileno(f))!=0)ok=false;if(fclose(f)!=0)ok=false;return ok;}
 static bool remove_one(const char *p,bool *attempted){*attempted=true;errno=0;return PET_AUDIO_PATCH_REMOVE(p)==0||errno==ENOENT;}
 static bool clear_bank(int slot,int bank,bool *attempted){char p[64];if(!index_path(slot,bank,p,sizeof(p)))return false;if(!remove_one(p,attempted))return false;for(unsigned i=0;i<PET_AUDIO_PATCH_MAX_FILES;i++){if(!file_path(slot,bank,i,p,sizeof(p))||!remove_one(p,attempted))return false;}return true;}
+/* The wire manifest and stored index use identical family/path/size bounds. */
+static bool file_metadata_valid(const patch_plan_t *plan,unsigned index,const char *family,const char *path,uint32_t size){
+  if(!family_valid(family)||!path_valid(path)||size<44||size>PET_AUDIO_PATCH_MAX_FILE ||
+     size>PET_AUDIO_PATCH_MAX_BYTES-plan->total)return false;
+  for(unsigned j=0;j<index;j++)
+    if(!strcmp(family,plan->files[j].family)||!strcmp(path,plan->files[j].path))return false;
+  return true;
+}
 static index_result_t read_index(int slot,int bank,patch_plan_t *out){
   char p[64];if(!index_path(slot,bank,p,sizeof(p)))return INDEX_INVALID;
   errno=0;FILE *f=PET_AUDIO_PATCH_INDEX_OPEN(p,"rb");
@@ -96,14 +110,13 @@ static index_result_t read_index(int slot,int bank,patch_plan_t *out){
   uint64_t generation=le64(index_bytes+16);uint32_t count=le32(index_bytes+88);
   if(!generation||generation>UINT32_MAX||count>PET_AUDIO_PATCH_MAX_FILES||n!=HEADER_BYTES+count*ENTRY_BYTES+8||hash(index_bytes,n-8)!=le64(index_bytes+n-8))return INDEX_INVALID;
   memset(out,0,sizeof(*out));out->slot=slot;out->bank=bank;out->generation=(uint32_t)generation;out->count=count;
-  memcpy(out->pack,index_bytes+24,64);out->pack[64]=0;if(!hex(out->pack,64))return INDEX_INVALID;
+  memcpy(out->pack,index_bytes+24,64);out->pack[64]=0;if(!pet_audio_patch_hex(out->pack,64))return INDEX_INVALID;
   for(unsigned i=0;i<count;i++){
     const uint8_t *row=index_bytes+HEADER_BYTES+i*ENTRY_BYTES;patch_file_t *entry=&out->files[i];
     if(!memchr(row,0,48)||!memchr(row+48,0,128))return INDEX_INVALID;
     memcpy(entry->family,row,48);memcpy(entry->path,row+48,128);entry->size=le32(row+176);entry->checksum=le64(row+180);
-    if(!family_valid(entry->family)||!path_valid(entry->path)||entry->size<44||entry->size>PET_AUDIO_PATCH_MAX_FILE||entry->size>PET_AUDIO_PATCH_MAX_BYTES-out->total)return INDEX_INVALID;
+    if(!file_metadata_valid(out,i,entry->family,entry->path,entry->size))return INDEX_INVALID;
     out->total+=entry->size;
-    for(unsigned j=0;j<i;j++)if(!strcmp(entry->family,out->files[j].family)||!strcmp(entry->path,out->files[j].path))return INDEX_INVALID;
   }
   return INDEX_VALID;
 }
@@ -126,15 +139,21 @@ void pet_audio_patch_global_refresh(void){
       &&!strcmp(scratch.pack,PET_AUDIO_PATCH_GLOBAL_PACK))mask=global_plan_mask(&scratch);
   atomic_store_explicit(&global_family_mask,mask,memory_order_release);
 }
+/* The bounded installer runs with playback excluded. Preserve the playback
+ * lookup profile below while minimizing flash for these storage operations. */
+#if defined(__riscv) && PET_P4_SYSTEM_WIFI
+#pragma GCC push_options
+#pragma GCC optimize ("Oz")
+#endif
 bool pet_audio_patch_begin(int slot,const char *pack,const cJSON *files,uint32_t total,bool *attempted){
-  if(pending.active||slot<0||slot>PET_AUDIO_PATCH_GLOBAL_SLOT||!hex(pack,64)||!cJSON_IsArray(files)||total>PET_AUDIO_PATCH_MAX_BYTES)return false;
+  if(pending.active||slot<0||slot>PET_AUDIO_PATCH_GLOBAL_SLOT||!pet_audio_patch_hex(pack,64)||!cJSON_IsArray(files)||total>PET_AUDIO_PATCH_MAX_BYTES)return false;
   int count=cJSON_GetArraySize(files);if(count<0||count>(int)PET_AUDIO_PATCH_MAX_FILES)return false;
   memset(&pending,0,sizeof(pending));pending.slot=slot;pending.count=(uint32_t)count;memcpy(pending.pack,pack,65);
   for(unsigned i=0;i<pending.count;i++){
     const cJSON *item=cJSON_GetArrayItem(files,(int)i);patch_file_t *entry=&pending.files[i];
     const char *family=string(item,"family"),*path=string(item,"path"),*checksum=string(item,"checksum");
-    if(!family_valid(family)||!path_valid(path)||!hex(checksum,16)||!number(item,"size",PET_AUDIO_PATCH_MAX_FILE,&entry->size)||entry->size<44||entry->size>PET_AUDIO_PATCH_MAX_BYTES-pending.total)return false;
-    for(unsigned j=0;j<i;j++)if(!strcmp(family,pending.files[j].family)||!strcmp(path,pending.files[j].path))return false;
+    if(!pet_audio_patch_hex(checksum,16)||!pet_audio_patch_number(item,"size",PET_AUDIO_PATCH_MAX_FILE,&entry->size)
+        ||!file_metadata_valid(&pending,i,family,path,entry->size))return false;
     memcpy(entry->family,family,strlen(family)+1);memcpy(entry->path,path,strlen(path)+1);
     for(unsigned j=0;j<16;j++)entry->checksum=(entry->checksum<<4)|(uint64_t)(checksum[j]<='9'?checksum[j]-'0':checksum[j]-'a'+10);
     entry->received_hash=UINT64_C(14695981039346656037);pending.total+=entry->size;
@@ -182,7 +201,7 @@ static bool wav_exact(const char *path,const patch_file_t *entry){
   }
   ok=ok&&format&&data&&offset==entry->size;if(fclose(f)!=0)ok=false;return ok;
 }
-bool pet_audio_patch_commit(bool *attempted,uint32_t *generation){
+bool pet_audio_patch_commit(bool *attempted,uint32_t *generation,bool (*current)(void)){
   if(!pending.active||pending.publication_attempted)return false;
   char p[64];
   for(unsigned i=0;i<pending.count;i++){
@@ -193,6 +212,8 @@ bool pet_audio_patch_commit(bool *attempted,uint32_t *generation){
   index_bytes[8]=(uint8_t)pending.slot;index_bytes[9]=(uint8_t)pending.bank;put64(index_bytes+16,pending.generation);memcpy(index_bytes+24,pending.pack,64);put32(index_bytes+88,pending.count);
   for(unsigned i=0;i<pending.count;i++){uint8_t *row=index_bytes+HEADER_BYTES+i*ENTRY_BYTES;patch_file_t *entry=&pending.files[i];memcpy(row,entry->family,strlen(entry->family)+1);memcpy(row+48,entry->path,strlen(entry->path)+1);put32(row+176,entry->size);put64(row+180,entry->checksum);}
   uint64_t expected_hash=hash(index_bytes,n-8);put64(index_bytes+n-8,expected_hash);if(!index_path(pending.slot,pending.bank,p,sizeof(p)))return false;
+  /* WAV verification may outlast the authenticated connection. */
+  if(current && !current()) return false;
   pending.publication_attempted=true;
   *attempted=true;FILE *f=fopen(p,"wb");if(!f)return false;bool ok=fwrite(index_bytes,1,n,f)==n;if(!close_written(f))ok=false;
   if(!ok||read_index(pending.slot,pending.bank,&scratch)!=INDEX_VALID||scratch.generation!=pending.generation||strcmp(scratch.pack,pending.pack)||hash(index_bytes,n-8)!=expected_hash)return false;
@@ -206,8 +227,11 @@ void pet_audio_patch_retire(void){memset(&pending,0,sizeof(pending));}
 bool pet_audio_patch_progress(const char *path,uint32_t *index,uint32_t *bytes){patch_file_t *entry=find_file(path,NULL);if(!pending.active||!entry)return false;*index=entry->index;*bytes=entry->received;return true;}
 unsigned pet_audio_patch_file_count(void){return pending.count;}
 uint32_t pet_audio_patch_total_bytes(void){return pending.total;}
+#if defined(__riscv) && PET_P4_SYSTEM_WIFI
+#pragma GCC pop_options
+#endif
 bool pet_audio_patch_resolve(int slot,const char *pack,const char *family,char *out,size_t n){
-  if(slot<0||slot>PET_AUDIO_PATCH_GLOBAL_SLOT||!hex(pack,64)||!family_valid(family)||!out||n<32)return false;
+  if(slot<0||slot>PET_AUDIO_PATCH_GLOBAL_SLOT||!pet_audio_patch_hex(pack,64)||!family_valid(family)||!out||n<32)return false;
   int bank;uint32_t generation;if(!latest(slot,&bank,&generation)||bank<0||read_index(slot,bank,&scratch)!=INDEX_VALID||strcmp(scratch.pack,pack))return false;
   for(unsigned i=0;i<scratch.count;i++)if(!strcmp(scratch.files[i].family,family))return file_path(slot,bank,i,out,n);
   return false;

@@ -20,10 +20,19 @@ for(let i=0;i<350;i++){
   if(core.snapshot().score>0){scored=true;break;}
 }
 assert.ok(scored&&moved,'real pointer segments must cut a spawned moving fruit');
+const active=core.snapshot();
+core.start(now+3,99);
+assert.deepEqual(core.snapshot(),active,'the physical start action must preserve an active round');
 core.pause(now);const paused=core.snapshot();assert.equal(paused.phase,2);
 core.tick(now+5000);assert.equal(core.snapshot().elapsed,paused.elapsed);
-core.pause(now+5000);assert.equal(core.snapshot().phase,1);
+core.start(now+5000,99);assert.equal(core.snapshot().phase,1);
+assert.equal(core.snapshot().score,paused.score,'start resumes without clearing score');
+assert.equal(core.snapshot().elapsed,paused.elapsed,'start resumes without clearing the timer');
 core.suspend(now+5016);assert.equal(core.snapshot().phase,2);
+core.start(now+5017,23);assert.equal(core.snapshot().score,paused.score);
+// Only an idle/finished round starts anew; deliberately finish this resumed one.
+for(let t=now+5033;t<now+80000&&core.snapshot().phase===1;t+=16)core.tick(t);
+assert.equal(core.snapshot().phase,3);
 core.start(0,23);
 for(now=16;now<(runtime.scene.duration_sec+10)*1000;now+=16){core.tick(now);if(core.snapshot().phase===3)break;}
 assert.equal(core.snapshot().phase,3,'miss/timeout result must be reachable');
@@ -43,4 +52,4 @@ assert.ok(radii.size>=4&&sawGold,'size variation and golden waves must actually 
 practice.pause(runtime.scene.duration_sec*1000+30);assert.equal(practice.snapshot().mode,0);
 practice.pause(runtime.scene.duration_sec*1000+31);assert.equal(practice.snapshot().mode,1);
 console.log(JSON.stringify({ok:true,mode:'touch-slice',sharedDeviceCore:true,deviceVerified:false,
-  visibleActions:buttons.map(x=>x.action),checks:['start','moving-fruit','pointer-sweep-score','pause-freezes-time','resume','navigation-suspends','miss-result','restart','mode-card-tap','start-surface-tap','practice-no-bombs','practice-miss-safe','variable-radii','golden-wave','three-mode-selection'],errors:[]}));
+  visibleActions:buttons.map(x=>x.action),checks:['start','moving-fruit','pointer-sweep-score','active-start-preserves-round','pause-freezes-time','start-resumes-score-and-time','navigation-suspends','miss-result','restart','mode-card-tap','start-surface-tap','practice-no-bombs','practice-miss-safe','variable-radii','golden-wave','three-mode-selection'],errors:[]}));

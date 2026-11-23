@@ -1,0 +1,6 @@
+{
+  "version": 2,
+  "work": {"inputs":["day"],"batch":[["append","user","day",11]]},
+  "rest": {"inputs":["day"],"batch":[["append","user","day",12]]},
+  "upgrade": {"from_version":1,"batch":[["map_add","user",1,10],["put","cache",0,2,0],["next","user",0]]}
+}

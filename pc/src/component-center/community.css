@@ -7,8 +7,8 @@
   display: flex;
   align-items: center;
   gap: 26px;
-  border-bottom: 1px solid var(--line);
-  margin-bottom: 28px;
+  border-bottom: 0;
+  margin-bottom: var(--workspace-section-gap, 12px);
   overflow-x: auto;
 }
 .community-tabs > button[role="tab"] {
@@ -240,7 +240,7 @@
   justify-content: space-between;
   align-items: center;
   gap: 16px;
-  margin-bottom: 18px;
+  margin-bottom: var(--workspace-section-gap, 12px);
 }
 .community-section-title h3 {
   font-size: 15px;
@@ -376,7 +376,7 @@
   list-style: none;
 }
 .community-ranking li + li {
-  border-top: 1px solid var(--line-soft);
+  border-top: 0;
 }
 .community-ranking li button {
   display: flex;
@@ -426,7 +426,7 @@
   overflow-wrap: anywhere;
 }
 .community-ranking > .community-fine {
-  border-top: 1px solid var(--line);
+  border-top: 0;
   padding-top: 14px;
   margin-top: 12px;
   margin-bottom: 0;
@@ -554,7 +554,7 @@
   z-index: 2;
   background: var(--surface);
   padding: 16px 24px;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 0;
 }
 .community-dialog > header h2 {
   font-size: 16px;
@@ -626,8 +626,8 @@
   font-size: 12px;
   color: var(--text-soft);
   padding: 14px 0;
-  border-top: 1px solid var(--line);
-  border-bottom: 1px solid var(--line);
+  border-top: 0;
+  border-bottom: 0;
 }
 .community-version b {
   float: right;
@@ -644,7 +644,7 @@
   color: var(--accent);
 }
 .community-compat {
-  border-top: 1px solid var(--line);
+  border-top: 0;
   padding-top: 18px;
   display: grid;
   gap: 8px;
@@ -671,7 +671,7 @@
   color: var(--text-soft);
 }
 .community-comments article {
-  border-bottom: 1px solid var(--line-soft);
+  border-bottom: 0;
   padding: 16px 0;
 }
 .community-comments strong {
@@ -770,6 +770,14 @@
 .community-publish {
   padding: 24px;
 }
+.community-publish > fieldset {
+  display: grid;
+  gap: var(--space-4);
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
 .community-publish h3 {
   margin: 0;
   font-size: 18px;
@@ -846,12 +854,12 @@
   background: var(--surface-muted);
   border-radius: var(--radius-lg);
 }
-.community-publish > footer {
+.community-publish fieldset > footer {
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 16px;
-  border-top: 1px solid var(--line);
+  border-top: 0;
   padding-top: 20px;
 }
 .community-publish footer small {
@@ -954,7 +962,7 @@
   .community-hero-preview {
     max-width: 160px;
   }
-  .community-publish > footer {
+  .community-publish fieldset > footer {
     flex-direction: column;
     align-items: stretch;
   }

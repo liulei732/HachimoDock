@@ -17,11 +17,15 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = Path(__file__).resolve().parent / 'fixtures'
 
 
-def synthetic_catalog():
+def synthetic_catalog(with_covers=False):
     items = [dict(widgetId=f'fixture-{i:02d}', title='Item', slot=i,
                   packageGeneration=i % 2, widgetChecksum=f'{0x1000+i:08x}',
                   buttonsChecksum=f'{0x2000+i:08x}', spritesChecksum=f'{0x3000+i:08x}')
              for i in range(32)]
+    if with_covers:
+        # Cover all three banks in the same historical cross-page geometry.
+        for bank in range(3):
+            items[bank] = dict(thumb=f'{0xfedcba98+bank:08x}', thumbBank=bank, **items[bank])
     catalog = dict(version=3, sequence=486, check='00000000',
                    activeWidgetId='fixture-31', seedPending=False,
                    selectedWidgetId='fixture-00', items=items)
@@ -117,7 +121,7 @@ def writer_hosts(tmp_path_factory):
             body += function(source, 'catalog_file_matches') + function(source, 'write_catalog_in_place')
         else:
             body += (FIXTURES/'catalog_in_place_legacy.c').read_text()
-        body += function(source, 'write_catalog_snapshot_at')
+        body += '\n#define center_thumb_catalog(g,items,count,committed) ((void)0)\n' + function(source, 'write_catalog_snapshot_at')
         path = work/(label+'.c')
         path.write_text(template.replace('/* ACTUAL_CATALOG_SOURCE */', body))
         # Historical mode does not call readback adapters; unused test adapters
@@ -134,12 +138,16 @@ def writer_hosts(tmp_path_factory):
     return work, target, env
 
 
-def test_actual_writer_cross_page_shrink_grow_and_failure_quarantine(writer_hosts):
+@pytest.mark.parametrize('with_covers', [False, True], ids=['legacy-bytes', 'mixed-thumb-banks'])
+def test_actual_writer_cross_page_shrink_grow_and_failure_quarantine(writer_hosts, with_covers):
     work, target, env = writer_hosts
+    if with_covers:
+        target = work/'synthetic-5625-with-covers.json'
+        target.write_bytes(synthetic_catalog(with_covers=True))
     run = subprocess.run([str(work/'current'), str(target), '1'], cwd=work, env=env,
                          capture_output=True, timeout=60)
-    (work/'current-run.stdout').write_bytes(run.stdout)
-    (work/'current-run.stderr').write_bytes(run.stderr)
+    target.with_suffix('.stdout').write_bytes(run.stdout)
+    target.with_suffix('.stderr').write_bytes(run.stderr)
     assert run.returncode == 0, run.stderr.decode(errors='replace')
     rows = [json.loads(line) for line in run.stdout.splitlines()]
     assert len(rows) == 17 and all(row['activeGenerationUnchanged'] for row in rows)

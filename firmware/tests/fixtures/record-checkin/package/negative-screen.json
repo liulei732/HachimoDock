@@ -1,0 +1,13 @@
+{
+  "dashboard": {
+    "title": "Check-in log",
+    "metricLabel": "Recorded day",
+    "metricValue": "0",
+    "badge": "0",
+    "note": "0",
+    "visualStyle": "clean",
+    "visualPalette": "mint",
+    "visualLayout": "tool",
+    "visualSprite": "star"
+  }
+}

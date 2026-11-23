@@ -7,15 +7,52 @@
  * All mailbox calls run under its short critical section; apply also owns the
  * state mutex. Only bounded memory operations are permitted in this helper.
  * The authenticated socket/boot owns the mailbox, never an arbitrary JSON id. */
-enum { PET_LAN_HUD_KIND = 7, PET_LAN_HUD_BYTES = 644 };
+enum { PET_LAN_HUD_KIND = 7, PET_LAN_HUD_BYTES = 644, PET_LAN_CAPTION_KIND = 9, PET_LAN_CAPTION_BYTES = 8 + 512 };
+_Static_assert(PET_P4_SPEECH_MAX == PET_LAN_CAPTION_BYTES - 8, "RTC caption text width");
 typedef struct {
   uint8_t body[PET_LAN_HUD_BYTES];
   uint8_t final[PET_LAN_HUD_BYTES];
   char displayed[64];
+  uint32_t turn;
+  unsigned cue_head, cue_count;
+  pet_p4_conversation_cue_t cues[PET_P4_CONVERSATION_CUES_MAX];
   bool live, bound, dirty, final_pending, terminal;
 } pet_lan_hud_t;
 
+/* RTC worker and state task serialize these operations under rtc_hud_mux.
+ * Reset before changing DAC ownership, so a new byte clock cannot release old text. */
+static inline void pet_lan_hud_turn(pet_lan_hud_t *h, uint32_t turn) {
+  h->turn = turn;
+  h->cue_head = h->cue_count = 0;
+}
+
+static inline bool pet_lan_hud_cue(pet_lan_hud_t *h, uint32_t turn, uint32_t offset,
+                                   const char *text) {
+  const char *end = memchr(text, 0, PET_P4_SPEECH_MAX);
+  if (!h->live || !h->bound || !turn || h->turn != turn || (offset & 1) ||
+      !end || end == text || h->cue_count == PET_P4_CONVERSATION_CUES_MAX) return false;
+  unsigned slot = (h->cue_head + h->cue_count) % PET_P4_CONVERSATION_CUES_MAX;
+  if (h->cue_count && offset < h->cues[(slot + PET_P4_CONVERSATION_CUES_MAX - 1)
+                                      % PET_P4_CONVERSATION_CUES_MAX].offset_bytes) return false;
+  h->cues[slot].offset_bytes = offset;
+  memcpy(h->cues[slot].text, text, (size_t)(end - text) + 1);
+  ++h->cue_count;
+  return true;
+}
+
+static inline void pet_lan_hud_advance(pet_lan_hud_t *h, pet_p4_runtime_state_t *s,
+                                       unsigned played, uint64_t now) {
+  if (!h->live || !h->bound || strcmp(s->conversation_id, (const char *)h->body + 4)) return;
+  while (h->cue_count && played > h->cues[h->cue_head].offset_bytes) {
+    pet_p4_conversation_update(s, (const char *)h->body + 4, "speaking", "", h->cues[h->cue_head].text,
+                               false, true, now);
+    h->cue_head = (h->cue_head + 1) % PET_P4_CONVERSATION_CUES_MAX;
+    --h->cue_count;
+  }
+}
+
 static inline void pet_lan_hud_begin(pet_lan_hud_t *h) {
+  pet_lan_hud_turn(h, 0);
   h->live = true;
   h->bound = h->dirty = h->final_pending = h->terminal = false;
 }
@@ -35,6 +72,7 @@ static inline bool pet_lan_hud_offer(pet_lan_hud_t *h, const uint8_t *body) {
       memcpy(h->final, h->body, PET_LAN_HUD_BYTES);
       h->final_pending = true;
     }
+    if (body[0] >= 4) pet_lan_hud_turn(h, 0);
     memcpy(h->body, body, PET_LAN_HUD_BYTES);
     h->dirty = true;
   }
@@ -43,6 +81,7 @@ static inline bool pet_lan_hud_offer(pet_lan_hud_t *h, const uint8_t *body) {
 }
 
 static inline void pet_lan_hud_end(pet_lan_hud_t *h) {
+  pet_lan_hud_turn(h, 0);
   h->live = h->dirty = h->final_pending = h->terminal = false;
 }
 

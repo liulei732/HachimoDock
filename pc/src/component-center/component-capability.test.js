@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
-import { legacyAudioInstallBlockedReason, componentUsbInstallBlockedReason } from "./library-order.js";
+import { legacyAudioInstallBlockedReason, componentInstallBlockedReason } from "./library-order.js";
 import { parseSync } from "@babel/core";
 import traverseModule from "@babel/traverse";
 const source = readFileSync(new URL("../ComponentCenter.jsx", import.meta.url), "utf8");
@@ -38,8 +38,8 @@ test("optional declarations do not block the actual install handler",async()=>{
 function syncFixture(overrides={}) {
  const events=[],syncInFlight={current:false};let installs=0;
  const ctx={
-  syncInFlight, transferInFlight:{current:false}, usb:{connected:true,capabilities:{touchInput:{ready:false}}},
-  bindingConflictForComponent:()=>"",localInstallBlockedReason:actual("localInstallBlockedReason",{legacyAudioInstallBlockedReason}),componentUsbInstallBlockedReason,
+  syncInFlight, wifi:null, transferInFlight:{current:false}, usb:{connected:true,capabilities:{touchInput:{ready:false}}},
+  bindingConflictForComponent:()=>"",localInstallBlockedReason:actual("localInstallBlockedReason",{legacyAudioInstallBlockedReason}),componentInstallBlockedReason,
   liveInventoryTarget:{transport:"usb",boardDeviceId:"synthetic-board"},
   push:e=>events.push(e),devicePackageState:()=>({key:"current"}),setDowngradeComponent:()=>events.push({downgrade:true}),
   deviceInventory:{freshness:"live",supportsMultiple:true,maxInstalled:33,items:[]},installedIds:new Set(),
@@ -87,4 +87,33 @@ test("ComponentCenter has no unresolved references across function scopes",()=>{
 });
 test("the app isolates ComponentCenter itself, including modal prop evaluation",()=>{
  const app=readFileSync(new URL("../App.jsx",import.meta.url),"utf8");assert.match(app,/<ComponentCenterBoundary>\s*<ComponentCenter\b[^>]*\/>\s*<\/ComponentCenterBoundary>/);
+});
+
+test("online Wi-Fi install checks the bound capability report for the selected target", async () => {
+  const identity = {boardDeviceId:"p4-0123456789ab",bootId:"0123456789abcdef",association:7};
+  const capabilities = {widgetWasm:"hachi-wasm-v1",widgetWasmCanvas:"640x480-v1",widgetWasmAudio:"hachi-audio-v2"};
+  const component = {id:"game",syncRequirements:{usbCapabilities:capabilities}};
+  const wifi = {...identity,panelControl:true,wifiConnected:true,controlTrusted:true,componentDelivery:true,
+    componentBundle:true,componentTarget:{...identity,capabilities}};
+  const target = {transport:"wifi",...identity};
+  const run = async (radio,selected) => {
+    const f=syncFixture({wifi:radio,usb:{connected:false},liveInventoryTarget:selected});
+    await f.run(component);
+    return [f.installs(),f.events[0]?.message];
+  };
+  assert.deepEqual(await run(wifi,target),[1,undefined]);
+  for(const [radio,selected,reason] of [
+    [{...wifi,wifiConnected:false},target,/未在线/],
+    [{...wifi,controlTrusted:false},target,/授权/],
+    [{...wifi,componentBundle:false},target,/分段/],
+    [wifi,{...target,association:8},/当前设备/],
+    [wifi,{...target,bootId:"0000000000000001"},/当前设备/],
+    [wifi,{...target,boardDeviceId:"p4-abcdef123456"},/当前设备/],
+    [{...wifi,componentTarget:{...identity,capabilities:{...capabilities,widgetWasmAudio:null}}},target,/widgetWasmAudio/],
+    [null,{transport:"ssh"},/SSH/],
+  ]) {
+    const [count,message]=await run(radio,selected);
+    assert.equal(count,0);
+    assert.match(message,reason);
+  }
 });

@@ -88,16 +88,20 @@ static bool format_utc(char *out, size_t capacity, uint64_t ms, bool include_tim
   return time_bytes >= 0 && (size_t)time_bytes < remaining;
 }
 
+bool pet_wifi_data_snapshot_date(cJSON *snapshot, uint64_t utc_ms) {
+  char date[11];
+  return format_utc(date, sizeof(date), utc_ms, false) && cJSON_AddStringToObject(snapshot, "date", date);
+}
+
 cJSON *pet_wifi_data_snapshot(const char *source, const char *status, const char *message,
                             uint32_t ttl_ms, uint64_t utc_ms) {
-  char date[11];
   cJSON *root = cJSON_CreateObject();
-  if (!root || !format_utc(date, sizeof(date), utc_ms, false)
+  if (!root
       || !cJSON_AddNumberToObject(root, "schema", 1)
       || !cJSON_AddStringToObject(root, "source", source)
       || !cJSON_AddStringToObject(root, "status", status)
       || !cJSON_AddStringToObject(root, "message", message)
-      || !cJSON_AddStringToObject(root, "date", date)
+      || !pet_wifi_data_snapshot_date(root, utc_ms)
       || !cJSON_AddNumberToObject(root, "ttlMs", ttl_ms)
       || !cJSON_AddArrayToObject(root, "rows")) {
     cJSON_Delete(root);
@@ -121,6 +125,7 @@ static bool append_row(cJSON *root, const char *id, const char *label, const cha
   }
   return true;
 }
+
 
 static bool decimal(const char *s, bool sign, size_t limit) {
   if (!s || !*s || strlen(s) > limit) return false;
@@ -238,6 +243,7 @@ static bool feed_shape(const char *body, size_t length, bool mapped) {
   }
   return true;
 }
+
 
 static const char *const feed_fields[] = {"rows", "id", "label", "value", "detail", "meta", "tone"};
 

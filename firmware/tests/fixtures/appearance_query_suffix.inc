@@ -41,7 +41,22 @@ int main(int argc,char**argv){
  else if(!strcmp(which,"partial")){cJSON_DeleteItemFromObjectCaseSensitive(q,"observationSchema");invalid=true;}
  else if(!strcmp(which,"schema")){cJSON_ReplaceItemInObjectCaseSensitive(q,"observationSchema",cJSON_CreateString("unknown-schema"));invalid=true;}
  else if(!strcmp(which,"legacy")){cJSON_Delete(q);q=cJSON_Parse("{\"transferId\":\"observe-synthetic\"}");legacy=true;}
- else if(!strcmp(which,"idle")){
+ else if(!strcmp(which,"idle") || !strcmp(which,"global-audio")){
+  if(!strcmp(which,"global-audio")){
+   static char token[64];
+   memset(token,'x',sizeof(token)-1); id=token; nonce=token;
+   memset(state.board_device_id,'b',sizeof(state.board_device_id)-1);
+   cJSON_ReplaceItemInObject(q,"transferId",cJSON_CreateString(id));
+   cJSON_ReplaceItemInObject(q,"queryNonce",cJSON_CreateString(nonce));
+   cJSON_ReplaceItemInObject(q,"expectedBoardDeviceId",cJSON_CreateString(state.board_device_id));
+   cJSON_AddStringToObject(q,"scope","global");
+   g_asset_active_slot=PET_P4_RAW_APPEARANCE_SLOT;
+   state.asset_catalog.count=PET_P4_ASSET_CATALOG_MAX_FAMILIES;
+   for(unsigned i=0;i<state.asset_catalog.count;i++){
+    snprintf(state.asset_catalog.entries[i].path,sizeof(state.asset_catalog.entries[i].path),"p4/video/%u.h264",i);
+    state.asset_catalog.entries[i].stream_bytes=4096;
+   }
+  }
   g_appearance_session.operation_active=false;forbid_storage=false;idle=true;
   assert(!mprotect(private_tracking,4096,PROT_READ|PROT_WRITE));private_tracking->active=false;
   for(int i=0;i<2;i++){char path[32];snprintf(path,sizeof(path),"slot-%d.synthetic",i);FILE*f=fopen(path,"wb");assert(f);for(int j=0;j<64;j++)assert(fputc('a'+i,f)!=EOF);assert(!fclose(f));}

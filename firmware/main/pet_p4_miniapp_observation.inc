@@ -56,11 +56,18 @@ bool pet_p4_miniapp_observe(pet_p4_miniapp_observation_t *out,pet_p4_miniapp_vie
     }else out->has_vm=false;
   }
 #endif
+  uint64_t now=esp_timer_get_time()/1000ULL;
+#if PET_P4_SYSTEM_WIFI
+  if(view->app_host)pet_app_host_view(view,now);
+  wifi_news_project(view,NULL,now);
+#endif
   miniapp_runtime_unlock();
 #if PET_COMPONENT_PROGRAM_ENABLED
   heap_caps_free(vm);
 #endif
-  if(view->app_host)pet_app_host_view(view,esp_timer_get_time()/1000ULL);
-  pet_p4_widget_data_view(view->data_source,view->data_page,esp_timer_get_time()/1000ULL,&view->data);
+#if !PET_P4_SYSTEM_WIFI
+  if(view->app_host)pet_app_host_view(view,now);
+#endif
+  pet_p4_widget_data_view(view->data_source,view->data_page,now,&view->data);
   return true;
 }

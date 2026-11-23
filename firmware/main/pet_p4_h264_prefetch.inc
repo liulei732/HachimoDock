@@ -76,16 +76,7 @@ static void h264_worker_pack(pet_h264_prefetch_job_t *job){
   int64_t started_us=esp_timer_get_time();
   pet_p4_h264_pack_job_t primary={.plane_y=job->output,.plane_u=job->output+storage_luma,.plane_v=job->output+storage_luma+storage_luma/4U,
     .packed=job->packed,.packed_stride=packed_stride,.src_w=job->width,.src_stride=stride,.row_begin=0,.row_end=storage_h};
-  if(g_h264_pack_task&&g_h264_pack_done){
-    /* The pack task is driven from WORKING here and from CONSUMING by the
-     * render-thread fallback; the single-job lifetime makes those exclusive. */
-    int split_row=storage_h/2;
-    g_h264_pack_job=primary;g_h264_pack_job.row_begin=split_row;primary.row_end=split_row;
-    while(xSemaphoreTake(g_h264_pack_done,0)==pdTRUE){}
-    xTaskNotifyGive(g_h264_pack_task);
-    pack_h264_i420_rows(&primary);
-    xSemaphoreTake(g_h264_pack_done,portMAX_DELAY);
-  }else pack_h264_i420_rows(&primary);
+  h264_pack_rows_joined(primary, false);
   job->pack_us=elapsed_us_clamped(started_us,esp_timer_get_time());
   job->packed_stride=stride;job->packed_storage_h=storage_h;job->packed_ok=true;
 }
@@ -208,6 +199,7 @@ static void h264_frame_offer_end(bool submit){
 /* Main only. Never touches codec memory while a worker/consumer is active.
  * Returning false means retirement/cleanup pending, NOT decoder failure. */
 static bool h264_prefetch_reset(void){
+  g_h264_rgb_cached = false;
   g_h264_packed_current=(pet_h264_packed_view_t){0};g_h264_presented_frame=-1;
   g_h264_first_presented_ms=0;g_h264_presented_path[0]=0;
   g_h264_tail_confirmed=false;
@@ -333,6 +325,7 @@ static bool render_h264_asset_frame_async(const pet_p4_asset_selection_t *asset,
   if(failed){portENTER_CRITICAL(&g_asset_prepare_mux);g_h264_reset_requested=true;portEXIT_CRITICAL(&g_asset_prepare_mux);return false;}
   bool direct_cpu=false;
   if(taken){
+    g_h264_rgb_cached = false;
     int stride=0,storage_h=0;const uint8_t *packed=NULL;
     bool layout=resolve_h264_i420_layout(asset->width,asset->height,ready.output_size,&stride,&storage_h);
     int64_t pack_started=esp_timer_get_time();
@@ -381,9 +374,19 @@ static bool render_h264_asset_frame_async(const pet_p4_asset_selection_t *asset,
   if(direct_cpu)return true;
   if(!g_h264_packed_current.data){g_asset_cache_pending=true;return false;}
   int64_t scale_started=esp_timer_get_time();
-  if(!h264_frame_supports_ppa_yuv420(asset->width,g_h264_packed_current.storage_height)
+  const size_t rgb_bytes = (size_t)PET_P4_UI_WIDTH * PET_P4_UI_HEIGHT * sizeof(uint16_t);
+  if (g_h264_rgb_cached) {
+    memcpy(g_framebuffer, g_jpeg_output, rgb_bytes);
+  } else {
+    if(!h264_frame_supports_ppa_yuv420(asset->width,g_h264_packed_current.storage_height)
       ||!scale_h264_frame_ppa(g_h264_packed_current.data,asset->width,asset->height,g_h264_packed_current.storage_height)){
-    g_render_trace.fallback|=PET_RENDER_FALLBACK_H264_CPU;scale_h264_packed_cpu(&g_h264_packed_current);
+      g_render_trace.fallback|=PET_RENDER_FALLBACK_H264_CPU;scale_h264_packed_cpu(&g_h264_packed_current);
+    }
+    // Save the base before bubbles, controls and all other overlays are drawn.
+    if (g_jpeg_output && g_jpeg_output_capacity >= rgb_bytes) {
+      memcpy(g_jpeg_output, g_framebuffer, rgb_bytes);
+      g_h264_rgb_cached = true;
+    }
   }
   pet_p4_render_trace_add(&g_render_trace.scale_us,elapsed_us_clamped(scale_started,esp_timer_get_time()));
   return true;

@@ -62,6 +62,7 @@ static size_t pet_p4_miniapp_background_list(pet_p4_miniapp_background_status_t 
 #include "pet_p4_catalog_profile.h"
 #define MINIAPP_CATALOG_GENERATION_COUNT 2
 #define MINIAPP_PACKAGE_GENERATION_COUNT 2
+#define center_thumb_catalog(g,items,count,committed) ((void)0)
 #define MINIAPP_CATALOG_VERSION 3
 #define MINIAPP_CATALOG_JSON_MAX (32 * 1024)
 #define MINIAPP_WIDGET_JSON_MAX 20000
@@ -135,6 +136,22 @@ static struct{bool active;char widget_id[48];} g_runtime,g_staging;
     for name in ['safe_id','pet_selection_read','pet_selection_write']:
         body += function(selection,name)
     body += cursor
+    # Retain firmware path, checksum and exact-length validation on cold reads.
+    # Only the mount point is redirected to the test's private working directory.
+    header = (ROOT/'main/pet_p4_miniapp.h').read_text()
+    entry_end = header.index('} pet_p4_miniapp_catalog_entry_t;') + len('} pet_p4_miniapp_catalog_entry_t;')
+    body += header[header.rindex('typedef struct {', 0, entry_end):entry_end] + '\n'
+    body += re.search(r'^#define PET_CENTER_THUMB_BYTES .*$', header, re.M)[0] + '\n'
+    body += r'''
+static FILE *open_test_thumb(const char *path,const char *mode){
+ assert(!strncmp(path,"/spiffs/",8));return fopen(path+8,mode);
+}
+#define fopen open_test_thumb
+'''
+    sidecar = (ROOT/'main/pet_p4_center_thumb.inc').read_text()
+    for name in ['center_thumb_path', 'center_thumb_hash', 'pet_p4_miniapp_center_read_thumb']:
+        body += function(sidecar,name)
+    body += '#undef fopen\n'
     for name in ['write_catalog_snapshot_at', 'persist_catalog_snapshot', 'load_catalog_snapshot']:
         body += function(code, name)
     # Use the actual native storage lane state machine; only its resources
@@ -160,6 +177,21 @@ static bool storage_audio_busy(void){return audio_busy;}
     body += function(code,'catalog_latest_snapshot')
     body += function(code,'recover_catalog_items')
     body += function(code,'pet_p4_miniapp_catalog_recovery_blocked')
+    body += r'''
+#undef PET_P4_EVENTS
+#define PET_P4_EVENTS 1
+static bool refuse_retirement;
+static unsigned retire_calls, forgotten;
+static bool local_alarm_retire(unsigned slot,const char *id,const miniapp_catalog_item_t *replacement){
+ int i=catalog_find(g_catalog,g_catalog_count,id);
+ assert(i>=0 && g_catalog[i].slot==slot && !replacement);
+ assert(!require_unlocked || write_lane_unlocked());
+ retire_calls++;return !refuse_retirement;
+}
+static void miniapp_ext_forget_events(const char *id){
+ assert(catalog_find(g_catalog,g_catalog_count,id)>=0 && retire_calls>forgotten);forgotten++;
+}
+'''
     body += (ROOT / 'main/pet_p4_catalog_admin.inc').read_text()
     body += r'''
 typedef struct {char board_device_id[64];unsigned last_update_ms;} pet_p4_runtime_state_t;
@@ -222,7 +254,47 @@ static void reset(void){
 static void readback(miniapp_catalog_snapshot_t *s){assert(load_catalog_snapshot((uint8_t)g_catalog_file_generation,s));assert(s->parsed);}
 int main(int argc,char **argv){
  assert(argc==2);reset();char err[160]={0};const char *test=argv[1];
- if(!strcmp(test,"atomic")){
+ if(!strcmp(test,"thumb-upgrade") || !strcmp(test,"thumb-reboot")){
+  bool reboot=!strcmp(test,"thumb-reboot");
+  miniapp_catalog_snapshot_t old,updated={0};
+  assert(load_catalog_snapshot(0,&old) && old.count==4 && old.sequence==70);
+  for(size_t i=0;i<old.count;i++)assert(!old.items[i].center_thumb_checksum);
+  if(reboot)assert(load_catalog_snapshot(1,&updated));
+  uint32_t sequence=0;
+  miniapp_catalog_snapshot_t *latest=catalog_latest_snapshot(&old,&updated,&sequence);
+  assert(sequence==(reboot?71u:70u) && latest->count==4 && !strcmp(latest->active_widget_id,"legacy-3"));
+  assert(!strcmp(latest->selected_widget_id,old.selected_widget_id));
+  for(size_t i=0;i<latest->count;i++){
+   miniapp_catalog_item_t *item=&latest->items[i];
+   char id[sizeof(item->widget_id)];snprintf(id,sizeof(id),"legacy-%u",(unsigned)i);
+   assert(!strcmp(item->widget_id,id) && item->slot==12+i && item->package_generation==1);
+   assert(item->widget_checksum==0x100+i && item->buttons_checksum==0x200+i);
+   if(i==3){assert(!item->center_thumb_checksum);continue;}
+   uint8_t expected[PET_CENTER_THUMB_BYTES],actual[PET_CENTER_THUMB_BYTES];
+   memset(expected,(int)(0x60+i),sizeof(expected));
+   uint32_t checksum=miniapp_checksum((const char *)expected,sizeof(expected));
+   if(!reboot){
+    item->center_thumb_checksum=checksum;item->center_thumb_generation=(uint8_t)i;
+   }else{
+    assert(item->center_thumb_checksum==checksum && item->center_thumb_generation==i);
+    pet_p4_miniapp_catalog_entry_t entry={.center_title_slot=item->slot,
+       .center_thumb_checksum=item->center_thumb_checksum,.center_thumb_generation=item->center_thumb_generation};
+    assert(pet_p4_miniapp_center_read_thumb(&entry,actual,sizeof(actual)) && !memcmp(actual,expected,sizeof(actual)));
+   }
+  }
+  assert(writes==0);
+  if(!reboot){
+   miniapp_catalog_commit_t result={0};
+   assert(write_catalog_snapshot_at(latest->items,latest->count,latest->active_widget_id,
+    latest->selected_widget_id,latest->seed_pending,0,sequence,&result));
+   assert(result.sequence==71 && result.generation==1);
+  }
+ }else if(!strcmp(test,"atomic")){
+#if PET_P4_SYSTEM_WIFI
+  memset(g_catalog[2].community_save,'b',32);
+  memset(g_catalog[0].community_save,'a',64);
+  strcpy(g_catalog[0].package_metadata.version,"1.2.3");
+#endif
   const unsigned char save[]={0,255,34,17};assert(write_bytes("private-save",save,sizeof(save)));
   miniapp_catalog_item_t hidden=g_catalog[1];
   cJSON *p=plan("[\"extra-default\"]","[\"keep-b\",\"keep-a\"]");
@@ -230,6 +302,11 @@ int main(int argc,char **argv){
   assert(g_catalog_sequence==41&&g_catalog_count==3&&g_catalog_selected==0&&!strcmp(g_runtime.widget_id,"keep-a"));
   assert(!memcmp(&g_catalog[1],&hidden,sizeof(hidden)));assert(!strcmp(g_catalog[2].widget_id,"keep-a"));
   miniapp_catalog_snapshot_t s;readback(&s);assert(!s.seed_pending&&s.count==3&&s.sequence==41);
+#if PET_P4_SYSTEM_WIFI
+  assert(strlen(s.items[0].community_save)==32 && !strcmp(s.items[0].community_save,g_catalog[0].community_save) && !s.items[1].community_save[0]);
+  assert(!strcmp(s.items[2].community_save,g_catalog[2].community_save) && strlen(s.items[2].community_save)==64);
+  assert(!strcmp(s.items[2].package_metadata.version,"1.2.3"));
+#endif
   assert(!strcmp(s.active_widget_id,"keep-a")&&!strcmp(s.selected_widget_id,"keep-b"));
   assert(!strcmp(s.items[0].widget_id,"keep-b")&&!strcmp(s.items[1].widget_id,"music-player"));
   unsigned char actual[4];FILE *f=fopen("private-save","rb");assert(f&&fread(actual,1,4,f)==4);fclose(f);assert(!memcmp(actual,save,4));
@@ -245,7 +322,11 @@ int main(int argc,char **argv){
  }else if(!strcmp(test,"background-protect")){
   cJSON *p=plan("[\"extra-default\"]","[\"keep-b\",\"keep-a\"]");
   strcpy(registered_program,"extra-default");assert(!strcmp(pet_p4_miniapp_catalog_reconcile(p,err,sizeof(err)),"not_committed")&&!writes);
-  registered_program[0]=0;assert(!strcmp(pet_p4_miniapp_catalog_reconcile(p,err,sizeof(err)),"committed"));cJSON_Delete(p);
+  assert(!retire_calls&&!forgotten);
+  registered_program[0]=0;refuse_retirement=true;
+  assert(!strcmp(pet_p4_miniapp_catalog_reconcile(p,err,sizeof(err)),"not_committed")&&!writes&&g_catalog_count==4&&!forgotten);
+  refuse_retirement=false;assert(!strcmp(pet_p4_miniapp_catalog_reconcile(p,err,sizeof(err)),"committed"));
+  assert(retire_calls==2 && forgotten==1);cJSON_Delete(p);
  }else if(!strcmp(test,"dispatcher-unlocked")){
   cJSON *p=plan("[\"extra-default\"]","[\"keep-b\",\"keep-a\"]");
   assert(pet_storage_lane_enter(&lane));require_unlocked=true;
@@ -302,9 +383,10 @@ int main(int argc,char **argv){
   miniapp_catalog_snapshot_t snapshot;readback(&snapshot);g_catalog_selected=0;
   char active[48],cursor[48];bool exists;catalog_restore_navigation(&snapshot,active,cursor,&exists);
   assert(!strcmp(active,"keep-a")&&!strcmp(cursor,"keep-b")&&g_catalog_selected==2);
- }else if(!strcmp(test,"seventeen-ab")){
-  g_catalog_count=17;g_catalog_selected=7;memset(g_catalog,0,sizeof(g_catalog));
-  for(size_t i=0;i<17;i++){snprintf(g_catalog[i].widget_id,48,"user-%02u",(unsigned)(16-i));g_catalog[i].slot=(uint8_t)i;g_catalog[i].widget_checksum=123+(uint32_t)i;g_catalog[i].resource_state=1;}
+ }else if(!strcmp(test,"seventeen-ab")||!strcmp(test,"twentyeight-ab")){
+  size_t count=!strcmp(test,"seventeen-ab")?17:28;
+  g_catalog_count=count;g_catalog_selected=7;memset(g_catalog,0,sizeof(g_catalog));
+  for(size_t i=0;i<count;i++){snprintf(g_catalog[i].widget_id,48,"user-%02u",(unsigned)(count-1-i));g_catalog[i].slot=(uint8_t)i;g_catalog[i].widget_checksum=123+(uint32_t)i;g_catalog[i].resource_state=1;}
   copy_utf8(g_runtime.widget_id,48,g_catalog[3].widget_id);
   assert(persist_catalog_snapshot(g_catalog,g_catalog_count,g_runtime.widget_id));
   assert(persist_catalog_snapshot(g_catalog,g_catalog_count,g_runtime.widget_id));
@@ -317,14 +399,17 @@ int main(int argc,char **argv){
    char *json=cJSON_PrintUnformatted(p);assert(write_bytes(path,json,strlen(json)));cJSON_free(json);cJSON_Delete(p);
   }
   miniapp_catalog_snapshot_t a,b;assert(load_catalog_snapshot(0,&a)&&load_catalog_snapshot(1,&b));
-  uint32_t seq=0;miniapp_catalog_snapshot_t *latest=catalog_latest_snapshot(&a,&b,&seq);assert(seq==42&&latest->count==17&&!latest->seed_pending);
+  uint32_t seq=0;miniapp_catalog_snapshot_t *latest=catalog_latest_snapshot(&a,&b,&seq);assert(seq==42&&latest->count==count&&!latest->seed_pending);
+#if PET_P4_SYSTEM_WIFI
+  for(size_t i=0;i<count;i++)assert(!a.items[i].community_save[0]&&!b.items[i].community_save[0]);
+#endif
   assert(catalog_cursor_write(seq,g_catalog[7].widget_id));
   char active[48],cursor[48];bool exists;catalog_restore_navigation(latest,active,cursor,&exists);
   assert(!strcmp(active,g_catalog[3].widget_id)&&!strcmp(cursor,g_catalog[7].widget_id));
-  assert(pet_p4_miniapp_sync_builtins()==ESP_OK&&g_catalog_count==17&&materialized==0);
+  assert(pet_p4_miniapp_sync_builtins()==ESP_OK&&g_catalog_count==count&&materialized==0);
   assert(write_bytes("marker","changed-build-and-bundle",24));
-  assert(pet_p4_miniapp_sync_builtins()==ESP_OK&&g_catalog_count==17&&materialized==0);
-  for(size_t i=0;i<17;i++){char id[48];snprintf(id,sizeof(id),"user-%02u",(unsigned)(16-i));assert(!strcmp(g_catalog[i].widget_id,id)&&g_catalog[i].slot==i);}
+  assert(pet_p4_miniapp_sync_builtins()==ESP_OK&&g_catalog_count==count&&materialized==0);
+  for(size_t i=0;i<count;i++){char id[48];snprintf(id,sizeof(id),"user-%02u",(unsigned)(count-1-i));assert(!strcmp(g_catalog[i].widget_id,id)&&g_catalog[i].slot==i);}
   assert(!strcmp(g_runtime.widget_id,g_catalog[3].widget_id)&&g_catalog_selected==7);
  }else if(!strcmp(test,"seed-interrupted")){
   g_catalog_count=0;g_catalog_selected=0;g_runtime.active=false;g_catalog_seed_pending=true;fail_package=2;
@@ -367,11 +452,51 @@ int main(int argc,char **argv){
 }
 '''
     src=out/'catalog.c';exe=out/'catalog'
-    src.write_text(prelude + f'\n#define PET_P4_COMMIT_LEAN_IO {request.param}\n' + body + tail)
+    src.write_text(prelude + f'\n#define PET_P4_COMMIT_LEAN_IO {request.param}\n#define PET_P4_SYSTEM_WIFI {request.param}\n' + body + tail)
     vendor=ROOT/'tests/vendor/cjson'
     subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-error=deprecated-declarations','-fsanitize=address,undefined','-I',str(vendor),'-I',str(ROOT/'main'),str(src),str(vendor/'cJSON.c'),str(ROOT/'main/pet_p4_storage_lane.c'),'-lz','-o',str(exe)],check=True,capture_output=True,text=True)
     return exe
 
-@pytest.mark.parametrize('scenario',['atomic','invalid','stale','unknown','noop','inspect','cursor','old-schema','empty','fresh','navigation','wire','sequence-upgrade','seventeen-ab','seed-interrupted','dispatcher-unlocked','background-protect'])
+@pytest.mark.parametrize('scenario',['atomic','invalid','stale','unknown','noop','inspect','cursor','old-schema','empty','fresh','navigation','wire','sequence-upgrade','seventeen-ab','twentyeight-ab','seed-interrupted','dispatcher-unlocked','background-protect'])
 def test_production_catalog_persistence_and_reconcile(binary,tmp_path,scenario):
     subprocess.run([str(binary),scenario],cwd=tmp_path,check=True,capture_output=True,text=True)
+
+
+@pytest.mark.parametrize('version,partial', [(2, False), (3, False), (3, True)],
+                         ids=['pre-sprites-v2', 'pre-covers-v3', 'invalid-optional-metadata'])
+def test_old_catalog_and_mixed_thumbnail_banks_across_cold_processes(binary, tmp_path, version, partial):
+    # Historical bytes independent of the current writer, including a package
+    # generation that differs from thumbnail banks zero and two.
+    items = [dict(widgetId=f'legacy-{i}', title=f'Legacy {i}', slot=12+i,
+                  packageGeneration=1, widgetChecksum=f'{0x100+i:08x}',
+                  buttonsChecksum=f'{0x200+i:08x}') for i in range(4)]
+    legacy = dict(version=version, sequence=70, activeWidgetId='legacy-3', items=items)
+    if version == 3:
+        legacy.update(selectedWidgetId='legacy-1', seedPending=False)
+        for i, item in enumerate(items):
+            item['spritesChecksum'] = f'{0x300+i:08x}'
+
+    if partial:
+        items[0].update(thumb='12345678')                   # Missing bank.
+        items[1].update(thumb='12345678', thumbBank=3)      # Out of range.
+        items[2].update(thumb='1234xxxx', thumbBank=1)      # Invalid digest.
+
+    old = tmp_path/'catalog.0'
+    old_bytes = json.dumps(legacy, separators=(',', ':')).encode()
+    old.write_bytes(old_bytes)
+    covers = {tmp_path/f'p4th{12+i:02d}-{i}.p4t': bytes([0x60+i])*1568 for i in range(3)}
+    for path, data in covers.items():
+        path.write_bytes(data)
+
+    subprocess.run([binary, 'thumb-upgrade'], cwd=tmp_path, check=True)
+    updated = tmp_path/'catalog.1'
+    updated_bytes = updated.read_bytes()
+    records = json.loads(updated_bytes)['items']
+    for i, item in enumerate(items):
+        assert all(records[i][key] == value for key, value in item.items()
+                   if key not in ('thumb', 'thumbBank'))
+    assert 'thumb' not in records[3] and 'thumbBank' not in records[3]
+
+    subprocess.run([binary, 'thumb-reboot'], cwd=tmp_path, check=True)
+    assert old.read_bytes() == old_bytes and updated.read_bytes() == updated_bytes
+    assert all(path.read_bytes() == data for path, data in covers.items())

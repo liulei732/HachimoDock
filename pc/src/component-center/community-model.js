@@ -70,6 +70,33 @@ export function updateFavorites(entries, work) {
     ...entries,
   ].slice(0, 200);
 }
+export function publicationCandidates(items, provenance, owned) {
+  if (!Array.isArray(provenance?.reservedIds) || !provenance.downloaded) return [];
+  const candidates = new Map();
+  for (const item of items) {
+    for (const source of item.sourceAlternatives || [item]) {
+      const {id, libraryPath} = source;
+      if (!source.isLocal || !libraryPath || source.isBundledCopy || isWithdrawnComponent(source)
+          || !/^[a-z][a-z0-9_-]{0,43}$/.test(id || "") || /^(official-|hachimo-)/.test(id)
+          || provenance.reservedIds.includes(id)
+          || (Object.hasOwn(provenance.downloaded, id) && !Object.hasOwn(owned, id))) continue;
+      candidates.set(libraryPath, source);
+    }
+  }
+  return [...candidates.values()];
+}
+
+export function publicationReceiptError(receipt, id, version) {
+  if (receipt?.canPublish === false) return receipt.warning || "社区未通过此组件的发布预检。";
+  if (receipt?.serverChecked !== true || receipt.canPublish !== true)
+    return "尚未取得社区预检通过回执，请重新检查。";
+  if (receipt.id !== id || !receipt.version || (version && receipt.version !== version)
+      || !/^[a-f0-9]{64}$/.test(receipt.contentHash || "") || !Array.isArray(receipt.files)
+      || !receipt.files.length || !receipt.files.every(name => typeof name === "string"))
+    return "预检回执与所选本地组件不匹配，请重新检查。";
+  return "";
+}
+
 export function publicationStatus(work) {
   if (work.status === "pending") return "待审核";
   if (work.status === "rejected") return "需修改";

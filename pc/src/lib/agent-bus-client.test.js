@@ -31,7 +31,7 @@ test("Agent Bus client normalizes adapters and encodes ordered Session cursors",
       agents: [{ agentId: "codex" }],
     });
     assert.deepEqual(
-      await fetchAgentSessionEvents("claude code", 8, "stream/old"),
+      await fetchAgentSessionEvents("claude code", 8, "stream/old", undefined, 17),
       {
         cursor: 9,
         streamId: "stream-a",
@@ -41,6 +41,7 @@ test("Agent Bus client normalizes adapters and encodes ordered Session cursors",
     );
     assert.match(requests[1].url, /agentId=claude\+code/);
     assert.match(requests[1].url, /cursor=8/);
+    assert.match(requests[1].url, /limit=17/);
     assert.match(requests[1].url, /streamId=stream%2Fold/);
     const ctl = new AbortController();
     ctl.abort();
