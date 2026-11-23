@@ -44,11 +44,26 @@ fn websocket_upgrade_validates_handshake_and_exchanges_frames() {
             assert_eq!(ws.next().await.unwrap().unwrap(), Message::Text("hello".into()));
             ws.send(Message::Binary(vec![1, 2, 3].into())).await.unwrap();
         });
-        let (mut ws, _) = tokio::time::timeout(Duration::from_secs(3), upgrade_websocket(&direct(CloudTransport::WebSocket), url.into_client_request().unwrap())).await.unwrap().unwrap();
+        let (mut ws, _) = tokio::time::timeout(Duration::from_secs(3), upgrade_websocket(crate::model_issue::ASR, &direct(CloudTransport::WebSocket), url.into_client_request().unwrap())).await.unwrap().unwrap();
         ws.send(Message::Text("hello".into())).await.unwrap();
         assert_eq!(ws.next().await.unwrap().unwrap(), Message::Binary(vec![1, 2, 3].into()));
         server.await.unwrap();
     });
+}
+
+#[tokio::test]
+async fn model_issue_ws_rejection_keeps_service_and_http_status_only() {
+    for source in [crate::model_issue::ASR, crate::model_issue::TTS] {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let request=format!("ws://{}/private-path",listener.local_addr().unwrap()).into_client_request().unwrap();
+        let server=tokio::spawn(async move {
+            let (mut stream,_)=listener.accept().await.unwrap();
+            let mut buf=[0;2048];stream.read(&mut buf).await.unwrap();
+            stream.write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nX-Debug: sk-private\r\n\r\nhttps://private.invalid").await.unwrap();
+        });
+        let error=upgrade_websocket(source,&direct(CloudTransport::WebSocket),request).await.unwrap_err();
+        assert_eq!(error,crate::model_issue::http(source,403,true));server.await.unwrap();
+    }
 }
 
 #[test]
@@ -64,7 +79,7 @@ fn websocket_rejects_bad_accept_and_unsolicited_extensions() {
                 let extra = if invalid_accept { "" } else { "Sec-WebSocket-Extensions: permessage-deflate\r\n" };
                 stream.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n{extra}\r\n").as_bytes()).await.unwrap();
             });
-            let error = upgrade_websocket(&direct(CloudTransport::WebSocket), request).await.unwrap_err();
+            let error = upgrade_websocket(crate::model_issue::ASR, &direct(CloudTransport::WebSocket), request).await.unwrap_err();
             assert!(error.contains("握手校验失败"));
             server.await.unwrap();
         }

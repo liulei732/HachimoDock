@@ -28,6 +28,28 @@ int main(void) {
   state.session_queue_count = 1;
   pet_p4_build_view_model(&state, &view);
   assert(!view.show_voice_overlay && state.session_voice_active);
+  state.voice_feedback.phase = PET_VOICE_LISTENING;
+  pet_p4_build_view_model(&state, &view);
+  assert(view.show_voice_overlay && !view.show_bubble && state.session_queue_count == 1);
+  state.session_voice_active = false;
+  state.voice_feedback.phase = PET_VOICE_DRAFT;
+  pet_p4_build_view_model(&state, &view);
+  assert(view.show_voice_overlay);
+  state.approval_active = true;
+  pet_p4_build_view_model(&state, &view);
+  assert(!view.show_voice_overlay);
+  state.approval_active = false;
+
+  // An unconfirmed outcome dismisses the overlay and restores the Agent view.
+  state.voice_feedback.phase = PET_VOICE_UNKNOWN;
+  pet_p4_build_view_model(&state, &view);
+  assert(!view.show_voice_overlay && view.show_bubble);
+  state.voice_feedback.phase = PET_VOICE_ERROR;
+  pet_p4_build_view_model(&state, &view);
+  assert(view.show_voice_overlay);
+
+  state.voice_feedback.phase = PET_VOICE_IDLE;
+  state.session_voice_active = true;
   state.session_queue_count = 0;
   pet_p4_build_view_model(&state, &view);
   assert(view.show_voice_overlay);

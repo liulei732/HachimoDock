@@ -1,6 +1,6 @@
 /**
  * [Input] Browser API-configuration changes plus provider/ASR status values.
- * [Output] Shared API configuration event, editable LLM defaults, provider/endpoint-specific saved key masks, fixed ASR/TTS 2.0 defaults, and readiness helpers.
+ * [Output] Shared API configuration event, editable LLM defaults, provider/endpoint-specific saved models and key masks, fixed ASR/TTS 2.0 defaults, and readiness helpers.
  * [Pos] config helper in pc/src/lib
  * [Sync] If this file changes, update this header and `pc/src/.folder.md`.
  */
@@ -32,7 +32,7 @@ function llmPreset(providerId) {
 export const DEFAULT_TTS_RESOURCE_ID = "seed-tts-2.0";
 
 function restoreLlmCredential(current) {
-  const endpoint = (current.llmBaseUrl || "").trim().replace(/\/+$/, "") || "https://api.deepseek.com";
+  const endpoint = (current.llmBaseUrl || "").trim().replace(/\/+$/, "");
   const scope = current.llmProvider === "custom" ? `custom:${endpoint}` : current.llmProvider;
   const masked = current.llmApiKeyMasks?.[scope] || "";
   return { ...current, llmApiKey: "", llmApiKeyMasked: masked, llmConfigured: Boolean(masked),
@@ -43,15 +43,19 @@ function restoreLlmCredential(current) {
 export function selectLlmProvider(current, providerId) {
   if (current.llmProvider === providerId) return current;
   const preset = llmPreset(providerId);
-  return restoreLlmCredential({ ...current, llmProvider: providerId,
-    llmBaseUrl: preset?.baseUrl || current.llmCustomBaseUrl || "", llmModel: preset?.model || "" });
+  const baseUrl = preset?.baseUrl || current.llmCustomBaseUrl || "";
+  const scope = providerId === "custom" ? "custom:" + baseUrl.trim().replace(/\/+$/, "") : providerId;
+  return restoreLlmCredential({ ...current, llmProvider: providerId, llmBaseUrl: baseUrl,
+    llmModel: current.llmModels?.[scope] || preset?.model || "" });
 }
 
 export function changeLlmEndpoint(current, baseUrl) {
   const normalize = (value) => (value || "").trim().replace(/\/+$/, "");
   const changed = current.llmProvider === "custom" && normalize(current.llmBaseUrl) !== normalize(baseUrl);
   const next = { ...current, llmBaseUrl: baseUrl };
-  return changed ? restoreLlmCredential(next) : next;
+  if (!changed) return next;
+  const savedModel = current.llmModels?.["custom:" + normalize(baseUrl)];
+  return restoreLlmCredential({ ...next, llmModel: savedModel ?? current.llmModel });
 }
 
 export function describeLlmPreset(providerId, model) {

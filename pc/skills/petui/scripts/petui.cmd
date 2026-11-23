@@ -1,5 +1,7 @@
 @echo off
 setlocal DisableDelayedExpansion
+set "desktop="
+if not defined USERPROFILE goto missing
 set "workspace=%USERPROFILE%\.claw-pet\authoring"
 if exist "%workspace%\desktop-path" set /p "desktop=" < "%workspace%\desktop-path"
 if not defined desktop goto missing

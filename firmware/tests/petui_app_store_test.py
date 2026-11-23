@@ -12,7 +12,7 @@ def test_native_cache_scope_preserves_all_save_generations_audio_fault_and_recla
 def test_owned_pending_preserves_complete_save_suite_and_rejects_nested_flush(tmp_path):
     _run_private_save_generations(tmp_path, True, owned_pending=True)
 
-def _run_private_save_generations(tmp_path, native_cache, owned_pending=False, wide_program=False):
+def _run_private_save_generations(tmp_path, native_cache, owned_pending=False, wide_program=False, record_driver=None, extra_sources=(), record_cflags=()):
     stubs={
         'esp_attr.h':'#define EXT_RAM_BSS_ATTR\n',
         'esp_timer.h':'#include <stdint.h>\nstatic int64_t clock_us;\nstatic int64_t esp_timer_get_time(void){return clock_us;}\n',
@@ -181,7 +181,13 @@ int main(void){
  assert(pet_fs_activity_idle_epoch(&before_audio));save_t deferred=saves[0];
  flush_one();flush_one();assert(access(path,F_OK)&&!memcmp(&deferred,&saves[0],sizeof(deferred)));
  assert(pet_fs_activity_idle_epoch(&after_audio)&&after_audio==before_audio);
- playback=0;flush_one();assert(!access(path,F_OK)&&!saves[0].dirty);
+ uint64_t age=0;
+ assert(!strcmp(pet_app_store_cached_state("no-cached-slot",&age),"unknown")&&!age);
+ clock_us+=120000000;flush_one();
+ assert(!strcmp(pet_app_store_cached_state("garden",&age),"pending")&&age>=120000);
+ assert(access(path,F_OK));playback=0;flush_one();assert(!access(path,F_OK)&&!saves[0].dirty);
+ assert(!strcmp(pet_app_store_cached_state("garden",&age),"clean")&&!age);
+ clock_us-=120000000;
  assert(pet_app_store_update("garden","{\"count\":99}"));
  assert(pet_app_store_update("garden","{\"count\":2}"));clock_us=62000000;flush_one();
  memset(saves,0,sizeof(saves));assert(pet_app_store_read("garden",out)&&!strcmp(out,"{\"count\":2}"));
@@ -213,6 +219,47 @@ int main(void){
  assert(pet_app_store_forget_with_lease("epoch-case",delete_io.lease));save_io_end(&delete_io);
  memset(saves,0,sizeof(saves));assert(pet_app_store_load("epoch-case",out)==PET_APP_STORE_EMPTY);
  assert(!pet_app_store_forget_with_lease("epoch-case",(pet_resource_lease_t){0}));
+ #if PET_COMPONENT_PROGRAM_ENABLED
+ // Cold clear covers the separate program record domain even after an update
+ // to another app type. A pinned live owner blocks clearing its checkpoint.
+ assert(pet_app_store_load_scoped(PET_PROGRAM_SAVE_DOMAIN,"record-log",out)==PET_APP_STORE_EMPTY);
+ assert(pet_app_store_update_scoped(PET_PROGRAM_SAVE_DOMAIN,"record-log","row-one"));
+ clock_us+=31000000;for(int k=0;k<40;k++)flush_one();
+ assert(pet_app_store_load_scoped(PET_PROGRAM_SAVE_DOMAIN,"record-other",out)==PET_APP_STORE_EMPTY);
+ assert(pet_app_store_update_scoped(PET_PROGRAM_SAVE_DOMAIN,"record-other","private"));
+ clock_us+=31000000;for(int k=0;k<40;k++)flush_one();
+ pet_app_store_pin_t record_pin={0};
+ assert(pet_app_store_pin_scoped(PET_PROGRAM_SAVE_DOMAIN,"record-log",&record_pin,&record_pin));
+ assert(save_io_begin(&delete_io,NULL));
+ assert(!pet_app_store_forget_with_lease("record-log",delete_io.lease));save_io_end(&delete_io);
+ assert(pet_app_store_unpin(&record_pin));
+ memset(saves,0,sizeof(saves));
+ assert(save_io_begin(&delete_io,NULL));
+ assert(pet_app_store_forget_with_lease("record-log",delete_io.lease));save_io_end(&delete_io);
+ memset(saves,0,sizeof(saves));
+ assert(!pet_app_store_update_scoped(PET_PROGRAM_SAVE_DOMAIN,"record-log","stale writer"));
+ assert(pet_app_store_load_scoped(PET_PROGRAM_SAVE_DOMAIN,"record-log",out)==PET_APP_STORE_EMPTY);
+ assert(pet_app_store_load_scoped(PET_PROGRAM_SAVE_DOMAIN,"record-other",out)==PET_APP_STORE_VALUE&&!strcmp(out,"private"));
+ // Exercise the public cold delete with opposite domain layouts. A mask from
+ // the other journal would hide the live epoch or spuriously create one.
+ for(unsigned older_domain=0;older_domain<=1;older_domain++){
+   const char *id=older_domain?"mask-program":"mask-ordinary";
+   memset(saves,0,sizeof(saves));assert(save_io_begin(&delete_io,NULL));
+   uint32_t epoch;unsigned marker_slot;
+   assert(write_forget_epoch(id,older_domain,&epoch,delete_io.lease,0)&&epoch==1);
+   assert(write_forget_epoch(id,older_domain,&epoch,delete_io.lease,0)&&epoch==2);
+   char stale[64];epoch_path_for(id,older_domain,0,3,stale);
+   FILE *left=fopen(stale,"wb");assert(left&&fclose(left)==0);
+   assert(pet_app_store_forget_with_lease(id,delete_io.lease));
+   assert(read_epoch(id,older_domain,&epoch,&marker_slot,delete_io.lease,false,0)&&epoch==3);
+   assert(access(stale,F_OK)!=0&&errno==ENOENT);
+   assert(read_epoch(id,1-older_domain,&epoch,&marker_slot,delete_io.lease,false,0));
+   // Ordinary domain always commits. A cold empty program domain stays empty.
+   assert(epoch==older_domain);
+   if(!older_domain)assert(marker_slot==4);
+   save_io_end(&delete_io);
+ }
+ #endif
  // Return the original test identity to the first cache slot for its explicit
  // concurrent-load assertions. All existing generations remain unchanged.
  memset(saves,0,sizeof(saves));assert(pet_app_store_read("garden",out));
@@ -265,8 +312,19 @@ int main(void){
  assert(!pet_fs_activity_idle_epoch(&epoch));pet_fs_activity_end(&second);
  assert(pet_fs_activity_idle_epoch(&epoch)&&epoch==previous+4);
  save_t failed={.id="failed-write",.json="{}"};path_for(failed.id,0,path);assert(!mkdir(path,0700));
- save_io_t failed_io={0};assert(save_io_begin(&failed_io,NULL));
- assert(!write_slot(&failed,failed_io.lease));save_io_end(&failed_io);assert(pet_fs_activity_idle_epoch(&previous)&&previous==epoch+2);
+ save_io_t failed_io={0};
+#if PET_P4_SAVE_TRACE_DETACHED
+ assert(save_io_begin(&failed_io,NULL));
+ assert(!write_slot(&failed,failed_io.lease));save_io_end(&failed_io);
+ assert(pet_fs_activity_idle_epoch(&previous)&&previous==epoch);
+ save_pending_scope_t failed_owner={0};assert(save_pending_begin(&failed_owner));
+#endif
+ assert(save_io_begin(&failed_io,NULL));
+ assert(!write_slot(&failed,failed_io.lease));save_io_end(&failed_io);
+#if PET_P4_SAVE_TRACE_DETACHED
+ save_pending_finish(&failed_owner);assert(!save_pending_scope);
+#endif
+ assert(pet_fs_activity_idle_epoch(&previous)&&previous==epoch+2);
  // Cold admission busy is not an empty save or a poisoned cache. A trusted
  // outer package load may borrow exactly its own active storage lease.
  memset(saves,0,sizeof(saves));save_io_t outer={0};assert(save_io_begin(&outer,NULL));before=reads;
@@ -560,14 +618,20 @@ static save_load_workspace_t *save_load_workspace_acquire(void){
  assert(!saves[lookup_slot(0,"oom-cold")].loading&&!live_load_alloc);memset(saves,0,sizeof(saves));
 """)
         harness.write_text(code)
+    if record_driver is not None:
+        harness.write_text(harness.read_text().replace("int main(void){","int original_save_suite(void){") + record_driver)
     program_sources=[ROOT/'main'/('pet_p4_program_'+name+'.c') for name in ('core','image','runtime','host','store','persistence','activation')]
     resource_device=ROOT/'main/pet_p4_resources_device.c'
     for reviewed in (0,1):
         exe=tmp_path/f'save-{reviewed}';directory=tmp_path/f'files-{reviewed}';directory.mkdir()
         flags=['-DPET_APP_SCOPED_RECLAIM_REVIEWED=1'] if reviewed else []
+        if record_driver is not None:
+            flags+=['-DPET_COMPONENT_PROGRAM_ENABLED=1',*record_cflags]
         if wide_program:
             flags+=['-DPET_P4_PROGRAM_V2=1','-DPET_COMPONENT_PROGRAM_ENABLED=1','-DPET_P4_TEXT_TABLE=1','-DPET_P4_APP_DIRTY_CACHE=1']
-        subprocess.run(['cc','-std=c11','-D_POSIX_C_SOURCE=200809L','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',*flags,'-DPET_APP_SAVE_ROOT="."','-I',str(tmp_path),'-I',str(ROOT/'main'),'-I',str(ROOT/'tests'),str(harness),str(ROOT/'main/pet_p4_resources.c'),str(resource_device),*map(str,program_sources),'-o',str(exe)],check=True)
+        if extra_sources:
+            flags.extend(['-I'+str(ROOT/'tests/vendor/cjson'),'-Wno-error=deprecated-declarations'])
+        subprocess.run(['cc','-std=c11','-D_POSIX_C_SOURCE=200809L','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',*flags,'-DPET_APP_SAVE_ROOT="."','-I',str(tmp_path),'-I',str(ROOT/'main'),'-I',str(ROOT/'tests'),str(harness),str(ROOT/'main/pet_p4_file_cleanup.c'),str(ROOT/'main/pet_p4_resources.c'),str(resource_device),*map(str,program_sources),*map(str,extra_sources),'-o',str(exe)],check=True)
         subprocess.run([str(exe)],cwd=directory,check=True)
     if wide_program:
         stack_source=tmp_path/'save-stack.c'

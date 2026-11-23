@@ -13,7 +13,7 @@ PC 订阅用同一个 `data.source`，具体传输由客户端选择。USB 优�
 
 能在设备完成的组件使用设备时钟、输入、存档和数据宿主。设备联网组件验收要覆盖初次配置、断网恢复和重启，整个过程可以在没有活动 PC 客户端时运行。包含本机数据的组件可同时保留设备侧功能，只有读取、同步或执行电脑动作的部分调用 PC。
 
-这里的快照是由 PC 主动推送的列表数据，也可以持续刷新。旧版交互式 PC 应用的实例和动作、`app/snapshot`、设备发起的 PC Fetch/`data.refresh` 及 PC 媒体控制或音频流仍走 USB。声明 `fetch.*` 只标识数据源，现有 Fetch 宿主仍负责启用、主机授权和发布归属。设备直接获取公开音频是单独的能力。
+这里的快照是由 PC 主动推送的列表数据，也可以持续刷新。支持配对应用通道的 WiFi6 与客户端可经受信 Wi-Fi 交换交互式 PC 应用事件与 `app/snapshot`，旧端用 USB。设备发起的 PC `widget/data/refresh` 使用 USB，PC 媒体控制和音频需单独检查其通道。声明 `fetch.*` 只标识数据源，现有 Fetch 宿主仍负责启用、主机授权和发布归属。设备直接获取公开音频是单独的能力。
 
 ## WiFi6 设备直连
 
@@ -42,12 +42,12 @@ PC 仍管理最多 20 个代码。确认精确能力后，PC 将规范化列表�
 | `stocks.watchlist` | PC 组件详情管理最多 20 只股票，中文/代码联想、添加、删除、排序 | 正常每 2 秒批量取价并推送；失败退避；断连 30 秒标过期 |
 | `computer.status` / `todos.upcoming` | 本机采样 / 本机待办（见 `pc/docs/local-live-widgets.md`） | 每 2 秒，30 秒过期 |
 | `location.current` | PC 按共享设置投影城市级位置 | 变化时推送，定期续期，30 秒过期后清除展示 |
-| `github.me` | **鉴权提供器**：用户在 PC 组件详情填入自己创建的 GitHub OAuth App client_id，完成设备码授权后读取 `api.github.com/user` | 120 秒 TTL，失败保留上次结果并退避 |
+| `github.me` | **鉴权提供器**：兼容已有授权的 PC，在本机读取 `api.github.com/user` | 120 秒 TTL，失败保留上次结果并退避 |
 | `codex.usage` | **接口契约尚未确认，提供器未启用**：组件会显示"接口契约尚未确认"，不猜测端点、不冒充其他客户端 | — |
 
 鉴权提供器（`pc/src-tauri/src/auth_provider.rs`）的规则：端点与主机名是 PC 内置描述符，资源包只写
 `data.source`；令牌只存在这台电脑（macOS/Linux 为 0600 私有文件，Windows 为系统凭据库），不进包、
-不进快照、不进日志、不下发设备；设备码流程由用户在 PC 面板逐步完成，不自动打开浏览器、不循环轮询；
+不进快照、不进日志、不下发设备；用户可在 PC 组件详情移除本机已有授权；
 未授权显示"尚未授权"，上游失败显示上次结果并标过期。新提供器必须先确认端点、鉴权方式与使用条款。
 
 PC 首次配置默认港股小米 01810、阿里 09988，已有列表及用户主动删空不覆盖。
@@ -64,7 +64,7 @@ PC 首次配置默认港股小米 01810、阿里 09988，已有列表及用户�
 - PC 快照基本声明为 `source` 与 `page_var`，后者引用声明的 int 变量，通常从 0 开始。过滤、选择、刷新动作按对应能力声明。
 - 标准 transition 对页码增减或归零；摇杆左右翻页、主操作回首页是行情适用的输入。
 - `dashboard` 使用 clean/tool，包含题材对应的 title/footer；预览显示“等待数据”，不用示例价格。
-- 不混用 scene/game，不放请求脚本、URL、refreshInterval、rows 或用户名单；不靠 tick 伪造更新。
+- PC 命名来源不混用 scene/game，不放请求脚本、URL、refreshInterval、rows 或用户名单；设备 `wifi.feed` 的 URL 与映射遵循设备联网契约；不靠 tick 伪造更新。
 - 设备按实际页数循环，负页码向后翻页；仅设置 `page_var` 而没有有效输入会造成后面的数据不可达。
 - 现有渲染布局/颜色不由组件 CSS 配置：label/meta 正常色，value/detail 用 tone；日期来自可选 date。
 
@@ -99,7 +99,7 @@ PC 首次配置默认港股小米 01810、阿里 09988，已有列表及用户�
 
 - `usbCount` 和 `wifiCount` 是本次开机中该来源被固件接受的累计帧数。`fresh` 说明采集诊断时最新的 PC 快照是否仍在 TTL 内，两种传输共用这份时效。
 - 无对应来源、旧诊断缺少计数、无效计数或范围不匹配时，`status` 为 `unknown`，接收证据为 `null`。无法读取或解析输入文件、runtime 缺少有效声明时，命令以错误退出。
-- `declaredRoute` 来自 runtime 中的来源声明。`wifi.feed` 和内置 `news.hn` 归为 `device-https`。`stocks.watchlist` 为 `pc-snapshot-or-device-https`。设备直连取数需要独立的实际能力与时效证据，工具把 `deviceHttps` 保持为 `unknown`。版本号和产品配置不会产生收包证据。
+- `declaredRoute` 来自 runtime 中的来源声明。公开或 Bearer HTTPS feed 与有效的 HN 宿主投影归为 `device-https`；匿名和私有 MQTT feed 归为 `device-mqtt-tls`，`deviceMqtt` 为 `unknown`。`stocks.watchlist` 为 `pc-snapshot-or-device-https`。设备直连取数需要独立的实际能力与时效证据，工具把 `deviceHttps` 保持为 `unknown`。未识别的来源为 `check-provider`，未启用的提供器为 `provider-unavailable`。单独运行 data-link 时只有 runtime，没有 PC 应用声明；`fetch.*` 的发布资格须另用 compatibility 核验完整包。
 - 输出仅含声明来源和接收元数据。保留诊断的采集出处；本地文件与 ID 匹配本身不认证文件。核对 Wi-Fi 实际收包可在同板同启动、断开 USB 后比较两次诊断，观察 `wifiCount` 增长与 `fresh=true`。PC 收包不能代替设备直连数据或屏幕渲染验收。
 
 ## 验证与交付

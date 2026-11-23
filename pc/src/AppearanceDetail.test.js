@@ -31,7 +31,7 @@ test("appearance detail stays focused on preview, deletion, and gallery navigati
   const source = readSource("AppearanceDetail.jsx");
   const css = readSource("styles.css");
 
-  assert.match(source, /返回宠物图册/);
+  assert.match(source, /返回形象画廊/);
   assert.match(source, /删除形象/);
   assert.doesNotMatch(source, /应用到设备/);
   assert.doesNotMatch(source, /detail-apply-/);
@@ -63,13 +63,13 @@ test("appearance detail guards deletion with progress and error feedback", () =>
   assert.match(source, /删除形象失败/);
 });
 
-test("appearance USB transfers expose a real shared-button cancel action", () => {
+test("appearance transfers cancel only their own request", () => {
   const source = readSource("AppearanceDetail.jsx");
   assert.match(source, /APPEARANCE_SYNC_CANCELLED_MESSAGE/);
-  assert.match(source, /invoke\("usb_cancel_appearance_sync"\)/);
+  assert.match(source, /await cancelAppearance\(\)/);
   assert.match(source, /handleCancelAppearanceSync/);
   assert.match(source, /variant="danger"/);
-  assert.match(source, /aria-label="中断 USB 形象传输"/);
+  assert.match(source, /aria-label="中断形象传输"/);
   assert.match(source, /中断传输/);
 });
 
@@ -133,7 +133,7 @@ test("appearance detail uses a preview-first workspace with a unified inspector 
 
 test("global audio downlink is separate from video transfer and has persistent reminders", () => {
  const source=readSource("GlobalAudioCuesPanel.jsx");
- assert.match(source,/globalAudioDirty/);assert.match(source,/markGlobalAudioDirty\(false,revision\)/);
+ assert.match(source,/globalAudioDirty/);assert.match(source,/confirmGlobalAudio\(target\.id,sentRevision\)/);
  assert.match(source,/audioOnly:true/);assert.match(source,/下发音效/);
  assert.doesNotMatch(source,/prepare_p4_appearance|replaceFamilyVideo/);
 });
@@ -160,7 +160,8 @@ test("appearance detail can regenerate one selected state and replace it on the 
   assert.match(source, /<AvatarWizardStep2[\s\S]*startLabel="生成并替换当前状态"/);
   assert.match(source, /生成并替换当前状态/);
   assert.match(source, /替换到板端/);
-  assert.match(source, /usb_sync_appearance/);
+  assert.match(source, /useAppearanceDelivery\(\s*device\?\.usb, device\?\.wifi/);
+  assert.match(source, /const message = await sendAppearance\(\)/);
   assert.match(source, /replaceFamilyVideo\(\{[\s\S]*appearanceId: record\.id,[\s\S]*family: activeRecord\.family/);
   assert.match(source, /runSingleFamilyVideo\(\{[\s\S]*family: activeRecord\.family/);
   assert.match(source, /singleStateProgressFromPipeline/);

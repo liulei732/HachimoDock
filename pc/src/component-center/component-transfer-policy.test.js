@@ -1,7 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {syncAudioPreflight,deviceDeletePolicy,componentTransferError,componentCommitOutcomeUnknown} from './component-transfer-policy.js';
+import {canRepairThumbnail,syncAudioPreflight,deviceDeletePolicy,componentTransferError,componentCommitOutcomeUnknown,verifyWifiInstall} from './component-transfer-policy.js';
+
+test('thumbnail repair requires a local cover, live installed version and capable transport', () => {
+ const component={id:'example',version:'1',libraryPath:'/fixture',coverDataUrl:'data:image/png;base64,abc'};
+ const inventory={scope:'board',freshness:'live',items:[{id:'example',version:'1'}]};
+ const usb={capabilities:{widgetCenterThumb:'p4t-64x48-v1',widgetTransfer:'p4-widget-files-v2'}};
+ const allowed=(c=component,i=inventory,t='usb',u=usb,w={})=>canRepairThumbnail(c,i,'board',{transport:t},u,w);
+ assert.ok(allowed());
+ assert.ok(allowed(component,{...inventory,items:[{id:'example'}]}));
+ assert.ok(allowed(component,inventory,'wifi',null,{centerThumb:true}));
+ assert.ok(!allowed(component,inventory,'wifi',null,{}));
+ assert.ok(!allowed(component,inventory,'ssh'));
+ assert.ok(!allowed(component,inventory,'usb',{capabilities:{widgetCenterThumb:true}}));
+ assert.ok(!allowed({...component,coverDataUrl:null}));
+ assert.ok(!allowed({...component,version:'2'}));
+ assert.ok(!allowed(component,{...inventory,scope:'other'}));
+ assert.ok(!allowed(component,{...inventory,freshness:'cached'}));
+ assert.ok(!allowed(component,{...inventory,items:[]}));
+});
 
 test('sync audio preflight issues only a readonly correlated status request and preserves voice block',async()=>{
  const calls=[];
@@ -60,4 +78,23 @@ test('USB automatically repeats only pre-write deferrals for the same staged pac
  assert.match(commit,/ok == Some\(false\) && error_code == "commit_storage_deferred"[\s\S]*?<= retry_window[\s\S]*?continue;/);
  assert.match(commit,/None => \{\s*return match status\(\) \{\s*Ok\(WidgetTransferStatus::Committed\) => completed\(\),\s*_ => Err/);
  assert.equal(commit.match(/\bcontinue;/g)?.length, 1);
+});
+
+test('Wi-Fi commit uncertainty reads only the same live boot and confirms only a changed version', async () => {
+  for (const error of ['无线安装提交结果未确认，请查看设备组件列表。','安装结果未确认。请查看设备组件列表，再决定是否重试。']) {
+    assert.equal(componentCommitOutcomeUnknown(error),true);
+  }
+  assert.equal(componentCommitOutcomeUnknown('无线组件传输已中断，请检查连接。'),false);
+  const check={scope:'wifi:A:boot1',id:'count',version:'2',previousVersion:'1'};
+  const item={id:'count',version:'2'};
+  const snapshot={scope:check.scope,items:[item],freshness:'live'};
+  let scope=check.scope, reads=0;
+  const read=async()=>{reads++;return snapshot;};
+  assert.equal(await verifyWifiInstall(check,()=>scope,read),item);
+  assert.equal(reads,1);
+  await assert.rejects(verifyWifiInstall({...check,previousVersion:'2'},()=>scope,read),/同版本/);
+  await assert.rejects(verifyWifiInstall(check,()=>scope,async()=>({...snapshot,items:[]})),/尚未确认/);
+  await assert.rejects(verifyWifiInstall(check,()=>scope,async()=>({...snapshot,freshness:'stale'})),/最新/);
+  await assert.rejects(verifyWifiInstall(check,()=>scope,async()=>{scope='wifi:A:boot2';return snapshot;}),/最新/);
+  await assert.rejects(verifyWifiInstall(check,()=>scope,()=>assert.fail('must not read a different device')),/设备或连接已变化/);
 });

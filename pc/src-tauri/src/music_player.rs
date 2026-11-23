@@ -125,6 +125,7 @@ struct Service {
     local_only: bool,
     view_identity: Option<Arc<Mutex<String>>>,
     job_view_identity: Mutex<String>,
+    component_route: Mutex<Option<crate::lan_agent::component_av::Binding>>,
     usb: UsbSerialManager,
     data: Mutex<Snapshot>,
     tracks: Mutex<HashMap<String, Track>>,
@@ -218,11 +219,26 @@ async fn get_stream(raw: &str) -> Result<reqwest::Response, String> {
     Err("音源跳转次数过多".into())
 }
 impl Service {
+    fn board(&self)->crate::lan_agent::component_av::Board{
+        crate::lan_agent::component_av::board_status(&self.usb,self.component_route.lock().unwrap().as_ref())
+    }
+    fn send_media(&self,board:&str,topic:&str,mut payload:Value)->Result<Value,String>{
+        if !self.local_only{return self.usb.media_request(board,topic,payload);}
+        let route=self.component_route.lock().unwrap().clone().ok_or("请先在设备打开本地曲库")?;
+        let session=self.data.lock().unwrap().session_id.clone();
+        if route.board()!=board || session.is_empty() || payload.get("sessionId").is_some_and(|s|s!=&session){
+            return Err("媒体视图或播放会话已更换".into());
+        }
+        payload["sessionId"]=json!(session);
+        let ack=route.media(&self.usb,topic,payload)?;
+        if topic=="media/stop" {let mut state=self.data.lock().unwrap();if state.session_id==session{state.session_id.clear();}}
+        Ok(ack)
+    }
     fn request(&self, board: &str, topic: &str, mut payload: Value) -> Result<Value, String> {
         let _transport = self.transport.lock().unwrap();
         let started = Instant::now();
         if self.local_only{payload["source"]=self.source_id.clone().into();payload["hostInstance"]=self.job_view_identity.lock().unwrap().clone().into();}
-        let result = self.usb.media_request(board, topic, payload);
+        let result = self.send_media(board, topic, payload);
         #[cfg(test)]
         if topic == "media/chunk" {
             if let Ok(ack) = &result {
@@ -255,11 +271,11 @@ impl Service {
             if self.local_only{payload["hostInstance"]=self.job_view_identity.lock().unwrap().clone().into();}
         }
         if !self.source_id.is_empty() { payload["source"] = self.source_id.clone().into(); }
-        self.usb.media_request(board, "media/begin", payload)
+        self.send_media(board, "media/begin", payload)
     }
     fn snapshot(&self) -> Snapshot {
         let mut s = self.data.lock().unwrap().clone();
-        s.connected = self.usb.status().connected;
+        s.connected = self.board().connected;
         s
     }
     fn api(&self, params: &[(&str, String)], cached: bool) -> Result<Value, String> {
@@ -427,7 +443,13 @@ impl Service {
             if current.is_empty()||view_hint.is_some_and(|expected|expected!=current){return Err("媒体视图已经退出或更换，未开始播放".into());}current
         }else{String::new()};
         if self.local_only && track.source != "local" { return Err("此服务仅接受由 PC 明确导入的本地音频".into()); }
-        let board = self.usb.status();
+        let binding=if self.local_only{
+            let id=self.source_id.strip_prefix("app.").ok_or("组件标识无效")?;
+            let route=crate::lan_agent::component_av::Binding::open(id,&self.usb)?;
+            if route.instance!=desired_view{return Err("设备已经重新打开曲库".into());}
+            Some(route)
+        }else{None};
+        let board=crate::lan_agent::component_av::board_status(&self.usb,binding.as_ref());
         if !board.connected {
             return Err("请连接哈基米设备后播放".into());
         }
@@ -443,6 +465,15 @@ impl Service {
         }
         let voice = crate::realtime_chat::status().active;
         if self.local_only && voice { return Err("语音正在使用，请结束后再播放".into()); }
+        let _wire=self.transport.lock().unwrap();
+        if self.local_only {
+            let old=self.data.lock().unwrap().session_id.clone();
+            if let Some(route)=self.component_route.lock().unwrap().clone(){
+                if !old.is_empty() && route.local(&self.usb) && route.instance==desired_view {
+                    route.media(&self.usb,"media/stop",json!({"source":route.source,"hostInstance":route.instance,"sessionId":old}))?;
+                }
+            }
+        }
         let generation = {
             let mut s = self.data.lock().unwrap();
             if expected.is_some_and(|g| !self.alive(g)) {
@@ -450,6 +481,7 @@ impl Service {
             }
             self.stop_generation();
             *self.job_view_identity.lock().unwrap()=desired_view;
+            *self.component_route.lock().unwrap()=binding;
             let generation = self.generation.load(Ordering::SeqCst);
             s.session_id.clear();
             if !s.queue.iter().any(|t| t.key == track.key) {
@@ -472,6 +504,7 @@ impl Service {
             self.voice_handoff.store(voice, Ordering::SeqCst);
             generation
         };
+        drop(_wire);
         crate::realtime_chat_log::record("", "music_selection", json!({
             "generation":generation,"trackRef":diagnostic_track_ref(&track.key),"state":if voice {"queued"} else {"loading"}
         }));
@@ -1039,7 +1072,7 @@ impl Service {
 pub fn configure(dir: PathBuf, usb: UsbSerialManager) {
     if !AVAILABLE { return; }
     let s = Arc::new(Service {
-        source_id: String::new(), local_only: false,view_identity:None,job_view_identity:Mutex::new(String::new()),
+        source_id: String::new(), local_only: false,view_identity:None,job_view_identity:Mutex::new(String::new()),component_route:Mutex::new(None),
         usb,
         data: Mutex::new(Snapshot::default()),
         tracks: Mutex::new(HashMap::new()),
@@ -1208,14 +1241,14 @@ fn execute_with_view(s: &Arc<Service>, input: Value, view_hint:Option<&str>) -> 
                 state.state = "interrupted".into();
                 state.message = "已取消播放准备".into();
             } else {
-                let board = s.usb.status().board_device_id;
+                let board = s.board().board_device_id;
                 let ack = s.request(&board, "media/control", json!({"operation":op}))?;
                 s.update_ack(&ack, 0, s.generation.load(Ordering::SeqCst))?;
             }
         }
         "stop" => {
             s.stop_generation();
-            let board = s.usb.status();
+            let board = s.board();
             if board.connected {
                 if let Err(error) = s.request(&board.board_device_id, "media/stop", json!({})) {
                     let mut state = s.data.lock().unwrap();
@@ -1239,8 +1272,8 @@ fn execute_with_view(s: &Arc<Service>, input: Value, view_hint:Option<&str>) -> 
                 .as_u64()
                 .filter(|n| *n <= 100)
                 .ok_or("音量需为 0–100")?;
-            let board = s.usb.status().board_device_id;
-            if s.usb.status().connected {
+            let board = s.board().board_device_id;
+            if s.board().connected {
                 s.request(
                     &board,
                     "media/control",
@@ -1434,7 +1467,7 @@ pub(crate) struct LocalPlayer(Arc<Service>);
 impl LocalPlayer {
     pub(crate) fn open(id:&str,dir:PathBuf,usb:UsbSerialManager,view_identity:Arc<Mutex<String>>)->Result<Self,String>{
         if !crate::component_extension::valid_id(id)||id.len()>43{return Err("媒体组件身份无效".into());}
-        let s=Arc::new(Service{source_id:format!("app.{id}"),local_only:true,view_identity:Some(view_identity),job_view_identity:Mutex::new(String::new()),usb,data:Mutex::new(Snapshot::default()),tracks:Mutex::new(HashMap::new()),local:Mutex::new(HashMap::new()),api:Mutex::new(ApiCache::default()),local_lyrics:Mutex::new(None),operations:Mutex::new(()),transport:Mutex::new(()),generation:AtomicU64::new(0),voice_handoff:AtomicBool::new(false),dir});
+        let s=Arc::new(Service{source_id:format!("app.{id}"),local_only:true,view_identity:Some(view_identity),job_view_identity:Mutex::new(String::new()),component_route:Mutex::new(None),usb,data:Mutex::new(Snapshot::default()),tracks:Mutex::new(HashMap::new()),local:Mutex::new(HashMap::new()),api:Mutex::new(ApiCache::default()),local_lyrics:Mutex::new(None),operations:Mutex::new(()),transport:Mutex::new(()),generation:AtomicU64::new(0),voice_handoff:AtomicBool::new(false),dir});
         let path=s.dir.join("music-library.json");
         let exists=match std::fs::symlink_metadata(&path){
             Ok(metadata)=>{if !metadata.file_type().is_file()||metadata.len()>LOCAL_TEXT_BYTES as u64{return Err("曲库无效，原数据保留".into());}true},
@@ -1501,7 +1534,7 @@ impl LocalPlayer {
             }
             if method=="volume"&&!candidate.session_id.is_empty(){
                 self.0.check_local_view(Some(expected_view))?;
-                let board=self.0.usb.status();
+                let board=self.0.board();
                 if !board.connected{return Err("设备已断开，音量未发送".into());}
                 let ack=self.0.request(&board.board_device_id,"media/control",json!({"operation":"volume","volume":candidate.volume}))?;
                 if ack["ok"]==false{return Err(ack["message"].as_str().unwrap_or("设备拒绝音量操作").into());}
@@ -1912,7 +1945,7 @@ mod tests {
     }
     fn test_service(dir: &std::path::Path) -> Arc<Service> {
         Arc::new(Service {
-            source_id: String::new(), local_only: false,view_identity:None,job_view_identity:Mutex::new(String::new()),
+            source_id: String::new(), local_only: false,view_identity:None,job_view_identity:Mutex::new(String::new()),component_route:Mutex::new(None),
             usb: UsbSerialManager::new(),
             data: Mutex::new(Snapshot::default()),
             tracks: Mutex::new(HashMap::new()),

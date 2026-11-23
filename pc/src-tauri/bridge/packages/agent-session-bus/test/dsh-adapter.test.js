@@ -7,7 +7,7 @@ const { spawnSync } = require('node:child_process')
 const { createCapabilityStore } = require('../../../../../../integrations/dsh-hachimodock/capability')
 const token = 'a'.repeat(64), epoch = 'b'.repeat(64)
 // Capture only the production helper's fixed diagnostic schema. Nothing from
-// raw PowerShell stderr (which may include paths) is forwarded to CI output.
+// raw native helper stderr (which may include paths) is forwarded to CI output.
 function fixtureAcl(t, operation, target) {
   return windowsAcl(operation, target, { spawn(executable, args, options) {
     const result = spawnSync(executable, args, options)

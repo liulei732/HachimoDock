@@ -67,7 +67,16 @@ def _profile_cpp(profile):
 
 def _compile_arguments(database, output):
     entries = json.loads(database.read_text())
-    matches = [e for e in entries if Path(e['file']).resolve() == SOURCE.resolve()]
+    def matches_source(entry):
+        candidate = (Path(entry['directory']) / entry['file']).resolve()
+        if candidate == SOURCE.resolve():
+            return True
+        # Release builds compile a staged source tree. Require both the exact
+        # firmware-relative path and identical bytes before reusing its flags.
+        return (candidate.parts[-3:] == SOURCE.parts[-3:]
+                and candidate.is_file() and candidate.read_bytes() == SOURCE.read_bytes())
+
+    matches = [entry for entry in entries if matches_source(entry)]
     assert len(matches) == 1, 'database must contain the actual production source exactly once'
     entry = matches[0]
     argv = entry.get('arguments') or shlex.split(entry['command'])

@@ -4,6 +4,9 @@
  * [Pos] Tauri-side cloud ASR provider for device push-to-talk.
  */
 
+use crate::model_issue::{self, ASR};
+use crate::voice_chat_settings::{buffered_speech, official_mimo_endpoint, speech_value_or_default, MIMO_ROOT, MIMO_ASR};
+
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -41,11 +44,14 @@ const MACOS_CONFIG_FILE_NAME: &str = "volcengine-device-asr.json";
 static MACOS_CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const FINAL_TIMEOUT: Duration = Duration::from_secs(8);
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const MAX_FINAL_WAIT: Duration = UPLOAD_TIMEOUT.saturating_add(Duration::from_secs(1));
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const AUDIO_INPUT_TIMEOUT: Duration = Duration::from_secs(8);
 const PCM_SAMPLE_BYTES: usize = 2;
-const PROBE_FINAL_SILENCE_PCM_BYTES: usize = 640;
-const PROBE_SILENCE_PCM_BYTES: usize = 3_200;
+// eSpeak NG reads "Speech test", stored as 16 kHz mono S16LE. A save test
+// never needs the device microphone or recorded user audio.
+const PROBE_SPEECH_PCM: &[u8] = include_bytes!("../test-fixtures/speech-probe.s16le");
 // Admission bounds cover at most 30 seconds of 16 kHz S16LE PCM, even
 // while a connection/write is stalled. Finish/Cancel are independent of PCM.
 const MAX_QUEUED_PCM_BYTES: usize = 16_000 * 2 * 30;
@@ -76,6 +82,7 @@ type SpeechCallback = Arc<dyn Fn(StreamingSpeechEvent) + Send + Sync>;
 #[serde(rename_all = "camelCase")]
 struct StoredAsrConfig {
     version: u32,
+    #[serde(deserialize_with = "crate::voice_chat_settings::deserialize_saved_key")]
     api_key: String,
     resource_id: String,
     #[serde(default = "default_asr_provider")]
@@ -87,6 +94,131 @@ struct StoredAsrConfig {
 }
 
 fn default_asr_provider() -> String { "volcengine".into() }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StoredSpeechSettings {
+    #[serde(flatten)]
+    active: StoredAsrConfig,
+    #[serde(default)]
+    selection_pinned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inactive: Option<StoredAsrConfig>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    saved_profiles: std::collections::BTreeMap<String, StoredAsrConfig>,
+    // Derived from the complete legacy ASR/TTS pair when loading or saving.
+    #[serde(skip)]
+    reusable_mimo_key: Option<String>,
+    // A pre-shared TTS credential could belong to another custom endpoint.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    legacy_custom_keys: std::collections::BTreeMap<String, String>,
+}
+
+impl Default for StoredSpeechSettings {
+    fn default() -> Self {
+        Self {
+            active: StoredAsrConfig {
+                version: 1,
+                api_key: String::new(),
+                resource_id: DEFAULT_RESOURCE_ID.into(),
+                provider: default_asr_provider(),
+                base_url: String::new(),
+                model: String::new(),
+            },
+            inactive: None,
+            reusable_mimo_key: None,
+            selection_pinned: false,
+            saved_profiles: Default::default(),
+            legacy_custom_keys: Default::default(),
+        }
+    }
+}
+
+impl StoredSpeechSettings {
+    fn profile(&self, provider: &str) -> Option<&StoredAsrConfig> {
+        if self.active.provider == provider {
+            Some(&self.active)
+        } else {
+            self.saved_profiles.get(provider).filter(|p| p.provider == provider)
+                .or_else(|| self.inactive.as_ref().filter(|p| p.provider == provider))
+        }
+    }
+
+    fn activate(&mut self, profile: StoredAsrConfig) {
+        self.reusable_mimo_key = None;
+        if let Some(legacy) = self.inactive.take() {
+            self.saved_profiles.entry(legacy.provider.clone()).or_insert(legacy);
+        }
+        self.saved_profiles.remove(&profile.provider);
+        let previous = std::mem::replace(&mut self.active, profile);
+        if previous.provider != self.active.provider {
+            self.saved_profiles.insert(previous.provider.clone(), previous);
+        }
+    }
+
+    pub(crate) fn assess_mimo_key(&mut self, tts_key: &str, promote: bool) -> bool {
+        self.reusable_mimo_key = None;
+        if self.profile("mimo").is_some() { return false; }
+        let Some(old) = self.profile("openai") else { return false; };
+        if !official_mimo_endpoint(&old.base_url) || old.model.trim().is_empty() || old.api_key.trim().is_empty()
+            || (!tts_key.is_empty() && old.api_key != tts_key)
+            || self.legacy_custom_keys.get(MIMO_ROOT).is_some_and(|other| other != &old.api_key) {
+            return false;
+        }
+        if promote && self.active.provider == "openai" && old.model.trim() == MIMO_ASR {
+            self.activate(StoredAsrConfig { provider: "mimo".into(), base_url: MIMO_ROOT.into(),
+                model: MIMO_ASR.into(), ..old.clone() });
+            true
+        } else {
+            self.reusable_mimo_key = Some(old.api_key.clone());
+            false
+        }
+    }
+
+    pub(crate) fn pin_selection(&mut self) {
+        self.selection_pinned = true;
+    }
+
+    fn accepts_environment(&self, config: &RuntimeAsrConfig) -> bool {
+        // Keep environment overrides for the explicitly selected built-in preset.
+        // An independently saved custom ASR always uses its own route, model and key.
+        !self.selection_pinned || (self.active.provider != "openai" && self.active.provider == config.provider)
+    }
+
+    pub(crate) fn active_provider(&self) -> &str {
+        &self.active.provider
+    }
+
+    pub(crate) fn custom_asr(&self) -> Option<(&str, &str, &str)> {
+        self.profile("openai").map(|p| (p.base_url.as_str(), p.model.as_str(), p.api_key.as_str()))
+    }
+
+    // A validated shared legacy MiMo credential may have been computed on read.
+    // Preserve that preset before the first independent stage edit separates the keys.
+    pub(crate) fn retain_legacy_mimo(&mut self) {
+        if let Some(key) = self.reusable_mimo_key.take() {
+            self.saved_profiles.entry("mimo".into()).or_insert_with(|| StoredAsrConfig {
+                version: 1,
+                provider: "mimo".into(),
+                api_key: key,
+                base_url: MIMO_ROOT.into(),
+                resource_id: String::new(),
+                model: MIMO_ASR.into(),
+            });
+        }
+    }
+
+    fn mimo_model(&self) -> &str {
+        let model = self.profile("mimo").map_or("", |p| p.model.as_str());
+        speech_value_or_default(model, MIMO_ASR)
+    }
+
+    pub(crate) fn has_mimo_key(&self) -> bool {
+        self.profile("mimo").map_or(self.reusable_mimo_key.is_some(),
+            |p| official_mimo_endpoint(&p.base_url) && !p.api_key.trim().is_empty())
+    }
+
+}
 
 #[derive(Debug, Clone)]
 struct RuntimeAsrConfig {
@@ -120,6 +252,19 @@ pub struct DeviceAsrSettingsStatus {
     pub model: String,
     pub credential_source: &'static str,
     pub message: String,
+    pub saved_provider: String,
+    pub saved_volcengine: bool,
+    pub saved_mimo: bool,
+    pub mimo_asr_model: String,
+    pub saved_custom_roots: Vec<String>,
+    pub saved_custom: Option<PublicCustomSpeechProfile>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicCustomSpeechProfile {
+    base_url: String,
+    model: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -231,6 +376,7 @@ pub(crate) enum SpeechRoundTerminal {
 
 #[derive(Default)]
 struct SpeechRoundState {
+    provider: &'static str,
     finishing: bool,
     terminal: Option<SpeechRoundTerminal>,
     terminal_metadata_logged: bool,
@@ -273,7 +419,7 @@ impl SpeechRoundState {
                     SpeechRoundTerminal::Error(_) => "error",
                     SpeechRoundTerminal::Cancelled => "cancelled",
                 },
-                "provider": "volcengine",
+                "provider": self.provider,
                 "acceptedPcmChunks": self.accepted_pcm_chunks,
                 "acceptedPcmBytes": self.accepted_pcm_bytes,
                 "finishRequested": self.finishing,
@@ -314,7 +460,7 @@ impl SpeechRound {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Self { generation: NEXT.fetch_add(1, Ordering::Relaxed),
             state: Mutex::new(SpeechRoundState {
-                started_at: Some(TokioInstant::now()), stage: "created",
+                provider: "volcengine", started_at: Some(TokioInstant::now()), stage: "created",
                 ..SpeechRoundState::default()
             }), stop: tokio::sync::Notify::new() }
     }
@@ -404,8 +550,7 @@ impl SpeechRound {
     }
 
     fn note_log_id(&self, log_id: &str) {
-        // A malformed trace header is not safe diagnostic metadata. The error
-        // returned to the caller still carries the original provider detail.
+        // The socket supplies a local digest of the trace header.
         if !log_id.is_empty() && log_id.len() <= 128
             && log_id.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
         {
@@ -464,7 +609,7 @@ impl StreamingSpeechRecognizer {
         callback: impl Fn(StreamingSpeechEvent) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let started_at = TokioInstant::now();
-        let config = load_runtime_config()?;
+        let config = load_runtime_config().map_err(|e| model_issue::local(ASR,e))?;
         let callback: SpeechCallback = Arc::new(callback);
         let (sender, receiver) = mpsc::unbounded_channel();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -472,7 +617,13 @@ impl StreamingSpeechRecognizer {
         let round = Arc::new(SpeechRound::new());
         // Include synchronous credential preparation in ASR API-entry latency.
         // Earlier device/capture setup remains the caller's separate timeline.
-        round.state().started_at = Some(started_at);
+        {
+            let mut state = round.state();
+            state.started_at = Some(started_at);
+            state.provider = match config.provider.as_str() {
+                "mimo" => "mimo", "openai" => "openai", _ => "volcengine",
+            };
+        }
         let worker_round = round.clone();
         let transport_round = round.clone();
         let exit = SpeechWorkerExit { round: round.clone(), callback: callback.clone(), cancelled: cancelled.clone() };
@@ -499,7 +650,7 @@ impl StreamingSpeechRecognizer {
                 transport_round,
                 ) => result,
             };
-            exit.complete(result);
+            exit.complete(result.map_err(|e| model_issue::local(ASR,e)));
         });
 
         Ok(Self {
@@ -510,6 +661,18 @@ impl StreamingSpeechRecognizer {
     }
 
     pub(crate) fn generation(&self) -> u64 { self.round.generation }
+
+    // The upload starts at Finish for buffered providers. Let the transport
+    // report its own timeout before the caller's independent watchdog fires.
+    pub(crate) fn final_wait_budget(&self) -> Duration {
+        if buffered_speech(self.round.state().provider) {
+            MAX_FINAL_WAIT
+        } else {
+            // A short PTT can finish while the socket is still connecting.
+            // Bound connection/drain separately from the provider final wait.
+            CONNECT_TIMEOUT + CONNECT_TIMEOUT + FINAL_TIMEOUT + Duration::from_secs(1)
+        }
+    }
 
     pub(crate) fn terminal(&self) -> Option<SpeechRoundTerminal> { self.round.state().terminal.clone() }
 
@@ -593,168 +756,216 @@ impl Drop for StreamingSpeechRecognizer {
     }
 }
 
+fn saved_profiles(status: &mut DeviceAsrSettingsStatus, stored: &StoredSpeechSettings) {
+    status.saved_provider = stored.active.provider.clone();
+    status.saved_custom_roots = stored.legacy_custom_keys.keys().cloned().collect();
+    status.saved_mimo = stored.has_mimo_key();
+    status.mimo_asr_model = stored.mimo_model().into();
+    status.saved_volcengine = stored.profile("volcengine")
+        .is_some_and(|profile| !profile.api_key.trim().is_empty());
+    status.saved_custom = stored.profile("openai").filter(|profile| !profile.base_url.trim().is_empty() && !profile.api_key.trim().is_empty())
+        .map(|profile| PublicCustomSpeechProfile {
+            base_url: profile.base_url.clone(),
+            model: profile.model.clone(),
+        });
+}
+
+fn stored_status(stored: &StoredSpeechSettings) -> Result<DeviceAsrSettingsStatus, String> {
+    let active = &stored.active;
+    let mut status = if active.provider == "mimo" {
+        public_status_full(official_mimo_endpoint(&active.base_url) && !active.api_key.trim().is_empty(), String::new(), credential_source_name(),
+            "小米 MiMo 语音服务", "mimo", MIMO_ROOT.into(), stored.mimo_model().into())
+    } else if active.provider == "openai" && !active.base_url.trim().is_empty() {
+        public_status_full(!active.api_key.trim().is_empty(), String::new(), credential_source_name(),
+            if active.api_key.trim().is_empty() { "请配置自定义语音服务的 API Key" } else { "自定义语音识别端点已配置" }, "openai",
+            active.base_url.trim().trim_end_matches('/').into(), active.model.trim().into())
+    } else if !active.api_key.trim().is_empty() {
+        public_status(true, normalize_resource_id(&active.resource_id)?,
+            credential_source_name(), "火山引擎云端 ASR 已配置")
+    } else {
+        public_status(false, DEFAULT_RESOURCE_ID.into(), "none", "请配置火山引擎语音识别 API Key")
+    };
+    saved_profiles(&mut status, stored);
+    Ok(status)
+}
+
 pub fn settings_status() -> Result<DeviceAsrSettingsStatus, String> {
-    if let Some(config) = runtime_config_from_env() {
-        return Ok(public_status(
-            true,
-            config.resource_id,
-            "environment",
-            "火山引擎云端 ASR 已通过环境变量配置",
-        ));
-    }
-
-    if let Some(config) = read_stored_config()? {
-        if config.provider.trim() == "openai" && !config.base_url.trim().is_empty() {
-            return Ok(public_status_full(
-                true,
-                String::new(),
-                credential_source_name(),
-                "自定义语音识别端点已配置",
-                "openai",
-                config.base_url.trim().trim_end_matches('/').into(),
-                config.model.trim().into(),
-            ));
-        }
-        if !config.api_key.trim().is_empty() {
-            return Ok(public_status(
-                true,
-                normalize_resource_id(&config.resource_id)?,
-                credential_source_name(),
-                "火山引擎云端 ASR 已配置",
-            ));
-        }
-    }
-
-    Ok(public_status(
-        false,
-        DEFAULT_RESOURCE_ID.to_string(),
-        "none",
-        "请配置火山引擎语音识别 API Key",
-    ))
+    let unified = crate::voice_chat_settings::saved_speech_profiles()?;
+    let in_secure_config = unified.is_some();
+    let stored = match unified {
+        Some(stored) => stored,
+        None => read_legacy_config()?.unwrap_or_default(),
+    };
+    let Some(config) = runtime_config_from_env().filter(|cfg| stored.accepts_environment(cfg)) else {
+        let mut status = stored_status(&stored)?;
+        if in_secure_config && status.configured { status.credential_source = "secure-config"; }
+        return Ok(status);
+    };
+    let mut status = public_status_full(true, config.resource_id, "environment",
+        "语音识别已通过环境变量配置", &config.provider, config.base_url, config.model);
+    saved_profiles(&mut status, &stored);
+    Ok(status)
 }
 
 pub fn settings_status_for_automatic_restore() -> Result<DeviceAsrSettingsStatus, String> {
     settings_status()
 }
 
-pub fn save_settings(input: DeviceAsrSettingsInput) -> Result<DeviceAsrSettingsStatus, String> {
-    let existing = read_stored_config()?;
-    let existing = existing.unwrap_or_else(|| StoredAsrConfig {
-        version: 1, api_key: String::new(), resource_id: DEFAULT_RESOURCE_ID.into(),
-        provider: "volcengine".into(), base_url: String::new(), model: String::new(),
-    });
-    let provider = input
-        .provider
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| if value == "openai" { "openai".to_string() } else { "volcengine".to_string() })
-        .unwrap_or_else(|| if existing.provider.trim() == "openai" { "openai".into() } else { "volcengine".into() });
-    let api_key = input
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| existing.api_key.clone());
-    let resource_id = input
-        .resource_id
-        .as_deref()
-        .unwrap_or(existing.resource_id.as_str());
-    let base_url = input
-        .base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| existing.base_url.trim().trim_end_matches('/').to_string());
-    let model = input
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| existing.model.trim().to_string());
+fn resolve_profile(stored: &StoredSpeechSettings, input: DeviceAsrSettingsInput) -> Result<StoredAsrConfig, String> {
+    use crate::voice_chat_settings::custom_speech_endpoint;
 
-    let base_url = if provider == "openai" {
-        crate::voice_chat_settings::custom_speech_base_url(&base_url)?
-    } else { String::new() };
-    let same_scope = provider == existing.provider && (provider != "openai"
-        || crate::voice_chat_settings::custom_speech_base_url(&existing.base_url).ok().as_deref() == Some(base_url.as_str()));
-    if !same_scope && !input.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
-        return Err("切换语音服务或地址时，请填写该服务的 API Key".into());
-    }
-
-    if provider == "volcengine" {
-        let resource_id = normalize_resource_id(resource_id)?;
-        write_stored_config(&StoredAsrConfig {
-            version: 1,
-            api_key,
-            resource_id: resource_id.clone(),
-            provider,
-            base_url,
-            model,
-        })?;
-        return Ok(public_status(
-            true,
-            resource_id,
-            credential_source_name(),
-            credential_saved_message(),
-        ));
-    }
-    if base_url.is_empty() {
-        return Err("自定义语音识别端点需要填写 base URL".to_string());
-    }
-    write_stored_config(&StoredAsrConfig {
+    let supplied = |value: Option<&str>| value.map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned);
+    let provider = supplied(input.provider.as_deref()).unwrap_or_else(|| stored.active.provider.clone());
+    let provider = match provider.as_str() { "openai" => "openai", "mimo" => "mimo",
+        "volcengine" | "" => "volcengine", _ => return Err("未知语音服务".into()) };
+    let existing = stored.profile(provider);
+    let mut api_key = supplied(input.api_key.as_deref()).filter(|key| !crate::voice_chat_settings::credential_placeholder(key));
+    let (resource_id, base_url, model) = if provider == "mimo" {
+        if input.base_url.as_deref().is_some_and(|url| !official_mimo_endpoint(url)) {
+            return Err("小米 MiMo 预设使用固定的服务地址".into());
+        }
+        if api_key.is_none() { api_key = stored.key_for_scope("mimo", MIMO_ROOT); }
+        let model = input.model.as_deref().unwrap_or_else(|| stored.mimo_model());
+        (String::new(), MIMO_ROOT.into(), speech_value_or_default(model, MIMO_ASR).into())
+    } else if provider == "openai" {
+        let base_url = input.base_url.as_deref().map(|url| url.trim().to_owned())
+            .or_else(|| existing.map(|profile| profile.base_url.clone()))
+            .ok_or("自定义语音识别端点需要填写接口地址")?;
+        custom_speech_endpoint(&base_url)?;
+        if api_key.is_none() {
+            api_key = stored.key_for_scope(provider, &base_url);
+            if api_key.is_none() { return Err("此语音服务地址没有已保存的 API Key，请填写该地址的 Key".into()); }
+        }
+        let model = input.model.map(|model| model.trim().to_owned()).or_else(|| existing
+            .filter(|profile| same_custom_speech_root(&profile.base_url, &base_url))
+            .map(|profile| profile.model.clone()));
+        (String::new(), base_url.trim_end_matches('/').to_owned(), model.unwrap_or_default())
+    } else {
+        if api_key.is_none() {
+            api_key = existing.and_then(|profile| supplied(Some(&profile.api_key)));
+        }
+        let resource_id = input.resource_id.as_deref().or(existing.map(|profile| profile.resource_id.as_str()));
+        (normalize_resource_id(resource_id.unwrap_or_default())?, String::new(), String::new())
+    };
+    Ok(StoredAsrConfig {
         version: 1,
-        api_key,
-        resource_id: String::new(),
-        provider,
-        base_url: base_url.clone(),
-        model: model.clone(),
-    })?;
-    Ok(public_status_full(
-        true,
-        String::new(),
-        credential_source_name(),
-        credential_saved_message(),
-        "openai",
+        api_key: api_key.ok_or("此语音服务没有已保存的 API Key，请填写后保存")?,
+        resource_id,
+        provider: provider.into(),
         base_url,
         model,
-    ))
+    })
+}
+
+impl StoredSpeechSettings {
+    pub(crate) fn apply(&mut self, input: DeviceAsrSettingsInput) -> Result<DeviceAsrSettingsStatus, String> {
+        let profile = resolve_profile(self, input)?;
+        if !self.selection_pinned && profile.provider == "openai" {
+            let root = crate::voice_chat_settings::custom_speech_endpoint(&profile.base_url)?.api_root;
+            if let Some(saved) = self.legacy_custom_keys.get_mut(&root) {
+                saved.clone_from(&profile.api_key);
+            }
+        }
+        self.activate(profile);
+        let mut status = stored_status(self)?;
+        status.message = "语音配置已保存".into();
+        Ok(status)
+    }
+
+    pub(crate) fn key_for_scope(&self, provider: &str, endpoint: &str) -> Option<String> {
+        let profile = self.profile(provider);
+        if let Some(p) = profile.filter(|p| !p.api_key.trim().is_empty() &&
+            (provider == "volcengine" || (provider == "mimo" && official_mimo_endpoint(endpoint) && official_mimo_endpoint(&p.base_url))
+                || (provider == "openai" && same_custom_speech_root(endpoint, &p.base_url)))) {
+            return Some(p.api_key.clone());
+        }
+        if provider == "mimo" && profile.is_none() && official_mimo_endpoint(endpoint) {
+            return self.reusable_mimo_key.clone();
+        }
+        if provider != "openai" { return None; }
+        let root = crate::voice_chat_settings::custom_speech_endpoint(endpoint).ok()?.api_root;
+        self.legacy_custom_keys.get(&root).filter(|key| !key.trim().is_empty() && !crate::voice_chat_settings::credential_placeholder(key)).cloned()
+    }
+
+    pub(crate) fn tts_key_for_scope(&self, provider: &str, endpoint: &str) -> Option<String> {
+        if provider == "openai" {
+            let root = crate::voice_chat_settings::custom_speech_endpoint(endpoint).ok()?.api_root;
+            if let Some(key) = self.legacy_custom_keys.get(&root).filter(|key| !key.trim().is_empty() && !crate::voice_chat_settings::credential_placeholder(key)) { return Some(key.clone()); }
+        }
+        self.key_for_scope(provider, endpoint)
+    }
+
+    pub(crate) fn import_key(&mut self, provider: &str, base_url: &str, key: &str) -> Result<(), String> {
+        let profile = resolve_profile(self, DeviceAsrSettingsInput {
+            api_key: Some(key.into()), resource_id: None, provider: Some(provider.into()),
+            base_url: Some(base_url.into()), model: None,
+        })?;
+        if profile.provider == "openai" {
+            let root = crate::voice_chat_settings::custom_speech_endpoint(&profile.base_url)?.api_root;
+            // A historical TTS override belongs to TTS even if ASR uses this same API root.
+            self.legacy_custom_keys.insert(root, profile.api_key.clone());
+        }
+        if let Some(existing) = self.profile(&profile.provider) {
+            if profile.provider == "openai" && !existing.base_url.is_empty()
+                && !same_custom_speech_root(&profile.base_url, &existing.base_url) {
+                return Ok(());
+            }
+            if !existing.api_key.trim().is_empty() { return Ok(()); }
+        }
+        if self.active.provider == profile.provider || (self.active.api_key.is_empty() && self.active.base_url.is_empty()) {
+            self.activate(profile);
+        } else {
+            self.saved_profiles.insert(profile.provider.clone(), profile);
+        }
+        Ok(())
+    }
+}
+
+pub fn save_settings(input: DeviceAsrSettingsInput) -> Result<DeviceAsrSettingsStatus, String> {
+    crate::voice_chat_settings::save_asr(input)
+}
+
+pub(crate) fn save_legacy_asr(input: DeviceAsrSettingsInput) -> Result<DeviceAsrSettingsStatus, String> {
+    let mut profiles = read_legacy_config()?.unwrap_or_default();
+    let status = profiles.apply(input)?;
+    write_stored_config(&profiles)?;
+    Ok(status)
+}
+
+// Called only under the voice settings mutation lock, before a unified record exists.
+pub(crate) fn import_legacy_key(provider: &str, base_url: &str, key: &str) -> Result<bool, String> {
+    let mut stored = read_legacy_config()?.unwrap_or_default();
+    let provider = if provider.is_empty() { "volcengine" } else { provider };
+    if let Some(p) = stored.profile(provider) {
+        if provider == "openai" && !p.base_url.is_empty() && !same_custom_speech_root(&p.base_url, base_url) {
+            return Ok(false);
+        }
+        if !p.api_key.trim().is_empty() && !(provider == "openai" && p.api_key != key) { return Ok(true); }
+    }
+    stored.import_key(provider, base_url, key)?;
+    write_stored_config(&stored)?;
+    Ok(true)
+}
+
+pub(crate) async fn probe_custom_stage(base_url: String, model: String, api_key: String) -> Result<(), String> {
+    let config = RuntimeAsrConfig {
+        provider: "openai".into(), resource_id: String::new(), base_url, model, api_key,
+    };
+    transcribe_custom_speech(&config, PROBE_SPEECH_PCM, Duration::from_secs(20)).await.map(|_| ())
 }
 
 pub async fn probe_saved_settings() -> Result<DeviceAsrProbeStatus, String> {
-    let config = load_runtime_config()?;
+    let config = load_saved_config()?;
     let started = Instant::now();
-    if config.provider == "openai" {
-        let base = crate::voice_chat_settings::custom_speech_base_url(&config.base_url)?;
-        let url = format!("{base}/v1/models");
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(8))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| format!("无法创建探测客户端: {e}"))?;
-        let mut req = client.get(&url);
-        if !config.api_key.trim().is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", config.api_key.trim()));
-        }
-        let resp = req.send().await.map_err(|_| "语音服务探测失败")?;
-        let body = crate::voice_chat_settings::read_custom_speech_response(resp, 256 * 1024).await?;
-        let models: serde_json::Value = serde_json::from_slice(&body).map_err(|_| "模型列表格式无效")?;
-        let model_ok = config.model.trim().is_empty() || models["data"].as_array().is_some_and(|rows|
-            rows.iter().any(|row| row["id"] == config.model));
+    if buffered_speech(&config.provider) {
+        transcribe_custom_speech(&config, PROBE_SPEECH_PCM, Duration::from_secs(20)).await?;
         return Ok(DeviceAsrProbeStatus {
-            ok: model_ok,
+            ok: true,
             provider: config.provider.clone(),
             resource_id: config.model.clone(),
             latency_ms: started.elapsed().as_millis(),
             log_id: String::new(),
-            message: if model_ok {
-                "自定义语音识别端点可达".to_string()
-            } else {
-                format!("端点可达，但模型列表中没有 {}", config.model)
-            },
+            message: "语音识别已转写测试音频".to_string(),
         });
     }
     let (mut socket, log_id) = connect_cloud_socket(&config).await?;
@@ -765,32 +976,38 @@ pub async fn probe_saved_settings() -> Result<DeviceAsrProbeStatus, String> {
         send_stream_message(&mut socket, Message::Binary(
             encode_full_client_request(&recognition_payload())?.into()
         ), "探测初始化", &log_id).await?;
-        // Explicit settings probe only, never production-stream keepalive.
-        send_stream_message(&mut socket, Message::Binary(
-            encode_audio_request(&vec![0_u8; PROBE_SILENCE_PCM_BYTES], false)?.into()
-        ), "探测音频", &log_id).await?;
-        send_stream_message(&mut socket, Message::Binary(
-            encode_audio_request(&vec![0_u8; PROBE_FINAL_SILENCE_PCM_BYTES], true)?.into()
-        ), "探测结束帧", &log_id).await?;
+        let frames = PROBE_SPEECH_PCM.chunks(6_400);
+        let count = frames.len();
+        for (index, pcm) in frames.enumerate() {
+            send_stream_message(&mut socket, Message::Binary(
+                encode_audio_request(pcm, index + 1 == count)?.into()
+            ), "探测音频", &log_id).await?;
+        }
+        let mut transcript = String::new();
         loop {
             let message = timeout_at_message(deadline, &mut socket).await?;
             match message {
                 Message::Binary(data) => {
                     let frame = parse_server_frame(data.as_ref())?;
                     if frame.message_type == MSG_SERVER_ERROR {
-                        return Err(format_server_error(&frame, &log_id));
+                        return Err(format_server_error(&frame));
                     }
                     if frame.message_type == MSG_FULL_SERVER_RESPONSE {
-                        validate_response_payload(&frame.payload, &log_id, None)?;
+                        let value = validate_response_payload(&frame.payload, &log_id, None)?;
+                        let text = extract_transcript(&value);
+                        if !text.is_empty() { transcript = text; }
                         if !frame.is_final() { continue; }
+                        if transcript.is_empty() {
+                            return Err("语音识别服务未转写测试音频".into());
+                        }
                         return Ok(DeviceAsrProbeStatus {
                             ok: true, provider: config.provider.clone(), resource_id: config.resource_id.clone(),
                             latency_ms: started.elapsed().as_millis(), log_id,
-                            message: "语音识别探测已收到服务端最终响应".to_string(),
+                            message: "语音识别已转写测试音频".to_string(),
                         });
                     }
                 }
-                Message::Close(_) => return Err("语音识别在探测最终响应前关闭连接".to_string()),
+                Message::Close(frame) => return Err(model_issue::closed(ASR,frame.map(|f| f.code.into()))),
                 Message::Ping(payload) => {
                     send_stream_message(&mut socket, Message::Pong(payload), "探测心跳响应", &log_id).await?;
                 }
@@ -826,13 +1043,16 @@ fn public_status_full(
         configured,
         deferred: false,
         provider: provider.to_string(),
-        mode: "bigmodel-async-device-pcm",
+        mode: if buffered_speech(provider) { "buffered-device-wav" } else { "bigmodel-async-device-pcm" },
         endpoint: if provider == "volcengine" { DEFAULT_ENDPOINT.to_string() } else { base_url.clone() },
         resource_id,
         base_url,
         model,
         credential_source,
         message: message.into(),
+        saved_provider: String::new(),
+        mimo_asr_model: MIMO_ASR.into(), saved_mimo: false, saved_volcengine: false, saved_custom_roots: vec![],
+        saved_custom: None,
     }
 }
 
@@ -849,7 +1069,15 @@ fn normalize_resource_id(value: &str) -> Result<String, String> {
 }
 
 fn runtime_config_from_env() -> Option<RuntimeAsrConfig> {
-    if env::var("HACHIMO_ASR_PROVIDER").ok().as_deref() == Some("openai") {
+    let selected = env::var("HACHIMO_ASR_PROVIDER").unwrap_or_default();
+    if selected == "mimo" {
+        let key = env::var("HACHIMO_MIMO_SPEECH_API_KEY").ok()?;
+        if key.trim().is_empty() || crate::voice_chat_settings::credential_placeholder(&key) { return None; }
+        return Some(RuntimeAsrConfig { api_key: key.trim().into(), resource_id: String::new(),
+            provider: selected, base_url: MIMO_ROOT.into(),
+            model: speech_value_or_default(&env::var("HACHIMO_ASR_MODEL").unwrap_or_default(), MIMO_ASR).into() });
+    }
+    if selected == "openai" {
         let base_url = env::var("HACHIMO_ASR_BASE_URL").unwrap_or_default();
         if base_url.trim().is_empty() { return None; }
         return Some(RuntimeAsrConfig {
@@ -878,27 +1106,52 @@ fn runtime_config_from_env() -> Option<RuntimeAsrConfig> {
     })
 }
 
-/// The Doubao speech API key the ASR module resolved (stored user configuration or runtime environment).
-/// Realtime chat reuses it for Seed TTS when no separate TTS key is configured.
-pub fn stored_api_key() -> Option<String> {
-    load_runtime_config().ok().filter(|config| config.provider == "volcengine")
-        .map(|config| config.api_key).filter(|key| !key.trim().is_empty())
+pub(crate) fn environment_key_for_scope(provider: &str, endpoint: &str) -> Option<String> {
+    runtime_config_from_env().filter(|config| config.provider == provider &&
+        !config.api_key.trim().is_empty() && (provider == "volcengine"
+            || crate::voice_chat_settings::custom_speech::Stage::Tts.same_destination(endpoint, &config.base_url)))
+        .map(|config| config.api_key)
 }
 
-pub(crate) fn custom_key_for_endpoint(endpoint: &str) -> Option<String> {
-    let expected = crate::voice_chat_settings::custom_speech_base_url(endpoint).ok()?;
-    let config = load_runtime_config().ok()?;
-    (config.provider == "openai"
-        && crate::voice_chat_settings::custom_speech_base_url(&config.base_url).ok()? == expected
-        && !config.api_key.trim().is_empty()).then_some(config.api_key)
+fn read_stored_config() -> Result<Option<StoredSpeechSettings>, String> {
+    match crate::voice_chat_settings::saved_speech_profiles()? {
+        Some(profiles) => Ok(Some(profiles)),
+        None => read_legacy_config(),
+    }
+}
+
+fn same_custom_speech_root(first: &str, second: &str) -> bool {
+    use crate::voice_chat_settings::custom_speech_endpoint;
+    custom_speech_endpoint(first).ok().zip(custom_speech_endpoint(second).ok())
+        .is_some_and(|(first, second)| first.api_root == second.api_root)
 }
 
 fn load_runtime_config() -> Result<RuntimeAsrConfig, String> {
     if let Some(config) = runtime_config_from_env() {
+        if let Some(saved) = crate::voice_chat_settings::saved_speech_profiles()?.filter(|p| !p.accepts_environment(&config)) {
+            return saved_runtime_config(Some(saved));
+        }
         return Ok(config);
     }
-    if let Some(config) = read_stored_config()? {
-        let provider = if config.provider.trim() == "openai" { "openai".to_string() } else { "volcengine".to_string() };
+    load_saved_config()
+}
+
+fn load_saved_config() -> Result<RuntimeAsrConfig, String> {
+    saved_runtime_config(read_stored_config()?)
+}
+
+fn saved_runtime_config(stored: Option<StoredSpeechSettings>) -> Result<RuntimeAsrConfig, String> {
+    if let Some(stored) = stored {
+        let config = stored.active;
+        let provider = config.provider;
+        if provider == "mimo" {
+            if !official_mimo_endpoint(&config.base_url) || config.api_key.trim().is_empty() {
+                return Err("请重新配置小米 MiMo 语音 Key".into());
+            }
+            return Ok(RuntimeAsrConfig { api_key: config.api_key, resource_id: String::new(),
+                provider, base_url: MIMO_ROOT.into(), model: speech_value_or_default(&config.model, MIMO_ASR).into() });
+        }
+        if !matches!(provider.as_str(), "openai" | "volcengine" | "") { return Err("未知语音服务".into()); }
         if provider == "openai" {
             let base_url = config.base_url.trim().trim_end_matches('/');
             if !base_url.is_empty() {
@@ -943,46 +1196,46 @@ pub fn configure_storage_dir(_path: std::path::PathBuf) -> Result<(), String> {
 #[cfg(windows)]
 fn credential_entry() -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
-        .map_err(|error| format!("无法访问{}: {error}", credential_store_label()))
+        .map_err(|_| format!("[CREDENTIALS] 无法访问{}", credential_store_label()))
 }
 
 #[cfg(windows)]
-fn read_stored_config() -> Result<Option<StoredAsrConfig>, String> {
+pub(crate) fn read_legacy_config() -> Result<Option<StoredSpeechSettings>, String> {
     match credential_entry()?.get_password() {
         Ok(value) => serde_json::from_str(&value)
             .map(Some)
-            .map_err(|error| format!("火山引擎 ASR 安全配置损坏: {error}")),
+            .map_err(|_| "[CREDENTIALS] ASR 安全配置损坏".to_owned()),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(error) => Err(format!("无法读取{}: {error}", credential_store_label())),
+        Err(_) => Err(format!("[CREDENTIALS] 无法读取{}", credential_store_label())),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn read_stored_config() -> Result<Option<StoredAsrConfig>, String> {
+pub(crate) fn read_legacy_config() -> Result<Option<StoredSpeechSettings>, String> {
     read_macos_config_file(&macos_config_path()?)
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-fn read_stored_config() -> Result<Option<StoredAsrConfig>, String> {
+pub(crate) fn read_legacy_config() -> Result<Option<StoredSpeechSettings>, String> {
     Ok(None)
 }
 
 #[cfg(windows)]
-fn write_stored_config(config: &StoredAsrConfig) -> Result<(), String> {
+fn write_stored_config(config: &StoredSpeechSettings) -> Result<(), String> {
     let value = serde_json::to_string(config)
         .map_err(|error| format!("无法序列化火山引擎 ASR 配置: {error}"))?;
     credential_entry()?
         .set_password(&value)
-        .map_err(|error| format!("无法写入{}: {error}", credential_store_label()))
+        .map_err(|_| format!("[CREDENTIALS] 无法写入{}", credential_store_label()))
 }
 
 #[cfg(target_os = "macos")]
-fn write_stored_config(config: &StoredAsrConfig) -> Result<(), String> {
+fn write_stored_config(config: &StoredSpeechSettings) -> Result<(), String> {
     write_macos_config_file(&macos_config_path()?, config)
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-fn write_stored_config(_config: &StoredAsrConfig) -> Result<(), String> {
+fn write_stored_config(_config: &StoredSpeechSettings) -> Result<(), String> {
     Err("当前平台仅支持通过环境变量配置火山引擎 ASR".to_string())
 }
 
@@ -996,22 +1249,13 @@ fn macos_config_path() -> Result<PathBuf, String> {
 
 #[cfg(target_os = "macos")]
 fn prepare_private_directory(directory: &Path) -> Result<(), String> {
-    fs::create_dir_all(directory).map_err(|error| {
-        format!(
-            "无法创建 macOS ASR 本地配置目录 {}: {error}",
-            directory.display()
-        )
-    })?;
-    fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).map_err(|error| {
-        format!(
-            "无法保护 macOS ASR 本地配置目录 {}: {error}",
-            directory.display()
-        )
-    })
+    fs::create_dir_all(directory).map_err(|_| "[CREDENTIALS] 无法创建 ASR 配置目录，请检查写入权限")?;
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+        .map_err(|_| "[CREDENTIALS] 无法保护 ASR 配置目录，请检查文件权限".into())
 }
 
 #[cfg(target_os = "macos")]
-fn read_macos_config_file(path: &Path) -> Result<Option<StoredAsrConfig>, String> {
+fn read_macos_config_file(path: &Path) -> Result<Option<StoredSpeechSettings>, String> {
     let directory = path
         .parent()
         .ok_or_else(|| "macOS ASR 本地配置路径缺少父目录".to_string())?;
@@ -1019,29 +1263,21 @@ fn read_macos_config_file(path: &Path) -> Result<Option<StoredAsrConfig>, String
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "无法检查 macOS ASR 本地配置 {}: {error}",
-                path.display()
-            ))
-        }
+        Err(_) => return Err("[CREDENTIALS] 无法检查 ASR 配置文件，请检查权限".into()),
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(format!(
-            "macOS ASR 本地配置必须是普通文件: {}",
-            path.display()
-        ));
+        return Err("[CREDENTIALS] ASR 本地配置必须是普通文件".into());
     }
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("无法保护 macOS ASR 本地配置 {}: {error}", path.display()))?;
-    let value = crate::secure_config::read(path,"speech-asr")?.ok_or("语音配置未找到")?;
+        .map_err(|_| "[CREDENTIALS] 无法保护 ASR 配置文件，请检查权限")?;
+    let value = crate::secure_config::read(path,"speech-asr").map_err(|e| model_issue::local(model_issue::CREDENTIALS,e))?.ok_or("语音配置未找到")?;
     serde_json::from_str(&value)
         .map(Some)
-        .map_err(|error| format!("火山引擎 ASR 本地配置损坏: {error}"))
+        .map_err(|_| "[CREDENTIALS] ASR 本地配置损坏，请保留原文件".to_owned())
 }
 
 #[cfg(target_os = "macos")]
-fn write_macos_config_file(path: &Path, config: &StoredAsrConfig) -> Result<(), String> {
+fn write_macos_config_file(path: &Path, config: &StoredSpeechSettings) -> Result<(), String> {
     let directory = path
         .parent()
         .ok_or_else(|| "macOS ASR 本地配置路径缺少父目录".to_string())?;
@@ -1049,7 +1285,7 @@ fn write_macos_config_file(path: &Path, config: &StoredAsrConfig) -> Result<(), 
 
     let value = serde_json::to_vec(config)
         .map_err(|error| format!("无法序列化火山引擎 ASR 配置: {error}"))?;
-    crate::secure_config::write(path,"speech-asr",&value)
+    crate::secure_config::write(path,"speech-asr",&value).map_err(|e| model_issue::local(model_issue::CREDENTIALS,e))
 }
 
 #[cfg(windows)]
@@ -1072,16 +1308,6 @@ fn credential_source_name() -> &'static str {
     "environment"
 }
 
-#[cfg(target_os = "macos")]
-fn credential_saved_message() -> &'static str {
-    "火山引擎云端 ASR 配置已保存到当前用户的应用私有目录"
-}
-
-#[cfg(not(target_os = "macos"))]
-fn credential_saved_message() -> &'static str {
-    "火山引擎云端 ASR 配置已安全保存"
-}
-
 async fn run_asr_session(
     config: RuntimeAsrConfig,
     receiver: mpsc::UnboundedReceiver<StreamingSpeechCommand>,
@@ -1089,7 +1315,7 @@ async fn run_asr_session(
     cancelled: Arc<AtomicBool>,
     round: Arc<SpeechRound>,
 ) -> Result<(), String> {
-    if config.provider == "openai" {
+    if buffered_speech(&config.provider) {
         return run_openai_asr_session(config, receiver, callback, cancelled, round).await;
     }
     run_streaming_session(config, receiver, callback, cancelled, round).await
@@ -1108,7 +1334,7 @@ async fn run_openai_asr_session(
     if model.is_empty() {
         return Err(round.fail_at("config", "自定义语音识别未配置模型名称".to_string()));
     }
-    let base_url = crate::voice_chat_settings::custom_speech_base_url(&config.base_url)
+    crate::voice_chat_settings::custom_speech_endpoint(&config.base_url)
         .map_err(|e| round.fail_at("config", e))?;
     round.set_stage("first_pcm_wait");
     let mut pending = Vec::new();
@@ -1131,7 +1357,7 @@ async fn run_openai_asr_session(
                     pending.extend_from_slice(&bytes);
                 }
                 StreamingSpeechCommand::Finish => break true,
-                StreamingSpeechCommand::Cancel | _ => {
+                StreamingSpeechCommand::Cancel => {
                     cancelled.store(true, Ordering::SeqCst);
                     return Ok(());
                 }
@@ -1143,38 +1369,65 @@ async fn run_openai_asr_session(
         return Err(round.fail_at("first_pcm_empty", "未收到足够的真实麦克风 PCM".to_string()));
     }
     round.set_stage("openai_upload");
-    let wav = build_wav_16k_mono(&pending);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| round.fail_at("upload", format!("无法创建识别客户端: {e}")))?;
-    let mut form = reqwest::multipart::Form::new()
-        .part("file", reqwest::multipart::Part::bytes(wav).file_name("audio.wav"))
-        .text("model", model.clone());
-    let mut req = client
-        .post(format!("{}/v1/audio/transcriptions", base_url))
-        .multipart(form);
-    if !config.api_key.trim().is_empty() {
-        req = req.header("Authorization", format!("Bearer {}", config.api_key.trim()));
-    }
-    let resp = req.send().await.map_err(|_| round.fail_at("upload", "语音识别请求失败".into()))?;
-    let body = crate::voice_chat_settings::read_custom_speech_response(resp, 256 * 1024).await
-        .map_err(|e| round.fail_at("upload", e))?;
-    let reply: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|_| round.fail_at("transcript", "语音识别响应格式无效".into()))?;
-    let text = reply["text"].as_str().unwrap_or("");
-    if text.trim().is_empty() {
-        callback(StreamingSpeechEvent::Ready);
-        return Err(round.fail_at("transcript", "未识别到语音内容".to_string()));
-    }
+    let text = transcribe_custom_speech(&config, &pending, UPLOAD_TIMEOUT)
+        .await.map_err(|error| round.fail_at("upload", error))?;
     callback(StreamingSpeechEvent::Ready);
     callback(StreamingSpeechEvent::Final {
         revision: 1,
-        text: text.trim().to_string(),
+        text,
         confidence: None,
     });
     Ok(())
+}
+
+async fn transcribe_custom_speech(
+    config: &RuntimeAsrConfig,
+    pcm: &[u8],
+    timeout: Duration,
+) -> Result<String, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use crate::voice_chat_settings::custom_speech_endpoint;
+
+    let model = config.model.trim();
+    if model.is_empty() {
+        return Err("自定义语音识别未配置模型名称".into());
+    }
+    let endpoint = custom_speech_endpoint(&config.base_url)?;
+    let wav = build_wav_16k_mono(pcm);
+    let client = model_issue::client(ASR, timeout)?;
+    let root = &endpoint.api_root;
+    let request = if endpoint.uses_chat_completions {
+        client.post(format!("{root}/chat/completions")).json(&serde_json::json!({
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_audio",
+                    "input_audio": {"data": format!("data:audio/wav;base64,{}", STANDARD.encode(wav))},
+                }],
+            }],
+            "stream": false,
+        }))
+    } else {
+        let form = reqwest::multipart::Form::new()
+            .part("file", reqwest::multipart::Part::bytes(wav).file_name("audio.wav")
+                .mime_str("audio/wav").map_err(|_| "无法设置语音文件格式")?)
+            .text("model", model.to_owned());
+        client.post(format!("{root}/audio/transcriptions")).multipart(form)
+    };
+    let request = endpoint.authorize(request, &config.api_key);
+    let response = request.send().await.map_err(|error| model_issue::network(ASR,&error))?;
+    let body = model_issue::read_response(ASR,response, 256 * 1024).await?;
+    let reply: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|_| "语音识别响应格式无效")?;
+    model_issue::check_reply(ASR,&reply)?;
+    let transcript = if endpoint.uses_chat_completions {
+        &reply["choices"][0]["message"]["content"]
+    } else {
+        &reply["text"]
+    };
+    transcript.as_str().map(str::trim).filter(|text| !text.is_empty())
+        .map(str::to_owned).ok_or_else(|| "未识别到语音内容".into())
 }
 
 /// Wrap raw 16 kHz mono 16-bit little-endian PCM in a minimal WAV container.
@@ -1372,7 +1625,7 @@ async fn send_stream_message(
     timeout(CONNECT_TIMEOUT, socket.send(message))
         .await
         .map_err(|_| format!("语音识别 WebSocket {phase}写入超时{}", log_id_suffix(log_id)))?
-        .map_err(|error| format!("语音识别 WebSocket {phase}写入失败: {error}{}", log_id_suffix(log_id)))
+        .map_err(|e| model_issue::websocket(ASR,e))
 }
 
 async fn connect_cloud_socket(config: &RuntimeAsrConfig) -> Result<(CloudSocket, String), String> {
@@ -1387,16 +1640,18 @@ async fn connect_cloud_socket(config: &RuntimeAsrConfig) -> Result<(CloudSocket,
     insert_header(&mut request, "X-Api-Sequence", "-1")?;
     insert_header(&mut request, "X-Api-Connect-Id", &connect_id)?;
 
-    let connected = timeout(CONNECT_TIMEOUT, crate::llm_network::connect_websocket(request))
+    let connected = timeout(CONNECT_TIMEOUT, crate::llm_network::connect_websocket(ASR, request))
         .await
         .map_err(|_| "连接火山引擎 ASR 超时".to_string())?
-        .map_err(|error| format!("连接火山引擎 ASR 失败: {error}"))?;
+        .map_err(|error| model_issue::local(ASR,error))?;
     let (socket, response) = connected;
+    use sha2::{Digest, Sha256};
     let log_id = response
         .get("X-Tt-Logid")
         .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("{:x}", Sha256::digest(value.as_bytes()))[..16].to_owned())
+        .unwrap_or_default();
     Ok((socket, log_id))
 }
 
@@ -1490,7 +1745,7 @@ fn gzip_decompress(payload: &[u8]) -> Result<Vec<u8>, String> {
     decoder
         .take(MAX_SERVER_PAYLOAD_BYTES as u64 + 1)
         .read_to_end(&mut decoded)
-        .map_err(|error| format!("火山引擎 ASR 响应解压失败: {error}"))?;
+        .map_err(|_| "火山引擎 ASR 响应解压失败".to_string())?;
     if decoded.len() > MAX_SERVER_PAYLOAD_BYTES {
         return Err("语音识别服务响应解压后超过安全上限".to_string());
     }
@@ -1601,7 +1856,7 @@ async fn handle_server_message(
     round.set_stage("ws_read");
     let message = message
         .ok_or_else(|| round.fail_at("ws_read_close", format!("语音识别 WebSocket 连接已关闭{}", log_id_suffix(log_id))))?
-        .map_err(|error| round.fail_at("ws_read", format!("语音识别 WebSocket 接收失败: {error}{}", log_id_suffix(log_id))))?;
+        .map_err(|e| round.fail_at("ws_read", model_issue::websocket(ASR,e)))?;
 
     match message {
         Message::Binary(data) => {
@@ -1610,7 +1865,7 @@ async fn handle_server_message(
                 .map_err(|error| round.fail_at("response_decode", error))?;
             if frame.message_type == MSG_SERVER_ERROR {
                 round.note_provider_error(i64::from(frame.error_code), log_id);
-                return Err(format_server_error(&frame, log_id));
+                return Err(format_server_error(&frame));
             }
             if frame.message_type != MSG_FULL_SERVER_RESPONSE {
                 return Ok(false);
@@ -1629,10 +1884,7 @@ async fn handle_server_message(
                 .map_err(|error| round.fail_at("ws_pong_write", error))?;
             Ok(false)
         }
-        Message::Close(_) => Err(round.fail_at("ws_close_before_final", format!(
-            "语音识别 WebSocket 在返回最终文本前关闭连接{}",
-            log_id_suffix(log_id)
-        ))),
+        Message::Close(frame) => Err(round.fail_at("ws_close_before_final", model_issue::closed(ASR,frame.map(|f| f.code.into())))),
         _ => Ok(false),
     }
 }
@@ -1642,9 +1894,12 @@ fn validate_response_payload(payload: &[u8], log_id: &str, round: Option<&Speech
         return Ok(Value::Null);
     }
     let value: Value = serde_json::from_slice(payload)
-        .map_err(|error| format!("火山引擎 ASR 响应 JSON 无效: {error}"))?;
+        .map_err(|_| "火山引擎 ASR 响应 JSON 无效")?;
     if !value.is_object() && !value.is_null() {
         return Err("语音识别服务响应 JSON 顶层类型无效".into());
+    }
+    if let Some(error) = value.get("error").filter(|e| !e.is_null()) {
+        return Err(model_issue::business(ASR, error.get("code").or_else(|| error.get("type")).unwrap_or(&Value::Null)));
     }
     let code = match value.get("code").or_else(|| value.get("status_code")) {
         None => 0, // Result-only responses are allowed by the current protocol.
@@ -1655,9 +1910,7 @@ fn validate_response_payload(payload: &[u8], log_id: &str, round: Option<&Speech
     };
     if !matches!(code, 0 | 1000 | SUCCESS_CODE) {
         if let Some(round) = round { round.note_provider_error(code, log_id); }
-        // Preserve the decoded provider body for the caller, not diagnostic logs.
-        let detail = String::from_utf8_lossy(payload);
-        return Err(format_provider_error(code, detail.trim(), log_id));
+        return Err(model_issue::business(ASR, &json!(code)));
     }
     Ok(value)
 }
@@ -1712,28 +1965,8 @@ impl TranscriptState {
     }
 }
 
-fn format_server_error(frame: &ServerFrame, log_id: &str) -> String {
-    // No raw body is logged: the caller gets the unchanged decoded service
-    // detail while the terminal diagnostic contains only code and trace metadata.
-    let detail = String::from_utf8_lossy(&frame.payload);
-    format_provider_error(i64::from(frame.error_code), detail.trim(), log_id)
-}
-
-fn format_provider_error(code: i64, detail: &str, log_id: &str) -> String {
-    let category = if code == 45_000_081 {
-        "语音识别服务等待音频超时，本段已结束"
-    } else {
-        "语音识别服务返回错误"
-    };
-    format!(
-        "{category}（provider=volcengine, code={code}{}）{}",
-        log_id_suffix(log_id),
-        if detail.is_empty() {
-            String::new()
-        } else {
-            format!(": {detail}")
-        }
-    )
+fn format_server_error(frame: &ServerFrame) -> String {
+    model_issue::business(ASR, &json!(frame.error_code))
 }
 
 fn log_id_suffix(log_id: &str) -> String {
@@ -1755,7 +1988,7 @@ async fn timeout_at_message(
     .await
     .map_err(|_| "等待火山引擎 ASR 测试响应超时".to_string())?
     .ok_or_else(|| "火山引擎 ASR 测试连接已关闭".to_string())?
-    .map_err(|error| format!("火山引擎 ASR 测试接收失败: {error}"))
+    .map_err(|e| model_issue::websocket(ASR,e))
 }
 
 #[cfg(test)]
@@ -1965,17 +2198,25 @@ mod tests {
     }
 
     #[test]
-    fn provider_timeout_and_unknown_error_keep_code_trace_and_detail_without_blame() {
-        let timeout = format_provider_error(45_000_081, "Timed out waiting for next audio packet", "synthetic_trace");
-        assert!(timeout.starts_with("语音识别服务等待音频超时，本段已结束"));
-        assert!(timeout.contains("provider=volcengine"));
-        assert!(timeout.contains("code=45000081"));
-        assert!(timeout.contains("logid=synthetic_trace"));
-        assert!(timeout.contains("Timed out waiting for next audio packet"));
-        assert!(!timeout.contains("拒绝"));
-        let unknown = format_provider_error(55_099_999, "synthetic detail", "trace");
-        assert!(unknown.starts_with("语音识别服务返回错误"));
-        assert!(!unknown.contains("拒绝"));
+    fn provider_error_never_includes_the_frame_payload_or_header() {
+        for (code, token) in [(45000081, "45000081"), (55099999, "unknown")] {
+            let body = json!({"code": code, "message":"private https://private.invalid sk-fixture"});
+            let error = validate_response_payload(&serde_json::to_vec(&body).unwrap(), "secret-header", None).unwrap_err();
+            assert!(error.starts_with(&format!("[ASR] code={token} ")));
+            assert!(!error.contains("private") && !error.contains("secret") && !error.contains("fixture"));
+        }
+    }
+
+    #[tokio::test]
+    async fn model_issue_custom_asr_rejects_http_and_business_errors_before_transcript() {
+        for (status,expected) in [("403 Forbidden","[ASR] HTTP 403"),("200 OK","[ASR] code=invalid_api_key")] {
+            let body=json!({"text":"discard","error":{"code":"invalid_api_key","message":"secret https://private.invalid"}});
+            let (origin,server)=crate::voice_chat_settings::mock_model_response(status,"application/json",body.to_string().into_bytes()).await;
+            let cfg=RuntimeAsrConfig{base_url:origin,resource_id:String::new(),api_key:"private-key".into(),provider:"openai".into(),model:"fixture".into()};
+            let error=transcribe_custom_speech(&cfg,&[0;320],Duration::from_secs(5)).await.unwrap_err();
+            assert!(error.starts_with(expected)); assert!(!error.contains("private") && !error.contains("secret"));
+            server.await.unwrap();
+        }
     }
 
     #[test]
@@ -2090,6 +2331,59 @@ mod tests {
         assert_eq!(status.resource_id, DEFAULT_RESOURCE_ID);
     }
 
+    #[test]
+    fn saved_speech_profiles_switch_without_reentering_keys() {
+        let mut stored: StoredSpeechSettings = serde_json::from_value(json!({
+            "version": 1, "apiKey": "volcano-fixture", "resourceId": DEFAULT_RESOURCE_ID,
+        })).unwrap();
+        let input = |provider: &str, key: Option<&str>, endpoint: Option<&str>| DeviceAsrSettingsInput {
+            api_key: key.map(str::to_owned),
+            resource_id: None,
+            provider: Some(provider.to_owned()),
+            base_url: endpoint.map(str::to_owned),
+            model: (provider == "openai").then(|| "fixture-asr".into()),
+        };
+        assert!(resolve_profile(&stored, input("openai", None, Some("https://speech.invalid/v1"))).is_err());
+        let custom = resolve_profile(&stored,
+            input("openai", Some("custom-fixture"), Some("https://speech.invalid/v1"))).unwrap();
+        stored.activate(custom);
+        let raw = serde_json::to_string(&stored).unwrap();
+        stored = serde_json::from_str(&raw).unwrap();
+        let status = serde_json::to_value(stored_status(&stored).unwrap()).unwrap();
+        assert_eq!(status["provider"], "openai");
+        assert_eq!(status["savedVolcengine"], true);
+        assert_eq!(status["savedCustom"]["model"], "fixture-asr");
+        assert!(!status.to_string().contains("custom-fixture"));
+        assert!(!status.to_string().contains("volcano-fixture"));
+
+        let volcano = resolve_profile(&stored, input("volcengine", None, None)).unwrap();
+        assert_eq!(volcano.api_key, "volcano-fixture");
+        stored.activate(volcano);
+        assert_eq!(stored_status(&stored).unwrap().provider, "volcengine");
+        assert!(resolve_profile(&stored, input("openai", None, Some("https://other.invalid/v1"))).is_err());
+        assert!(resolve_profile(&stored, input("openai", None, Some("https://speech.invalid/other/v1"))).is_err());
+        let custom = resolve_profile(&stored, input("openai", None,
+            Some("https://speech.invalid/v1/chat/completions"))).unwrap();
+        assert_eq!(custom.api_key, "custom-fixture");
+        stored.activate(custom);
+        for masked in ["••••", "cus…ture"] {
+            let mut edit = input("openai", Some(masked), Some("https://speech.invalid/v1"));
+            edit.model = Some(String::new());
+            let edited = resolve_profile(&stored, edit).unwrap();
+            assert_eq!(edited.api_key, "custom-fixture");
+            assert!(edited.model.is_empty());
+            assert!(resolve_profile(&stored, input("openai", Some(masked), Some("https://other.invalid/v1"))).is_err());
+            assert_eq!(resolve_profile(&stored, input("volcengine", Some(masked), None)).unwrap().api_key, "volcano-fixture");
+        }
+        assert!(resolve_profile(&stored, input("openai", None, Some(""))).is_err());
+        let mut legacy = serde_json::to_value(&stored).unwrap();
+        legacy["apiKey"] = "••••".into();
+        let restored: StoredSpeechSettings = serde_json::from_value(legacy).unwrap();
+        assert!(!stored_status(&restored).unwrap().configured);
+        assert!(resolve_profile(&restored, input("openai", None, Some("https://speech.invalid/v1"))).is_err());
+        assert_eq!(stored.profile("volcengine").unwrap().api_key, "volcano-fixture");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_private_file_round_trip_is_owner_only() {
@@ -2104,7 +2398,7 @@ mod tests {
             model: String::new(),
         };
 
-        write_macos_config_file(&path, &expected).unwrap();
+        write_macos_config_file(&path, &StoredSpeechSettings { active: expected.clone(), ..Default::default() }).unwrap();
 
         let directory_mode = fs::metadata(path.parent().unwrap())
             .unwrap()
@@ -2115,7 +2409,7 @@ mod tests {
         assert_eq!(directory_mode, 0o700);
         assert_eq!(file_mode, 0o600);
 
-        let actual = read_macos_config_file(&path).unwrap().unwrap();
+        let actual = read_macos_config_file(&path).unwrap().unwrap().active;
         assert_eq!(actual.version, expected.version);
         assert_eq!(actual.api_key, expected.api_key);
         assert_eq!(actual.resource_id, expected.resource_id);
@@ -2132,7 +2426,7 @@ mod tests {
         let link = temp.path().join(MACOS_CONFIG_FILE_NAME);
         symlink(&target, &link).unwrap();
 
-        let error = read_macos_config_file(&link).unwrap_err();
+        let error = read_macos_config_file(&link).err().unwrap();
         assert!(error.contains("必须是普通文件"));
     }
 
@@ -2169,12 +2463,68 @@ mod tests {
         assert!(matches!(events.lock().unwrap().last(), Some(StreamingSpeechEvent::Final {text, ..}) if text == "请继续"));
     }
 
+    #[test]
+    fn selected_custom_asr_uses_its_saved_key_and_builtin_presets_keep_matching_env_overrides() {
+        let mut stored = StoredSpeechSettings::default();
+        let mut environment = RuntimeAsrConfig {
+            provider: "openai".into(), base_url: "https://elsewhere.invalid/v1".into(),
+            model: "environment-model".into(), api_key: "fixture-env".into(), resource_id: String::new(),
+        };
+        assert!(stored.accepts_environment(&environment));
+        stored.pin_selection();
+        assert!(!stored.accepts_environment(&environment));
+        environment.provider = "volcengine".into();
+        assert!(stored.accepts_environment(&environment));
+        stored.apply(serde_json::from_value(json!({
+            "provider":"openai","baseUrl":"https://custom.invalid/v1","model":"custom","apiKey":"fixture-custom"
+        })).unwrap()).unwrap();
+        assert!(!stored.accepts_environment(&environment));
+        environment.provider = "openai".into();
+        assert!(!stored.accepts_environment(&environment));
+    }
+
+    #[tokio::test]
+    async fn custom_asr_transcribes_wav_using_both_protocols() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use crate::voice_chat_settings::mock_speech_response;
+
+        for (suffix, route, response) in [
+            ("/speech/v1", "/speech/v1/audio/transcriptions", serde_json::json!({"text": " Speech test. "})),
+            ("/speech/v1/chat/completions", "/speech/v1/chat/completions",
+                serde_json::json!({"choices": [{"message": {"content": " Speech test. "}}]})),
+        ] {
+            let (origin, request) = mock_speech_response("application/json", response.to_string().into_bytes()).await;
+            let config = RuntimeAsrConfig {
+                provider: "openai".into(), api_key: "speech-fixture".into(), resource_id: String::new(),
+                base_url: format!("{origin}{suffix}"), model: "fixture-asr".into(),
+            };
+            assert_eq!(transcribe_custom_speech(&config, PROBE_SPEECH_PCM, Duration::from_secs(5)).await.unwrap(), "Speech test.");
+            let (headers, body) = request.await.unwrap();
+            assert!(headers.starts_with(&format!("POST {route} HTTP/1.1")));
+            assert!(headers.lines().filter_map(|line| line.split_once(':')).any(|(name, value)| {
+                name.eq_ignore_ascii_case("authorization") && value.trim() == "Bearer speech-fixture"
+            }));
+            let wav = build_wav_16k_mono(PROBE_SPEECH_PCM);
+            if suffix.ends_with("/chat/completions") {
+                let payload: Value = serde_json::from_slice(&body).unwrap();
+                let part = &payload["messages"][0]["content"][0];
+                assert_eq!(payload["model"], "fixture-asr");
+                assert_eq!(part["type"], "input_audio");
+                let audio = part["input_audio"]["data"].as_str().unwrap().strip_prefix("data:audio/wav;base64,").unwrap();
+                assert_eq!(STANDARD.decode(audio).unwrap(), wav);
+            } else {
+                assert!(headers.contains("multipart/form-data"));
+                assert!(body.windows(wav.len()).any(|bytes| bytes == wav));
+            }
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires saved Volcengine credentials and cloud access"]
-    async fn saved_credentials_probe_accepts_real_final_silence_packet() {
+    async fn saved_credentials_probe_transcribes_test_clip() {
         let status = probe_saved_settings()
             .await
-            .expect("saved credentials should accept a real PCM final packet");
+            .expect("saved credentials should transcribe the test clip");
         assert!(status.ok);
         assert_eq!(status.provider, "volcengine");
     }

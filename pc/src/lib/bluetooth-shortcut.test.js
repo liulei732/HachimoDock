@@ -43,3 +43,16 @@ test("HID chord capture distinguishes modifier sides and supports an empty main 
   assert.equal(isKeyboardChordSupported(0x0004, true), true);
   assert.equal(isKeyboardChordSupported(0x10002, true), false);
 });
+
+test("live keyboard state verifies board, complete HID slots, ownership and exact mutation", async () => {
+  const { verifiedKeyboardState } = await import("./bluetooth-shortcut.js");
+  const state = {ok:true, boardDeviceId:"peer", enabled:true, connected:false, paired:true,
+    pairing:false, radioState:1, keys:Array(20).fill(0)};
+  state.keys[7]=0x20f;
+  assert.equal(verifiedKeyboardState(state,"peer",{slot:7,chord:0x20f}),state);
+  assert.throws(()=>verifiedKeyboardState(state,"peer",{slot:7,chord:0}));
+  assert.throws(()=>verifiedKeyboardState(state,"peer",{enabled:false}));
+  for (const patch of [{keys:[1]}, {keys:Array(20).fill(-1)}, {connected:undefined}, {ok:false}, {boardDeviceId:"other"}]) {
+    assert.throws(()=>verifiedKeyboardState({...state,...patch},"peer"));
+  }
+});

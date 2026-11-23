@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "engine": "p4-bounded-runtime-v4",
+  "vars": {},
+  "states": [
+    "idle"
+  ],
+  "initial_state": "idle",
+  "transitions": [],
+  "tick": [],
+  "dashboard": {
+    "title": "配件温度",
+    "headline": "等待设备授权",
+    "note": "在设备上逐次允许读取指定传感器的摄氏温度。",
+    "footer": "摇杆选择地址，SW1 读取一次",
+    "visualStyle": "clean",
+    "visualPalette": "ocean",
+    "visualLayout": "tool",
+    "visualSprite": "gauge"
+  },
+  "accessory": "ambient-temperature"
+}

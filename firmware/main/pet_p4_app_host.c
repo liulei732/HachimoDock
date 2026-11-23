@@ -19,6 +19,15 @@
 static portMUX_TYPE mux=portMUX_INITIALIZER_UNLOCKED;
 static pet_p4_send_line_fn transport;
 static void *transport_ctx;
+#if PET_P4_SYSTEM_WIFI
+#include "pet_p4_lan.h"
+static uint32_t lan_route;
+static bool lan_needed;
+bool pet_app_host_lan_needed(void) {
+  portENTER_CRITICAL(&mux); bool needed = lan_needed; portEXIT_CRITICAL(&mux);
+  return needed;
+}
+#endif
 static char board_id[PET_P4_DEVICE_ID_MAX];
 static char widget[48],instance[32],values[8][160];
 static uint32_t generation,sequence,applied,incarnation;
@@ -98,10 +107,51 @@ static bool same_variables(const host_variable_t *incoming,int count){
   }
   return true;
 }
+#if PET_P4_SYSTEM_WIFI
+void pet_app_host_lan_route(uint32_t token, const char *board) {
+  portENTER_CRITICAL(&mux);
+  if (lan_route != token) {
+    lan_route = token;
+    transport = NULL;
+    transport_ctx = NULL;
+    snprintf(board_id, sizeof(board_id), "%s", board);
+    shown = false;
+    instance[0] = 0;
+    last_poll = 0;
+    clear_view();
+  }
+  portEXIT_CRITICAL(&mux);
+}
+
+bool pet_app_host_lan_owns(uint32_t token) {
+  portENTER_CRITICAL(&mux); bool current = token && token == lan_route; portEXIT_CRITICAL(&mux);
+  return current;
+}
+
+/* A poll may race a press, exit, or a new page while the PC resolves work. */
+bool pet_app_host_lan_current(uint32_t token, const cJSON *event) {
+  const cJSON *seq = cJSON_GetObjectItemCaseSensitive(event, "sequence");
+  if (!cJSON_IsNumber(seq) || seq->valuedouble < 1 || seq->valuedouble > UINT32_MAX ||
+      floor(seq->valuedouble) != seq->valuedouble) return false;
+  const bool visible = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(event, "visible"));
+  portENTER_CRITICAL(&mux);
+  const bool current = token && token == lan_route && shown == visible &&
+    !strcmp(widget, str(event, "componentId")) && !strcmp(instance, str(event, "instance")) &&
+    seq->valuedouble <= sequence && (!visible || (pet_resources_device_view_current(&resource_view) &&
+      (!strcmp(str(event, "action"), "status") || (ui_pending && seq->valuedouble == applied))));
+  portEXIT_CRITICAL(&mux);
+  return current;
+}
+#endif
 void pet_app_host_transport(pet_p4_send_line_fn send,void *ctx,const char *board){
   const char *next=board?board:"";
   portENTER_CRITICAL(&mux);
-  if(transport!=send||transport_ctx!=ctx||strcmp(board_id,next)){
+  bool changed=transport!=send||transport_ctx!=ctx||strcmp(board_id,next);
+#if PET_P4_SYSTEM_WIFI
+  changed |= lan_route!=0;
+  lan_route=0;
+#endif
+  if(changed){
     /* Late replies from a replaced transport cannot refresh the former view. */
     shown=false;instance[0]=0;last_poll=0;clear_view();
   }
@@ -135,6 +185,13 @@ static bool request(const char *id,uint32_t rev,uint8_t page,const char *action,
   uint32_t nonce=esp_random();
   portENTER_CRITICAL(&mux);
   bool command=strcmp(action,"status")!=0;
+#if PET_P4_SYSTEM_WIFI
+  if (!command) lan_needed = visible;
+  const uint32_t route = lan_route;
+  if (!transport && !route) {portEXIT_CRITICAL(&mux);return false;}
+#else
+  if (!transport) {portEXIT_CRITICAL(&mux);return false;}
+#endif
   if((expected_incarnation&&expected_incarnation!=incarnation)||(command&&(!shown||strcmp(widget,id)||generation!=rev))){portEXIT_CRITICAL(&mux);return false;}
   if(command&&(sequence==UINT32_MAX||!enabled_locked(id,action,now)
       ||(observed&&!observation_current_locked(id,observed)))){portEXIT_CRITICAL(&mux);return false;}
@@ -154,7 +211,7 @@ static bool request(const char *id,uint32_t rev,uint8_t page,const char *action,
     if(binding)snprintf(active_contract,sizeof(active_contract),"%s",binding);
 #endif
   }
-  if(!transport||(!strcmp(action,"status")&&sequence&&now-last_poll<2000&&shown==visible)||(strcmp(action,"status")&&last_action&&now-last_action<150)){
+  if((!command&&sequence&&now-last_poll<2000&&shown==visible)||(command&&last_action&&now-last_action<150)){
     portEXIT_CRITICAL(&mux);return false;
   }
   if(visible&&!resource_view.owner.generation&&pet_resources_device_view_begin(&resource_view)!=PET_RESOURCE_OK){
@@ -187,6 +244,9 @@ static bool request(const char *id,uint32_t rev,uint8_t page,const char *action,
     if(data){cJSON *copy=cJSON_Duplicate(data,true);if(!copy){cJSON_Delete(root);return false;}cJSON_AddItemToObject(p,"data",copy);}
 #endif
   }
+#if PET_P4_SYSTEM_WIFI
+  if(route){bool queued=p&&pet_p4_lan_app_event(route,p);cJSON_Delete(root);return queued;}
+#endif
   char *line=p?cJSON_PrintUnformatted(root):NULL;if(line)send(line,ctx);bool ok=line!=NULL;cJSON_free(line);cJSON_Delete(root);return ok;
 }
 void pet_app_host_tick(const char *id,uint32_t rev,uint8_t page,bool visible,uint64_t now){
@@ -195,6 +255,9 @@ void pet_app_host_tick(const char *id,uint32_t rev,uint8_t page,bool visible,uin
     /* Leaving for a non-host page must revoke the previous host too. Preserve
        its identity for the exit event; the next entry receives a new token. */
     portENTER_CRITICAL(&mux);
+#if PET_P4_SYSTEM_WIFI
+    lan_needed = false;
+#endif
     bool notify=shown&&widget[0];snprintf(previous,sizeof(previous),"%s",widget);rev=generation;expected_incarnation=incarnation;
     portEXIT_CRITICAL(&mux);
     if(!notify)return;
@@ -499,6 +562,9 @@ bool pet_app_host_emit(const char *topic,const cJSON *payload){
   return ok;
 }
 
+bool pet_app_host_instance_matches(const char*id,const char*token){
+  portENTER_CRITICAL(&mux);bool valid=id&&token&&token[0]&&shown&&pet_resources_device_view_current(&resource_view)&&!strcmp(widget,id)&&!strcmp(instance,token);portEXIT_CRITICAL(&mux);return valid;
+}
 #if PET_SERVICE_BRIDGE_ENABLED
 void pet_app_host_tick_bound(const char*id,uint32_t rev,uint8_t page,bool visible,uint64_t now,const char*binding){
   if(!id||!id[0]){pet_app_host_tick(id,rev,page,visible,now);return;}
@@ -512,9 +578,6 @@ bool pet_app_host_observed_value_action(const char*id,uint32_t rev,uint8_t page,
   if(!id||!action||strncmp(action,"host.",5)||!pet_bridge_json_name(parameter,31)||!observed||value < -1000000000||value>1000000000)return false;
   cJSON*data=cJSON_CreateObject();if(!data)return false;cJSON_AddNumberToObject(data,parameter,value);
   bool ok=request(id,rev,page,action,now,true,NULL,0,observed,data,NULL);cJSON_Delete(data);return ok;
-}
-bool pet_app_host_instance_matches(const char*id,const char*token){
-  portENTER_CRITICAL(&mux);bool valid=id&&token&&token[0]&&shown&&pet_resources_device_view_current(&resource_view)&&!strcmp(widget,id)&&!strcmp(instance,token);portEXIT_CRITICAL(&mux);return valid;
 }
 bool pet_app_host_image_ready(const cJSON*p,uint64_t now){
   pet_bridge_image_lease_t lease;bool ready=false;

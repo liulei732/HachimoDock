@@ -4,6 +4,9 @@
 #include "pet_p4_audio_volume.h"
 #include "pet_p4_input.h"
 #include "pet_p4_lan_bubble.inc"
+#ifdef ESP_PLATFORM
+static pet_font_route_t lan_panel_font_route(void);
+#endif
 
 __attribute__((optimize("Oz"), noinline))
 static bool lan_panel_valid_input(const cJSON *request) {
@@ -41,6 +44,17 @@ static cJSON *lan_panel_run(unsigned action, const cJSON *request, pet_p4_runtim
   const char *error = NULL;
   char storage_error[160] = {0};
   switch (action) {
+#ifdef ESP_PLATFORM
+    case PET_LAN_PANEL_TEST_MESSAGE: {
+      uint32_t association = pet_device_wifi_association();
+      uint64_t route = ((uint64_t)generation << 32) | association;
+      return pet_p4_test_message(state, request, route, association && admitted);
+    }
+    case PET_LAN_PANEL_BUBBLE_FONT: {
+      return pet_p4_font_delivery(request, lan_panel_font_route(), state->board_device_id,
+          admitted && !state->asset_transfer_active && !pet_p4_ota_active() && !pet_p4_audio_conversation_active());
+    }
+#endif
     case PET_LAN_PANEL_TEXT_PIXELS:
       return lan_bubble_run(request, state, admitted);
     case PET_LAN_PANEL_WRITE_INPUT:

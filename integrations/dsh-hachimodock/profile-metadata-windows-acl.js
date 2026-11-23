@@ -1,10 +1,9 @@
 'use strict'
 
 // Non-secret profile metadata only. Secret capability paths use windows-acl.js.
-const fs = require('node:fs')
 const path = require('node:path')
 const { createHash, randomBytes } = require('node:crypto')
-const { spawnSync } = require('node:child_process')
+const { runNativeAcl } = require('./windows-acl')
 const SCHEMA = 'dsh-profile-metadata-acl-v1'
 const SYSTEM = 'S-1-5-18'
 const ADMINS = 'S-1-5-32-544'
@@ -60,23 +59,10 @@ function validateProfileMetadataReceipt(receipt, operation, target, nonce) {
 function profileMetadataAcl(operation, target, options = {}) {
   if ((options.platform || process.platform) !== 'win32' || !OPERATIONS.has(operation)) reject()
   target = profileWindowsPath(target)
-  const inputEnv = options.env || process.env
-  const systemRoot = profileWindowsPath(inputEnv.SystemRoot || inputEnv.SYSTEMROOT || inputEnv.WINDIR)
-  const executable = path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-  let script
-  try { script = fs.readFileSync(path.join(__dirname, 'profile-metadata-windows-acl.ps1'), 'utf8') } catch { reject() }
   const nonce = randomBytes(16).toString('hex')
   let result
   try {
-    result = (options.spawn || spawnSync)(executable,
-      ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], {
-        windowsHide: true, encoding: 'utf8', timeout: 5000, maxBuffer: 65536,
-        env: { SystemRoot: systemRoot, WINDIR: systemRoot,
-          PSModulePath: path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules'),
-          HACHIMODOCK_PROFILE_METADATA_OPERATION: operation, HACHIMODOCK_PROFILE_METADATA_PATH: target,
-          HACHIMODOCK_PROFILE_METADATA_NONCE: nonce },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
+    result = runNativeAcl('profile', operation, target, options, nonce)
   } catch { reject() }
   if (!result || result.error || result.signal || result.status !== 0 || (result.stderr && result.stderr.trim())
       || typeof result.stdout !== 'string' || Buffer.byteLength(result.stdout) > 65536) reject()

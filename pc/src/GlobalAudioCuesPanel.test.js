@@ -37,3 +37,16 @@ test('appearance detail supplies the selected action to the global controls', ()
   const source = readFileSync(new URL('./AppearanceDetail.jsx', import.meta.url), 'utf8');
   assert.match(source, /<GlobalAudioCuesPanel\b[^>]*currentFamily=\{activeFamily\}/);
 });
+
+test('wireless editing stays available and a stale wired id cannot enable global cue transfer', () => {
+  for (const [props, enabled] of [
+    [{wifiConnected: true}, false], [{wifiConnected: true, boardDeviceId: 'old'}, false],
+    [{}, false], [{boardDeviceId: 'wired'}, true],
+  ]) {
+    const html = renderToStaticMarkup(React.createElement(Panel, props));
+    const button = html.match(/<button[^>]*class="btn-primary"[^>]*>/)[0];
+    assert.equal(!button.includes('disabled'), enabled);
+    assert.doesNotMatch(html.match(/<input[^>]*type="file"[^>]*>/)[0], /disabled/);
+    assert.equal(html.includes('下发全局提示音需要 USB'), props.wifiConnected === true);
+  }
+});

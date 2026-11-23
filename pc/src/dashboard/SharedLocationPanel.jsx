@@ -51,6 +51,8 @@ export default function SharedLocationPanel({ active = false, invokeCommand = in
           controller.edit({ mode: "auto" });
           void controller.save();
         }}>自动识别</button>
+        {snapshot?.mode !== "off" && <button type="button" disabled={disabled || !snapshot}
+          onClick={() => { controller.edit({ mode: "off" }); void controller.save(); }}>关闭位置共享</button>}
       </div>
       <form className="shared-location__row" aria-label="手动调整地区" onSubmit={(event) => {
         event.preventDefault();
@@ -95,6 +97,8 @@ export default function SharedLocationPanel({ active = false, invokeCommand = in
           </ul>}
         </div>
         <button className="shared-location__save" type="submit" disabled={disabled || !draft.city.trim()} aria-busy={saving}>保存</button>
+        {state.dirty && snapshot && <button type="button" disabled={disabled}
+          onClick={() => controller.resetDraft()}>撤销修改</button>}
       </form>
       {feedback && <div className="shared-location__row shared-location__feedback" role={state.saveError || state.readError || validation.city ? "alert" : "status"}>
         <span>{feedback}</span>

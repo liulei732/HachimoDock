@@ -215,6 +215,6 @@ int main(void){
     subprocess.run(['cc', '-std=c11', '-D_POSIX_C_SOURCE=200809L',
                     '-DPET_APP_SAVE_ROOT="."', '-Wall', '-Wextra', '-Werror',
                     '-fsanitize=address,undefined', '-I', str(tmp_path),
-                    '-I', str(ROOT / 'main'), str(path), str(ROOT/'main/pet_p4_resources.c'),
+                    '-I', str(ROOT / 'main'), str(path), str(ROOT/'main/pet_p4_file_cleanup.c'), str(ROOT/'main/pet_p4_resources.c'),
                     str(ROOT/'main/pet_p4_resources_device.c'), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], cwd=tmp_path, check=True)

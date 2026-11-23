@@ -1,6 +1,6 @@
 // Frontend acceptance is explicit. Repeated offers never repeat one key action;
 // errors remain retryable until native's original boot-bound TTL expires.
-export function createRealtimePressHandler({ accept, configure, onError = () => {} }) {
+export function createRealtimePressHandler({ accept, configure, onConfigurationFailure = () => {}, onError = () => {} }) {
   let disposed = false, busy = false;
   const completed = new Set();
   const current = () => !disposed;
@@ -14,7 +14,13 @@ export function createRealtimePressHandler({ accept, configure, onError = () => 
     try {
       const result = await accept(token);
       if (disposed) return;
-      if (result === null) await configure(token, current);
+      if (result === null) {
+        try { await configure(token, current); }
+        catch (error) {
+          if (!disposed) { try { await onConfigurationFailure(token); } catch {} }
+          throw error;
+        }
+      }
       if (disposed) return;
       completed.add(key);
       if (completed.size > 16) completed.delete(completed.values().next().value);

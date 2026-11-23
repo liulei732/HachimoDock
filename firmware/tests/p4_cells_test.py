@@ -155,7 +155,7 @@ def test_runtime_struct_sizes_with_track_a_flags(tmp_path):
     """ptype-style growth estimate of the self-contained runtime structs, both flag states."""
     source = (ROOT / 'firmware/main/pet_p4_miniapp.c').read_text()
     start = source.index('typedef enum {\n  MINIAPP_VAR_INT,')
-    end = source.index('typedef struct {\n  bool active;\n  char widget_id[PET_P4_MINIAPP_WIDGET_ID_MAX];\n  bool resource_incomplete;')
+    end = source.index('} miniapp_slot_t;', start) + len('} miniapp_slot_t;')
     defines = source[source.index('/* p4-quota-v2 ceilings'):source.index('#define MINIAPP_WIDGET_PATH')]
     body = defines + source[start:end]
     code = ('#include <stdio.h>\n#include <stdint.h>\n#include <stdbool.h>\n#include "pet_p4_component_features.h"\n#include "pet_p4_app_navigation.h"\n'
@@ -169,8 +169,7 @@ def test_runtime_struct_sizes_with_track_a_flags(tmp_path):
         exe = tmp_path / ('sizes-' + label)
         result = subprocess.run(['cc', '-std=c11', '-w', *flags, '-I', str(ROOT / 'firmware/main'), '-I', str(ROOT / 'firmware/tests/vendor/cjson'),
                                  '-I', str(ROOT / 'firmware/tests/program_probe_stubs'), str(src), '-o', str(exe)], capture_output=True, text=True)
-        if result.returncode:
-            pytest.skip('host toolchain cannot compile the runtime struct extract: ' + result.stderr[:400])
+        assert result.returncode == 0, result.stderr
         sizes[label] = json.loads(subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout)
     off, on = sizes['off'], sizes['on']
     assert on['maxVars'] == 32 and off['maxVars'] == 16 and on['maxTransitions'] == 48 and on['maxTicks'] == 16

@@ -72,8 +72,14 @@ def test_holder_instrumentation_is_flag_gated_and_placed_around_the_existing_loc
     assert idle.index('xSemaphoreTake(g_state_mutex,portMAX_DELAY)') < idle.index('worker_locked_begin();') < idle.index('pet_p4_asset_transfer_cleanup_worker(&g_state)') < idle.index('worker_locked_end();') < idle.index('xSemaphoreGive(g_state_mutex)')
     assert 'g_worker_locked_topic_hash=pet_topic_hash("asset/idle-cleanup"' in idle
     assert 'worker_locked_end();g_worker_locked_topic_hash=0;' in idle
-    assert main.replace(cursor,'').replace(idle,'').count('#if PET_P4_GAP_PEAK_HOLDER')==10
-    assert main.count('#if PET_P4_GAP_PEAK_CONTEXT')==6
+    alarm=function(main,'protocol_worker_task').split('if (pet_local_alarm_work())',1)[1].split('if (xQueueReceive',1)[0]
+    activation=function(main,'run_component_activation')
+    for scoped, operation in ((alarm,'pet_local_alarm_run();'), (activation,'pet_p4_miniapp_activation_run(token)')):
+        assert scoped.count('#if PET_P4_GAP_PEAK_HOLDER') == 2
+        assert scoped.index('xSemaphoreTake(g_state_mutex') < scoped.index('worker_locked_begin();') < scoped.index(operation)
+        assert scoped.index(operation) < scoped.index('worker_locked_end();') < scoped.index('g_worker_locked_topic_hash = 0;') < scoped.index('xSemaphoreGive(g_state_mutex);')
+    assert main.replace(cursor,'').replace(idle,'').replace(alarm,'').replace(activation,'').count('#if PET_P4_GAP_PEAK_HOLDER')==10
+    assert main.count('#if PET_P4_GAP_PEAK_CONTEXT')==8
     assert renderer.count('void pet_p4_renderer_note_wait_holder(')==1 and renderer.index('context.at_us=(uint64_t)ended_us;')<renderer.index('pet_render_gap_context_record(&g_metrics.lifetime,g_render_trace.gap_us,&context);')
     for key in ('"atUs"','"waitHolder"','"waitTopicHash"','"workerLocked"','"overBudgetSpans"'):assert key in diag
     config=configparser.ConfigParser(interpolation=None);config.read(ROOT/'platformio.ini')

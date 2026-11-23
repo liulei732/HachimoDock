@@ -1,0 +1,7 @@
+{
+  "title": "配件电量",
+  "description": "在设备上逐次允许读取指定配件的电量百分比。",
+  "author": "PetUI",
+  "category": "tool",
+  "license": "HachimoDock Project License"
+}

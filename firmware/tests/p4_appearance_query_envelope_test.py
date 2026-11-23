@@ -42,3 +42,17 @@ def test_real_query_binding_classification_and_no_busy_storage(query_binary,tmp_
   if fixture.exists():
    rows=json.loads(fixture.read_text())["vectors"]
    row=next(v for v in rows if v["name"]==case);assert got==row["ack"]
+
+
+def test_global_audio_slot_proof_fits_lan_frame(query_binary, tmp_path):
+    result = subprocess.run([query_binary, "global-audio"], cwd=tmp_path,
+                            check=True, capture_output=True, text=True)
+    ack = json.loads(result.stdout)
+    assert ack["ok"] and ack["serialized"] and ack["quiescent"]
+    assert ack["queryNonce"] == ack["transferId"] == "x" * 63
+    assert ack["boardDeviceId"] == "b" * 63 and ack["activeSlot"] == 1
+    assert "videos" not in ack
+    assert all(row["valid"] and len(row["packId"]) == 64 for row in ack["slots"])
+    frame = json.dumps({"topic": "asset/ack", "payload": ack}, separators=(",", ":")).encode()
+    print(f"Global slot proof with two ready slots and full video catalog: {len(frame)} bytes")
+    assert len(frame) < 3072

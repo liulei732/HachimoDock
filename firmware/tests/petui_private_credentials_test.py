@@ -65,6 +65,7 @@ void vTaskDelete(void *);
 #include <assert.h>
 #include "pet_p4_private_feed.c"
 
+#include "scoped_transport_fixture.h"
 static unsigned test_seed, size[8];
 static bool root_provisioned, entropy_on;
 static uint8_t blobs[8][512];
@@ -111,7 +112,7 @@ int nvs_erase_key(nvs_handle_t h, const char *key) {
   size[key[4] - '0'] = 0;
   return 0;
 }
-int nvs_commit(nvs_handle_t h) { assert(h == NVS_READWRITE); return 0; }
+int nvs_commit(nvs_handle_t h) { assert(h == NVS_READWRITE); return fail_commit ? -1 : 0; }
 int xTaskCreate(void (*f)(void *), const char *name, int stack, void *arg, int prio, void *out) {
   (void)name; (void)stack; (void)prio; (void)out; f(arg); return pdPASS;
 }
@@ -149,13 +150,18 @@ int main(void) {
   assert(pet_private_secret_read(&feed, &typed) == PET_PRIVATE_STORAGE_ERROR && !typed.token[0]);
   assert(pet_private_secret_schedule(&feed, &typed, true));
   assert(pet_private_secret_read(&feed, &typed) == PET_PRIVATE_ABSENT);
+  exercise_scoped_writes();
 }
 ''')
+    # Exercise production packet construction, guarded transfer and the entire
+    # worker against the same sealed records used in the vault tests.
+    mqtt = (FIRMWARE / "main/pet_p4_mqtt_feed.c").read_text()
+    (tmp_path / "mqtt_transfer.inc").write_text(mqtt[mqtt.index("enum { IO_MS"):mqtt.index("static int receive")])
     cjson = FIRMWARE / "tests/vendor/cjson"
     crypto = ("aes", "cipher", "cipher_wrap", "constant_time", "gcm", "sha256", "platform_util")
     binary = tmp_path / "vault"
     subprocess.run([
-        os.environ.get("CC", "cc"), "-std=c11", "-DPET_P4_SYSTEM_WIFI=1",
+        os.environ.get("CC", "cc"), "-std=c11", "-DPET_P4_SYSTEM_WIFI=1", "-DPET_P4_SCOPED_WRITE=1", "-I", str(FIRMWARE / "tests"),
         '-DMBEDTLS_CONFIG_FILE="petui_mbedtls_config.h"',
         "-I", str(tmp_path), "-I", str(FIRMWARE / "main"), "-I", str(cjson),
         "-I", str(mbed / "include"), str(harness), str(cjson / "cJSON.c"),

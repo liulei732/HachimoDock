@@ -10,7 +10,7 @@ def test_pixel_chunks_release_reply_objects(tmp_path):
     sender = protocol[protocol.index("static void send_topic_payload("):]
     sender = sender[:sender.index("\n}") + 2]
     start = protocol.index('} else if (strcmp(topic, "ui/text-pixels") == 0) {')
-    end = protocol.index('} else if (strcmp(topic, "speech/text") == 0) {', start)
+    end = protocol.index('} else if', start + 1)
     branch = protocol[start + 1:end + 1].replace("else if", "if", 1)
     source = tmp_path / "pixel-reply.c"
     source.write_text(r'''

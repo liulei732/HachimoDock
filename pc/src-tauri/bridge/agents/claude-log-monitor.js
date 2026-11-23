@@ -7,6 +7,7 @@
  * [Sync] If Claude transcript or token aggregation semantics change, update `pc/.folder.md`.
  */
 
+const sessionTail = require("./session-tail");
 const { execFile } = require("child_process");
 const fs = require("fs");
 const os = require("os");
@@ -245,6 +246,18 @@ class ClaudeLogMonitor {
 
   start() {
     if (this.timer) return;
+    try {
+      this.watcher = fs.watch(this.projectsRoot(), { recursive: true, persistent: false }, (event, name) => {
+        if (event === "rename" || !name || !this.tracked.has(path.join(this.projectsRoot(), String(name)))) {
+          this.discovery = null;
+        }
+      });
+      this.watcher.on("error", () => {
+        this.watcher?.close();
+        this.watcher = null;
+        this.discovery = null;
+      });
+    } catch { /* platforms without recursive notifications use polling */ }
     this.baselineExistingSessions();
     this.pollProcessState();
     this.timer = setInterval(() => this.poll(), this.config.POLL_INTERVAL_MS);
@@ -253,6 +266,9 @@ class ClaudeLogMonitor {
 
   stop() {
     if (!this.timer) return;
+    this.watcher?.close();
+    this.watcher = null;
+    this.discovery = null;
     clearInterval(this.timer);
     this.timer = null;
   }
@@ -469,6 +485,7 @@ class ClaudeLogMonitor {
 
   listSessionFiles() {
     const root = this.projectsRoot();
+    if (this.watcher && this.discovery && Date.now() < this.discovery.expires) return this.discovery.files;
     let projects;
     try {
       projects = fs.readdirSync(root, { withFileTypes: true });
@@ -502,7 +519,9 @@ class ClaudeLogMonitor {
 
     files.sort((a, b) => b.mtimeMs - a.mtimeMs);
     const limit = Math.max(1, Number(this.config.MAX_SCAN_FILES) || 200);
-    return files.slice(0, limit);
+    const visible = files.slice(0, limit);
+    if (this.watcher) this.discovery = { files: visible, expires: Date.now() + 10000 };
+    return visible;
   }
 
   processLine(line, entry) {
@@ -570,7 +589,6 @@ class ClaudeLogMonitor {
   createEntry(fileName, offset, dropFirstLine) {
     return {
       offset,
-      partial: "",
       dropFirstLine,
       sessionId: fileName.replace(/\.jsonl$/, ""),
       cwd: "",
@@ -592,30 +610,19 @@ class ClaudeLogMonitor {
     };
   }
 
-  seedEntryTokenUsage(filePath, entry) {
-    let contents;
+  seedUsageLine(line, entry) {
+    let obj;
     try {
-      contents = fs.readFileSync(filePath, "utf8");
+      obj = JSON.parse(line);
     } catch {
       return;
     }
-
-    for (const rawLine of contents.split("\n")) {
-      const line = rawLine.trim();
-      if (!line) continue;
-      let obj;
-      try {
-        obj = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (!obj || typeof obj !== "object") continue;
-      entry.sessionId = extractSessionId(obj, entry.sessionId);
-      const usage = extractTokenUsage(obj);
-      accumulateTokenUsage(entry, usage, obj);
-      const eventTimestampMs = readTimestampMs(obj.timestamp) || Date.now();
-      this.accumulateEntryDailyTokenUsage(entry, usage, obj, eventTimestampMs);
-    }
+    if (!obj || typeof obj !== "object") return;
+    entry.sessionId = extractSessionId(obj, entry.sessionId);
+    const usage = extractTokenUsage(obj);
+    accumulateTokenUsage(entry, usage, obj);
+    const timestamp = readTimestampMs(obj.timestamp) || Date.now();
+    this.accumulateEntryDailyTokenUsage(entry, usage, obj, timestamp);
   }
 
   ensureDailyUsageDay() {
@@ -651,8 +658,13 @@ class ClaudeLogMonitor {
     try {
       const stat = fs.statSync(filePath);
       const entry = this.createEntry(fileName, stat.size, false);
-      if (seedTokenUsage) this.seedEntryTokenUsage(filePath, entry);
+      entry.fileId = sessionTail.identity(stat);
       this.tracked.set(filePath, entry);
+      if (seedTokenUsage) {
+        entry.offset = 0;
+        entry.historyEnd = stat.size;
+        this.pollFile(filePath, fileName, true);
+      }
     } catch {}
   }
 
@@ -671,7 +683,7 @@ class ClaudeLogMonitor {
     if (snapshotEntry) this.emitDailyTokenSnapshot(snapshotEntry);
   }
 
-  pollFile(filePath, fileName) {
+  pollFile(filePath, fileName, seeding = false) {
     let stat;
     try {
       stat = fs.statSync(filePath);
@@ -689,32 +701,21 @@ class ClaudeLogMonitor {
       this.tracked.set(filePath, entry);
     }
 
-    if (stat.size <= entry.offset) return;
-
-    let buffer;
     try {
-      const fd = fs.openSync(filePath, "r");
-      const readLen = stat.size - entry.offset;
-      buffer = Buffer.alloc(readLen);
-      fs.readSync(fd, buffer, 0, readLen, entry.offset);
-      fs.closeSync(fd);
-    } catch {
-      return;
-    }
-    entry.offset = stat.size;
-
-    const text = entry.partial + buffer.toString("utf8");
-    const lines = text.split("\n");
-    entry.partial = lines.pop() || "";
-    if (entry.dropFirstLine) {
-      lines.shift();
-      entry.dropFirstLine = false;
-    }
-
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line) continue;
-      this.processLine(line, entry);
+      sessionTail.readLines(filePath, stat, entry, () => {
+        const fresh = this.createEntry(fileName, 0, false);
+        this.tracked.set(filePath, fresh);
+        return fresh;
+      }, (line, target, end) => {
+        if (target.historyEnd != null && end <= target.historyEnd) this.seedUsageLine(line, target);
+        else this.processLine(line, target);
+      });
+      if (entry.historyEnd != null && entry.offset >= entry.historyEnd) {
+        delete entry.historyEnd;
+        if (!seeding && this.tracked.get(filePath) === entry && entry.dailyTokenUsage) this.emitDailyTokenSnapshot(entry);
+      }
+    } catch (error) {
+      if (!error.code) throw error;
     }
   }
 

@@ -22,5 +22,11 @@
     "event": "joystick.up",
     "label": "开始前增加 5 分钟",
     "control": "前方摇杆"
+  },
+  {
+    "action": "tomato.configure",
+    "event": "button.encoder.short_press",
+    "label": "暂停时重新选时长",
+    "control": "前方摇杆"
   }
 ]

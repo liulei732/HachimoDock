@@ -3,8 +3,28 @@ from pathlib import Path
 import subprocess
 ROOT=Path(__file__).resolve().parents[1]
 
-def _run_utc_test(tmp_path, extra_prefix='', extra_body='', extra_main='', extra_sources=()):
+# Legacy adapter tests have no catalog/NVS fixture. The local grant suite
+# passes the real included implementation and injects only its storage boundary.
+NO_LOCAL_GRANT_PROCESS = r"""
+enum { PET_ALARM_COUNT=2 };
+static struct { bool pending; } local_job;
+static bool local_alarm_foreground(const char *id,unsigned i,pet_cev_alarm_t *a) {
+  (void)id;(void)i;(void)a;return true;
+}
+static unsigned local_alarm_mode(const char *id) { (void)id; return 0; }
+static bool local_alarm_offer(const char *id,const char *title,unsigned i,const pet_cev_alarm_t *alarm) {
+  (void)id;(void)title;(void)i;(void)alarm;return false;
+}
+"""
+NO_LOCAL_GRANTS = NO_LOCAL_GRANT_PROCESS + r"""
+static void local_alarm_cancel_job(const char *id,const char *alarm) { (void)id;(void)alarm; }
+"""
+
+def _run_utc_test(tmp_path, extra_prefix='', extra_body='', extra_main='', extra_sources=(),
+                  local_grants=False):
     source=(ROOT/'main/pet_p4_miniapp_ext.inc').read_text()
+    if not local_grants:
+        source=source.replace('#include "pet_p4_local_alarm.inc"', NO_LOCAL_GRANTS)
     top=source[source.index('#if PET_P4_CAPABILITY_EXT'):source.index('static int ext_find_int_var')]+'\n#endif\n'
     a=source.index('#if PET_P4_EVENTS\n/* Alarm bookkeeping');process=source[a:source.index('static pet_cext_publish_ticket_t *g_ext_pending_publish',a)]
     a=source.index('#if PET_P4_EVENTS\n/* Storage-owner checkpoint');save=source[a:source.index('#if PET_P4_EVENTS\n#include "pet_p4_miniapp_alarm_boot.inc"',a)]
@@ -113,7 +133,7 @@ int main(void){char unused[256];(void)miniapp_ext_save_text(unused,sizeof unused
 '''.replace('EXTRA_MAIN',extra_main)
     (tmp_path/'utc.c').write_text(harness)
     binary=tmp_path/'utc'
-    subprocess.run(['cc','-std=c11','-pthread','-Wall','-Wextra','-Werror','-Wno-misleading-indentation',
+    subprocess.run(['cc','-std=c11','-DPET_P4_EVENTS=1','-pthread','-Wall','-Wextra','-Werror','-Wno-misleading-indentation',
                     '-Wno-error=deprecated-declarations','-fsanitize=address,undefined','-I',str(tmp_path),
                     '-I',str(ROOT/'main'),'-I',str(ROOT/'tests/vendor/cjson'),str(tmp_path/'utc.c'),
                     str(ROOT/'main/pet_p4_component_events.c'),str(ROOT/'tests/vendor/cjson/cJSON.c'),

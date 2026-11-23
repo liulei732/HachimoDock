@@ -81,17 +81,34 @@ def test_physical_verify_bypasses_stale_cache_without_adopting_another_task(tmp_
 
 def test_actual_unchanged_helper_compares_all_resources_preserving_live_state(tmp_path):
     text=(ROOT/'main/pet_p4_miniapp.c').read_text()
+    thumb=(ROOT/'main/pet_p4_center_thumb.inc').read_text().replace('/spiffs/p4th','p4th')
+    thumb_size=next(line for line in (ROOT/'main/pet_p4_miniapp.h').read_text().splitlines()
+                   if line.startswith('#define PET_CENTER_THUMB_BYTES '))
     code=r'''
-#include "pet_p4_file_exact.h"
 #include <assert.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <stdio.h>
+#include <stdbool.h>
+#include <string.h>
+static bool physical,stale_thumb_cache;
+static FILE *model_open(const char *path,const char *mode){
+ if(stale_thumb_cache&&!physical&&!strncmp(path,"p4th",4))return fopen("cached-thumb.bin",mode);
+ return fopen(path,mode);
+}
+#define fopen model_open
+#include "pet_p4_file_exact.h"
+#undef fopen
+#define PET_P4_STORAGE_PRESERVE_UNCHANGED 1
 #define MINIAPP_SPRITE_FILE_HEADER_SIZE 8
+'''+thumb_size+r'''
 typedef struct {unsigned frame_width,frame_height,frames,fps,data_offset,data_length;} pet_p4_miniapp_sprite_t;
 typedef struct {unsigned count,data_length;uint8_t pixels[1024];pet_p4_miniapp_sprite_t items[4];} pack_t;
-typedef struct {char widget_id[48],title[64];unsigned resource_state,slot,package_generation;uint32_t widget_checksum,buttons_checksum,sprites_checksum,center_title_checksum;char package_metadata[53];} miniapp_catalog_item_t;
+typedef struct {char widget_id[48],title[64];unsigned resource_state,slot,package_generation,center_thumb_generation;uint32_t widget_checksum,buttons_checksum,sprites_checksum,center_title_checksum,center_thumb_checksum;char package_metadata[53];} miniapp_catalog_item_t;
 typedef struct {bool active;char widget_id[48];struct {char title[64];}view;} miniapp_runtime_t;
-typedef struct {bool preserve_unchanged,repair_resources;char widget_id[48],widget_json[1024],buttons_json[1024];size_t widget_len,buttons_len;pack_t sprites;char package_metadata[53];} staging_t;
+typedef struct {bool preserve_unchanged,repair_resources;char widget_id[48],widget_json[1024],buttons_json[1024];size_t widget_len,buttons_len,center_thumb_len;uint8_t center_thumb[PET_CENTER_THUMB_BYTES];pack_t sprites;char package_metadata[53];} staging_t;
 typedef struct {bool active;} pet_storage_physical_scope_t;
-static bool audio,owner=true,physical,deny_begin,revoke_finish;
+static bool audio,owner=true,deny_begin,revoke_finish;
 static unsigned model_lock,begins,finishes;
 static miniapp_runtime_t g_runtime={.active=true,.widget_id="owned",.view={.title="Title"}};
 static staging_t g_staging={.preserve_unchanged=true,.widget_id="owned",.widget_json="{valid}",.widget_len=7,.buttons_json="[]",.buttons_len=2};
@@ -112,12 +129,34 @@ static bool pet_storage_physical_finish(pet_storage_physical_scope_t*s){assert(!
 static void catalog_slot_path(unsigned s,unsigned g,bool buttons,bool tmp,char*p,size_t n){(void)s;(void)g;(void)tmp;snprintf(p,n,"%s.bin",buttons?"buttons":"widget");}
 static void catalog_sprite_path(unsigned s,unsigned g,unsigned i,bool tmp,char*p,size_t n){(void)s;(void)g;(void)i;(void)tmp;snprintf(p,n,"sprite.bin");}
 static void put(const char*p,const void*b,size_t n){FILE*f=fopen(p,"wb");assert(f&&fwrite(b,1,n,f)==n);assert(!fclose(f));}
-'''+function(text,'unchanged_storage_current')+'\n'+function(text,'preserve_unchanged_package')+r'''
+static unsigned tile_writes;
+static bool write_file_atomic(const char*tmp,const char*path,const char*bytes,size_t len){
+ ++tile_writes;put(tmp,bytes,len);return rename(tmp,path)==0;
+}
+static uint8_t center_thumb_ref[2][1];
+static bool center_thumb_known[2]={true,true};
+'''+ '\n'.join(function(thumb,name) for name in ('center_thumb_path','center_thumb_hash','center_thumb_matches','stage_center_thumb'))+'\n'+function(text,'unchanged_storage_current')+'\n'+function(text,'preserve_unchanged_package')+r'''
 int main(void){
  miniapp_runtime_t next=g_runtime,original=g_runtime;
  put("widget.bin",g_staging.widget_json,7);put("buttons.bin",g_staging.buttons_json,2);
  assert(preserve_unchanged_package(&next,0)==1&&begins==1&&finishes==1);
  assert(!memcmp(&original,&g_runtime,sizeof(original))&&g_image_revision==8&&!physical);
+ char path[40];g_catalog[0].center_thumb_generation=2;
+ center_thumb_path(0,2,false,path,sizeof(path));g_staging.center_thumb_len=PET_CENTER_THUMB_BYTES;
+ memset(g_staging.center_thumb,0xab,PET_CENTER_THUMB_BYTES);
+ g_catalog[0].center_thumb_checksum=center_thumb_hash(g_staging.center_thumb);
+ assert(!preserve_unchanged_package(&next,0)); /* missing published bank */
+ put(path,g_staging.center_thumb,PET_CENTER_THUMB_BYTES);
+ assert(preserve_unchanged_package(&next,0)==1);
+ assert(stage_center_thumb(g_catalog)&&!tile_writes&&g_catalog[0].center_thumb_generation==2);
+ put("cached-thumb.bin",g_staging.center_thumb,PET_CENTER_THUMB_BYTES);
+ g_staging.center_thumb[512]^=1;put(path,g_staging.center_thumb,PET_CENTER_THUMB_BYTES);g_staging.center_thumb[512]^=1;
+ stale_thumb_cache=true;
+ assert(preserve_unchanged_package(&next,0)==0); /* physical bytes differ under a stale cached match */
+ deny_begin=true;assert(!stage_center_thumb(g_catalog)&&!tile_writes);deny_begin=false;
+ assert(stage_center_thumb(g_catalog)&&tile_writes==1&&g_catalog[0].center_thumb_generation!=2);
+ assert(preserve_unchanged_package(&next,0)==1); /* replacement bank passes physical verification */
+ stale_thumb_cache=false;g_staging.center_thumb_len=0;
  g_staging.widget_json[1]^=1;assert(!preserve_unchanged_package(&next,0));g_staging.widget_json[1]^=1;
  put("buttons.bin","[]x",3);assert(!preserve_unchanged_package(&next,0));put("buttons.bin","[]",2);
  g_staging.sprites.count=1;g_staging.sprites.data_length=600;g_catalog[0].sprites_checksum=123;

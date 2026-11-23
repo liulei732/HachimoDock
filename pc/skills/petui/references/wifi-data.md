@@ -114,7 +114,7 @@
 ```
 
 列表可放 1–16 项。普通曲目支持 MP3 和 16 位 PCM WAV，`live:true` 用于 MP3 直播。
-组件自行声明曲目和地址。播放须由用户发起，沿用媒体通道的录音和实时对话优先级。
+组件自行声明曲目和地址。播放须由用户发起，沿用媒体通道的录音和实时对话优先级。退出组件时设备停止播放并取消正在缓冲或重连的网络音频。
 
 两项能力都使用公开 DNS 域名上的 HTTPS GET（443）。设备校验公网 IPv4、证书链和域名，使用固件的常用公网根证书集合，
 拒绝私网、重定向和 URL 中的用户信息。设备不添加认证头，组件地址及其查询参数不得包含密钥或令牌。
@@ -144,3 +144,25 @@
 也可在受信配对后使用 `petui feed-credential <set|status|forget> <板卡 ID> <组件 ID> <runtime/widget.json>`。使用 `set` 时由密码管理器向标准输入提供凭证。HTTPS 输入一行 Token，MQTT 输入两行，分别为用户名和密码。命令返回配置状态，不提供凭证导出接口。
 
 离线验收需在板上保存凭证，把测试服务放在独立于电脑的主机上，关闭电脑后重启 Wi‑Fi 6 设备，确认 HTTPS 请求重新成功且 MQTT 订阅接到重启后发布的新值。确认实际固件能力、有无凭证、断网恢复和清除后停止取数。
+
+## 组件限域发送
+
+WiFi6 v1 与 v3 使用同一协议。列表工具声明整数分页变量，预留右上角系统按钮。安装要求设备报告 `widgetWifiFeed=p4-wifi-feed-v1`、`widgetPrivateFeed=p4-private-feed-v1` 和 `widgetScopedWrite=p4-scoped-write-v1`。发送还要求 `widgetCredentialStorageReady=true`、Wi‑Fi 在线、最近 24 小时同步过时钟，以及通过公开根证书和主机名验证的公网 IPv4 目标。
+
+签到工具的声明示例
+
+```json
+{"source":"wifi.feed","page_var":"page","url":"https://checkin.example.org/visits","connection":{"type":"https-submit","value":"arrived"}}
+```
+
+桌灯控制工具的声明示例
+
+```json
+{"source":"wifi.feed","page_var":"page","url":"mqtts://desk.example.org:8883","connection":{"type":"mqtt-publish","topic":"room/light","value":"on"}}
+```
+
+以上为 `runtime/widget.json` 的 `data` 对象。域名最长 32 字节，HTTPS 路径和 MQTT Topic 最长 40 字节。`value` 为 1–24 个 ASCII 字母、数字、点、下划线或短横线。路径固定，禁止查询串；Topic 禁止通配符与系统主题。包内只声明一个值，服务账号留在板上。HTTPS 请求固定为 443 端口上的 `POST`、`text/plain`、精确长度的原始值和 Bearer 头。MQTT 使用账号和密码、TLS、QoS 1、单一消息标识、清洁会话，retain 与 DUP 均为零。
+
+在组件右上角「发送授权」面板核对操作、主机、端口、目标及值，连接账号，再按「发送一次」。授权绑定组件 ID、协议、主机、端口、路径或主题及值。打开组件、刷新、定时器、重连和重新启动都不能触发写入。设备全局同时最多处理一次。协议分阶段限时，发送前先持久化一次性授权的已消费状态。HTTPS 2xx 表示服务接收，匹配的 PUBACK 表示代理接收；下游处理由服务端记录确认。传输中断、返回重定向或 ACK 不匹配时界面显示「结果未知」。先核对上游记录，再显式移除授权、重新授权并决定是否再发。组件卸载清理该组件的限域发送授权。设备上的移除授权停止本地使用，已被服务接收的请求以及服务商发行的 Token 遵循服务商自身的管理流程。
+
+设备 GitHub 账号卡的专用连接类型已停用。旧声明会被拒绝。通用 HTTPS Bearer 与 MQTT 的凭证读写和既有绑定继续使用原格式。

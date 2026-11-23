@@ -1,0 +1,366 @@
+{
+  "schema_version": 1,
+  "engine": "p4-bounded-runtime-v4",
+  "input": {
+    "engine": "p4-input-v1"
+  },
+  "states": [
+    "ready"
+  ],
+  "initial_state": "ready",
+  "vars": {
+    "status": {
+      "type": "int",
+      "init": 0
+    },
+    "key": {
+      "type": "int",
+      "init": 0
+    },
+    "savedDay": {
+      "type": "int",
+      "init": 0
+    },
+    "kind": {
+      "type": "int",
+      "init": 0
+    },
+    "day": {
+      "type": "int",
+      "init": 1
+    },
+    "cursor": {
+      "type": "int",
+      "init": 0
+    }
+  },
+  "limits": {
+    "day": [
+      1,
+      366
+    ],
+    "cursor": [
+      0,
+      3
+    ],
+    "key": [
+      -1,
+      3
+    ],
+    "status": [
+      -3,
+      1
+    ],
+    "kind": [
+      0,
+      12
+    ],
+    "savedDay": [
+      0,
+      366
+    ]
+  },
+  "transitions": [
+    {
+      "from": "*",
+      "on": "day.up",
+      "inc": {
+        "day": 1
+      }
+    },
+    {
+      "from": "*",
+      "on": "slot.up",
+      "inc": {
+        "cursor": 1
+      }
+    },
+    {
+      "from": "*",
+      "on": "first",
+      "set": {
+        "cursor": 0
+      }
+    }
+  ],
+  "dashboard": {
+    "title": "Check-in log",
+    "metricLabel": "Recorded day",
+    "metricValue": {
+      "var": "savedDay"
+    },
+    "badge": {
+      "var": "kind"
+    },
+    "note": {
+      "var": "key"
+    },
+    "visualStyle": "clean",
+    "visualPalette": "mint",
+    "visualLayout": "tool",
+    "visualSprite": "star"
+  },
+  "surface": {
+    "engine": "p4-app-surface-v1",
+    "graphics": "p4-app-graphics-v1",
+    "bindings": "p4-variable-bindings-v1",
+    "background": 0,
+    "elements": [
+      {
+        "type": "text",
+        "x": 20,
+        "y": 39,
+        "w": 194,
+        "h": 32,
+        "color": 65535,
+        "var_bind": "day",
+        "font_size": 22
+      },
+      {
+        "type": "text",
+        "x": 222,
+        "y": 39,
+        "w": 194,
+        "h": 32,
+        "color": 65535,
+        "var_bind": "cursor",
+        "font_size": 22
+      },
+      {
+        "type": "text",
+        "x": 424,
+        "y": 39,
+        "w": 194,
+        "h": 32,
+        "color": 65535,
+        "var_bind": "status",
+        "font_size": 22
+      },
+      {
+        "type": "text",
+        "x": 20,
+        "y": 91,
+        "w": 194,
+        "h": 32,
+        "color": 65535,
+        "var_bind": "savedDay",
+        "font_size": 22
+      },
+      {
+        "type": "text",
+        "x": 222,
+        "y": 91,
+        "w": 194,
+        "h": 32,
+        "color": 65535,
+        "var_bind": "key",
+        "font_size": 22
+      },
+      {
+        "type": "text",
+        "x": 424,
+        "y": 91,
+        "w": 194,
+        "h": 32,
+        "color": 65535,
+        "var_bind": "kind",
+        "font_size": 22
+      },
+      {
+        "type": "button",
+        "x": 20,
+        "y": 168,
+        "w": 180,
+        "h": 72,
+        "color": 2016,
+        "text": "Work",
+        "action": "work"
+      },
+      {
+        "type": "button",
+        "x": 220,
+        "y": 168,
+        "w": 180,
+        "h": 72,
+        "color": 2016,
+        "text": "Rest",
+        "action": "rest"
+      },
+      {
+        "type": "button",
+        "x": 420,
+        "y": 168,
+        "w": 180,
+        "h": 72,
+        "color": 2016,
+        "text": "Day +",
+        "action": "day.up"
+      },
+      {
+        "type": "button",
+        "x": 20,
+        "y": 258,
+        "w": 180,
+        "h": 72,
+        "color": 2016,
+        "text": "Browse",
+        "action": "browse"
+      },
+      {
+        "type": "button",
+        "x": 220,
+        "y": 258,
+        "w": 180,
+        "h": 72,
+        "color": 2016,
+        "text": "Slot +",
+        "action": "slot.up"
+      },
+      {
+        "type": "button",
+        "x": 420,
+        "y": 258,
+        "w": 180,
+        "h": 72,
+        "color": 2016,
+        "text": "Erase row",
+        "action": "erase"
+      },
+      {
+        "type": "text",
+        "x": 20,
+        "y": 17,
+        "w": 190,
+        "h": 22,
+        "color": 50712,
+        "font_size": 16,
+        "text": "Day of year"
+      },
+      {
+        "type": "text",
+        "x": 222,
+        "y": 17,
+        "w": 190,
+        "h": 22,
+        "color": 50712,
+        "font_size": 16,
+        "text": "Browse from"
+      },
+      {
+        "type": "text",
+        "x": 424,
+        "y": 17,
+        "w": 190,
+        "h": 22,
+        "color": 50712,
+        "font_size": 16,
+        "text": "Result"
+      },
+      {
+        "type": "text",
+        "x": 20,
+        "y": 69,
+        "w": 190,
+        "h": 22,
+        "color": 50712,
+        "font_size": 16,
+        "text": "Recorded day"
+      },
+      {
+        "type": "text",
+        "x": 222,
+        "y": 69,
+        "w": 190,
+        "h": 22,
+        "color": 50712,
+        "font_size": 16,
+        "text": "Row"
+      },
+      {
+        "type": "text",
+        "x": 424,
+        "y": 69,
+        "w": 190,
+        "h": 22,
+        "color": 50712,
+        "font_size": 16,
+        "text": "Activity"
+      },
+      {
+        "type": "button",
+        "x": 20,
+        "y": 375,
+        "w": 180,
+        "h": 64,
+        "color": 2016,
+        "text": "First slot",
+        "action": "first"
+      }
+    ]
+  },
+  "records": {
+    "version": 1,
+    "words": 2,
+    "user_slots": 4,
+    "cache_slots": 1,
+    "outputs": [
+      "status",
+      "key",
+      "savedDay",
+      "kind"
+    ],
+    "actions": {
+      "work": {
+        "inputs": [
+          "day"
+        ],
+        "batch": [
+          [
+            "append",
+            "user",
+            "day",
+            1
+          ]
+        ]
+      },
+      "rest": {
+        "inputs": [
+          "day"
+        ],
+        "batch": [
+          [
+            "append",
+            "user",
+            "day",
+            2
+          ]
+        ]
+      },
+      "browse": {
+        "inputs": [
+          "cursor"
+        ],
+        "batch": [
+          [
+            "next",
+            "user",
+            "cursor"
+          ]
+        ]
+      },
+      "erase": {
+        "inputs": [
+          "cursor"
+        ],
+        "batch": [
+          [
+            "delete",
+            "user",
+            "cursor"
+          ]
+        ]
+      }
+    }
+  },
+  "tick": []
+}

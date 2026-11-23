@@ -82,3 +82,20 @@ node pc/scripts/package-factory-release.mjs \
 CI 使用 Python 3.12、Node.js 22、PlatformIO Core 6.1.19，以及 LLVM/LLD **20.1.8**。`CLANG` 指定该版本的 clang，配套 wasm-ld 位于其工具目录。生成的 WASM 与技能镜像按字节检查，不应更换编译器后重写产物绕过验证。
 
 完整测试会读取锁定 SDK 的源码、目标编译器和各环境的编译数据库。[tools/prepare_ci_sdk.py](tools/prepare_ci_sdk.py) 在 GitHub Actions 中准备 v1/v3 PlatformIO core，通过 `compiledb` 生成上下文并将路径写入 `GITHUB_ENV`；它不连接或烧录设备。本机测试同样需要相应输入，将 `PET_P4_V1_COMPILE_COMMANDS`、`PET_P4_V3_COMPILE_COMMANDS` 指向真实编译数据库，并提供测试要求的 SDK 路径。不要使用手写数据库或空 SDK 替代。
+
+WiFi6 v1 和 v3 的 ESP-Hosted RPC 按数字标签编解码。构建时会从锁定的供应商源文件生成
+protobuf-c 的精简描述表，以节省 OTA 空间。升级 ESP-Hosted 后须复核描述表生成器，
+并运行 `firmware/tests/hosted_descriptor_size_test.py` 核对消息、枚举及编解码结果。
+
+## 四板 OTA 预算与真机长稳
+
+提供四种配置的镜像和预算报告后，可以用公开发布清单作基线，核对每块板的修订范围、版本、SHA-256 和 OTA 余量。
+
+```sh
+python3 firmware/tools/ota_matrix.py --release-index latest-release.json \
+  --reports "$reports" --images "$images" --require-complete
+```
+
+四板使用 ESP-IDF 的 silent assertions。断言失败仍触发中止，使用同批 ELF 和故障 PC 定位。SDK 的 ESP_RETURN_ON_* 等检查仍执行错误返回，相应调用点的格式化报错文本已精简。通用凭证读写继续沿用原绑定与格式。WiFi6 固件和组件工具均已撤下旧 GitHub 账号卡专用声明。
+
+按板型、芯片、屏幕和候选 ELF 记录长稳及升级恢复结果。[四板实机验收](docs/board-soak.md)

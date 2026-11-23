@@ -33,6 +33,39 @@
 
 static const char *TAG = "ESP32_P4_4_3";
 
+#if BSP_LCD_PANEL_AUTO
+#include "nv3049_init.h"
+
+static esp_err_t nv3049_init_controller(esp_lcd_panel_io_handle_t io)
+{
+    const gpio_config_t reset = {
+        .pin_bit_mask = 1ULL << BSP_LCD_RST,
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&reset), TAG, "NV3049 reset GPIO");
+    ESP_RETURN_ON_ERROR(gpio_set_level(BSP_LCD_RST, 1), TAG, "NV3049 reset high");
+    vTaskDelay(pdMS_TO_TICKS(10));
+    ESP_RETURN_ON_ERROR(gpio_set_level(BSP_LCD_RST, 0), TAG, "NV3049 reset low");
+    vTaskDelay(pdMS_TO_TICKS(20));
+    ESP_RETURN_ON_ERROR(gpio_set_level(BSP_LCD_RST, 1), TAG, "NV3049 reset release");
+    vTaskDelay(pdMS_TO_TICKS(120));
+    // A powered NV3049F can remain asleep across a host reset. Start the clock before Sleep Out.
+    mipi_dsi_host_ll_set_clock_lane_state(MIPI_DSI_LL_GET_HOST(0), MIPI_DSI_LL_CLOCK_LANE_STATE_HS);
+    vTaskDelay(pdMS_TO_TICKS(30));
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(io, 0x11, NULL, 0), TAG, "Wake NV3049 before configuration");
+    vTaskDelay(pdMS_TO_TICKS(220));
+    for (size_t i = 0; i < sizeof(nv3049_init) / sizeof(nv3049_init[0]); ++i) {
+        const nv3049_init_command_t *cmd = &nv3049_init[i];
+        ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(io, cmd->command, &cmd->parameter, 1),
+                            TAG, "NV3049 init command 0x%02x at %zu", cmd->command, i);
+        if (cmd->delay_ms) vTaskDelay(pdMS_TO_TICKS(cmd->delay_ms));
+    }
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(io, 0x29, NULL, 0), TAG, "Enable NV3049 display");
+    vTaskDelay(pdMS_TO_TICKS(50));
+    return ESP_OK;
+}
+#endif
+
 static const st7701_lcd_init_cmd_t vendor_specific_init_default[] = {
     {0xFF, (uint8_t[]){0x77, 0x01, 0x00, 0x00, 0x13}, 5, 0},
     {0xEF, (uint8_t[]){0x08}, 1, 0},
@@ -517,7 +550,7 @@ static esp_err_t bsp_enable_dsi_phy_power(void)
 esp_err_t bsp_display_new(const bsp_display_config_t *config, esp_lcd_panel_handle_t *ret_panel, esp_lcd_panel_io_handle_t *ret_io)
 {
     esp_err_t ret = ESP_OK;
-    bsp_lcd_handles_t handles;
+    bsp_lcd_handles_t handles = {0};
     ret = bsp_display_new_with_handles(config, &handles);
 
     *ret_panel = handles.panel;
@@ -532,6 +565,10 @@ esp_err_t bsp_display_new_with_handles(const bsp_display_config_t *config, bsp_l
 
     ESP_RETURN_ON_ERROR(bsp_display_brightness_init(), TAG, "Brightness init failed");
     ESP_RETURN_ON_ERROR(bsp_enable_dsi_phy_power(), TAG, "DSI PHY power failed");
+#if BSP_LCD_PANEL_AUTO
+    const bool nv3049 = config && config->nv3049;
+    if (nv3049) vTaskDelay(pdMS_TO_TICKS(20));
+#endif
 
     /* create MIPI DSI bus first, it will initialize the DSI PHY as well */
     esp_lcd_dsi_bus_handle_t mipi_dsi_bus;
@@ -543,11 +580,17 @@ esp_err_t bsp_display_new_with_handles(const bsp_display_config_t *config, bsp_l
         .phy_clk_src = 0,
         .lane_bit_rate_mbps = BSP_LCD_MIPI_DSI_LANE_BITRATE_MBPS,
     };
+#if BSP_LCD_PANEL_AUTO
+    if (nv3049) {
+        bus_config.num_data_lanes = BSP_LCD_NV3049_LANES;
+        bus_config.lane_bit_rate_mbps = BSP_LCD_NV3049_LANE_MBPS;
+    }
+#endif
     ESP_RETURN_ON_ERROR(esp_lcd_new_dsi_bus(&bus_config, &mipi_dsi_bus), TAG, "New DSI bus init failed");
 
     ESP_LOGI(TAG, "Install MIPI DSI LCD control panel");
     // we use DBI interface to send LCD commands and parameters
-    esp_lcd_panel_io_handle_t io;
+    esp_lcd_panel_io_handle_t io = NULL;
     esp_lcd_dbi_io_config_t dbi_config = {
         .virtual_channel = 0,
         .lcd_cmd_bits = 8,   // according to the LCD ILI9881C spec
@@ -565,7 +608,7 @@ esp_err_t bsp_display_new_with_handles(const bsp_display_config_t *config, bsp_l
         .dpi_clock_freq_mhz = BSP_LCD_DPI_CLOCK_MHZ,
         .virtual_channel = 0,
         .pixel_format = BSP_LCD_PIXEL_FORMAT,
-        .num_fbs = 1,
+        .num_fbs = CONFIG_BSP_LCD_DPI_BUFFER_NUMS,
         .video_timing = {
             .h_size = BSP_LCD_H_RES,
             .v_size = BSP_LCD_V_RES,
@@ -578,31 +621,49 @@ esp_err_t bsp_display_new_with_handles(const bsp_display_config_t *config, bsp_l
         },
         .flags.use_dma2d = true,
     };
-    dpi_config.num_fbs = CONFIG_BSP_LCD_DPI_BUFFER_NUMS;
 
-    ESP_LOGI(TAG, "Install Waveshare ESP32-P4-WIFI6-Touch-LCD-4B LCD control panel");
-    st7701_vendor_config_t vendor_config = {
-        .init_cmds = vendor_specific_init_default,
-        .init_cmds_size = sizeof(vendor_specific_init_default) / sizeof(st7701_lcd_init_cmd_t),
-        .flags = {
-            .use_mipi_interface = 1,
-            .skip_mipi_id_read = 1,
-        },
-        .mipi_config = {
-            .dsi_bus = mipi_dsi_bus,
-            .dpi_config = &dpi_config,
-        },
-    };
-    esp_lcd_panel_dev_config_t lcd_dev_config = {
-        .bits_per_pixel = BSP_LCD_BITS_PER_PIXEL,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
-        .reset_gpio_num = BSP_LCD_RST,
-        .vendor_config = &vendor_config,
-    };
-    ESP_GOTO_ON_ERROR(esp_lcd_new_panel_st7701_mipi_only(io, &lcd_dev_config, &panel_handle), err, TAG, "New LCD panel Waveshare failed");
-    ESP_GOTO_ON_ERROR(esp_lcd_panel_reset(panel_handle), err, TAG, "LCD panel reset failed");
-    ESP_GOTO_ON_ERROR(esp_lcd_panel_init(panel_handle), err, TAG, "LCD panel init failed");
-
+#if BSP_LCD_PANEL_AUTO
+    if (nv3049) {
+        dpi_config.dpi_clock_freq_mhz = BSP_LCD_NV3049_CLOCK_MHZ;
+        dpi_config.pixel_format = LCD_COLOR_PIXEL_FORMAT_RGB888;
+        dpi_config.num_fbs = 2;
+        dpi_config.flags.use_dma2d = false;
+        dpi_config.video_timing.hsync_back_porch = 44;
+        dpi_config.video_timing.hsync_pulse_width = 2;
+        dpi_config.video_timing.hsync_front_porch = 46;
+        dpi_config.video_timing.vsync_back_porch = 14;
+        dpi_config.video_timing.vsync_pulse_width = 2;
+        dpi_config.video_timing.vsync_front_porch = 16;
+        ESP_GOTO_ON_ERROR(nv3049_init_controller(io), err, TAG, "Initialize NV3049 controller");
+        ESP_GOTO_ON_ERROR(esp_lcd_new_panel_dpi(mipi_dsi_bus, &dpi_config, &panel_handle),
+                          err, TAG, "Create NV3049 DPI panel");
+        ESP_GOTO_ON_ERROR(esp_lcd_panel_init(panel_handle), err, TAG, "Start NV3049 DPI");
+    } else
+#endif
+    {
+        ESP_LOGI(TAG, "Install Waveshare ESP32-P4-WIFI6-Touch-LCD-4B LCD control panel");
+        st7701_vendor_config_t vendor_config = {
+            .init_cmds = vendor_specific_init_default,
+            .init_cmds_size = sizeof(vendor_specific_init_default) / sizeof(st7701_lcd_init_cmd_t),
+            .flags = {
+                .use_mipi_interface = 1,
+                .skip_mipi_id_read = 1,
+            },
+            .mipi_config = {
+                .dsi_bus = mipi_dsi_bus,
+                .dpi_config = &dpi_config,
+            },
+        };
+        esp_lcd_panel_dev_config_t lcd_dev_config = {
+            .bits_per_pixel = BSP_LCD_BITS_PER_PIXEL,
+            .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+            .reset_gpio_num = BSP_LCD_RST,
+            .vendor_config = &vendor_config,
+        };
+        ESP_GOTO_ON_ERROR(esp_lcd_new_panel_st7701_mipi_only(io, &lcd_dev_config, &panel_handle), err, TAG, "New LCD panel Waveshare failed");
+        ESP_GOTO_ON_ERROR(esp_lcd_panel_reset(panel_handle), err, TAG, "LCD panel reset failed");
+        ESP_GOTO_ON_ERROR(esp_lcd_panel_init(panel_handle), err, TAG, "LCD panel init failed");
+    }
     /* Return all handles */
     ret_handles->io = io;
     ret_handles->mipi_dsi_bus = mipi_dsi_bus;
@@ -619,6 +680,7 @@ err:
     if (panel_handle)
     {
         esp_lcd_panel_del(panel_handle);
+        panel_handle = NULL;
     }
     if (io)
     {

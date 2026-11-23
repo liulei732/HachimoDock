@@ -10,6 +10,22 @@
 #include "esp_lcd_mipi_dsi.h"
 #include "sdkconfig.h"
 
+#if BSP_LCD_PANEL_AUTO
+#define BSP_LCD_NV3049_LANES 2
+// At 24 MHz DPI, 480 Mbps gives 2.5 byte-clock cycles per pixel.
+// The 2/44/480/46 pixel segments then require exactly 5/110/1200/115 cycles.
+#define BSP_LCD_NV3049_LANE_MBPS 480
+#if BSP_LCD_NV3049_DMA_REFRESH
+// Request the exact 240 / 10 divider on IDF 5.5.4.
+#define BSP_LCD_NV3049_CLOCK_MHZ 24
+// This generated v3 SDK function opts one DPI panel into the DMA fence.
+void pet_p4_lcd_use_dma_refresh(esp_lcd_panel_handle_t panel);
+#else
+// IDF 5.5.1 integer division yields the measured 24 MHz.
+#define BSP_LCD_NV3049_CLOCK_MHZ 23
+#endif
+#endif
+
 /* LCD color formats */
 #define ESP_LCD_COLOR_FORMAT_RGB565    (1)
 #define ESP_LCD_COLOR_FORMAT_RGB888    (2)
@@ -54,7 +70,7 @@ extern "C" {
  *
  */
 typedef struct {
-    int dummy;
+    bool nv3049;
 } bsp_display_config_t;
 
 /**

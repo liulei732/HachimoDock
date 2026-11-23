@@ -103,6 +103,12 @@ export const CARDS = [
   },
 ];
 
+export const GUIDE_TEST_MESSAGE = "hello from pet-manager";
+export const GUIDE_OFFLINE_APPS = Object.freeze({
+  "wooden-fish": "静心木鱼",
+  "snake-turn": "像素贪吃蛇",
+});
+
 export const P4_CARDS = [
   {
     id: "screen-switch",
@@ -115,7 +121,7 @@ export const P4_CARDS = [
     otherWays: [
       { control: "p4Joystick", text: "向右默认：下一个" },
       { control: "p4Joystick", text: "向左默认：上一个" },
-      { control: "p4Joystick", text: "向上 / 向下默认：暂不绑定，可单独配置" },
+      { control: "p4Joystick", text: "向上 / 向下默认：上一个 / 下一个" },
       { control: "p4Joystick", text: "中按短按默认：确认" },
       { control: "p4Joystick", text: "中按长按默认：暂不绑定" },
     ],
@@ -153,14 +159,14 @@ export const P4_CARDS = [
         control: "sw3",
         rows: [
           { gesture: "短按", action: "返回（取消）" },
-          { gesture: "长按", action: "暂不绑定" },
+          { gesture: "长按", action: "打开系统设置（支持该功能的固件）" },
         ],
       },
     ],
   },
   {
     id: "widget-takeover",
-    title: "把 12 个手势调成你的习惯",
+    title: "配置设备按键和摇杆",
     shortTitle: "个性配置",
     headline: "设备导航与组件动作分层保存，修改一个组件不会打乱全局操作。",
     example: {
@@ -175,7 +181,7 @@ export const P4_CARDS = [
       ],
     },
     footnotes: [
-      "SW1/SW2/SW3 的短按和长按，加上摇杆的六种手势，共 12 个独立入口。",
+      "SW1/SW2/SW3 的短按和长按，加上摇杆的六种手势，共 12 个独立入口。支持双击的固件另有 3 个双击入口，默认均未绑定。",
       "组件按键只在该组件打开时生效，不覆盖设备页面的默认导航。",
     ],
   },

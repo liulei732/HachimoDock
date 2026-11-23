@@ -11,14 +11,14 @@ export function buildUsageHelp(rows = [], actions = {}, enabled = true, pending 
   const confirm = binding("page_enter");
   const voice = labels("voice_ptt").map(label => label.replace(/^长按\s*/, "按住 ")).join("或");
   const chat = binding("realtime_chat");
-  const unbound = rows.length ? "尚未设置快捷键，请到「按钮配置」中选择并同步到设备。"
-    : "连接设备后，可在「按钮配置」查看和设置快捷键。";
+  const unbound = rows.length ? "尚未设置快捷键，请到「键盘配置 → 按钮配置」中选择并同步到设备。"
+    : "连接设备后，可在「键盘配置 → 按钮配置」查看和设置快捷键。";
   return {
     pending,
-    voice: !enabled ? "语音输入尚未启用，请在首页「语音输入」中开启。" : voice
+    voice: !enabled ? "语音输入尚未启用，请在「Agent交互 → 语音输入」中开启。" : voice
       ? `${voice}说话，松开后将文字追加到 Agent 输入框；可以分多次说。` : unbound,
     confirm: confirm ? `${confirm}确认发送。` : rows.length
-      ? "尚未绑定确认键；可在 Agent 输入框中手动发送，或到「按钮配置」绑定确认键。"
+      ? "尚未绑定确认键；可在 Agent 输入框中手动发送，或到「键盘配置 → 按钮配置」绑定确认键。"
       : "可在 Agent 输入框中手动发送，或连接设备后查看确认键设置。",
     chat: chat ? `在宠物界面，${chat}开始聊天；再次执行相同操作结束。` : unbound,
     chatBound: Boolean(chat),
@@ -40,9 +40,10 @@ export function realtimeReadiness({ deviceOnline, appearance, personaReady, sett
   if (failed) return { message: "暂时无法读取配置，请重试检查。", action: "retry" };
   if (!settings?.ttsConfigured || !settings?.asrConfigured || !settings?.llmConfigured) {
     const missing = [];
-    if (!settings?.ttsConfigured || !settings?.asrConfigured) missing.push("语音服务");
+    if (!settings?.asrConfigured) missing.push("语音识别（ASR）");
+    if (!settings?.ttsConfigured) missing.push("语音合成（TTS）");
     if (!settings?.llmConfigured) missing.push("对话大模型");
-    return { message: `请先配置${missing.join("和")}。`, action: "api" };
+    return { message: `请先配置${missing.join("、")}。`, action: "api" };
   }
   return null;
 }

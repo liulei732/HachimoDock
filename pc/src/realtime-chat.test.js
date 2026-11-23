@@ -22,12 +22,23 @@ const read = (relative) => readFileSync(join(repoRoot, relative), "utf8");
 test("device realtime status labels omit question marks and unsupported ellipsis", () => {
   const rtc=read("pc/src-tauri/src/realtime_chat.rs");
   const labels=[...rtc.matchAll(/hud\([^;\n]*,\s*"([^"\n]*)"\);/g)].map(match=>match[1]);
-  for (const expected of ["准备中", "正在处理", "正在联网查询", "刚才没说成，请再说一遍"]) {
+  for (const expected of ["准备中", "正在处理", "刚才没说成，请再说一遍"]) {
     assert.ok(labels.includes(expected), expected);
   }
+  assert.ok(!labels.includes("正在联网查询"), "search progress must preserve the ASR caption");
   for (const label of labels) assert.doesNotMatch(label, /[?？…]/);
   const hints=read("firmware/main/pet_p4_view.c").split("static const char *conversation_hint(")[1].split("void pet_p4_build_view_model")[0];
   for (const [,label] of hints.matchAll(/return "([^"]*)"/g)) assert.doesNotMatch(label, /[?？…]/);
+});
+
+test("timed and legacy captions follow the first PCM from the selected TTS", () => {
+  const rtc = read("pc/src-tauri/src/realtime_chat.rs");
+  const subtitle = rtc.split("PlayerCmd::Subtitle(text) =>")[1].split("PlayerCmd::Pcm(bytes,")[0];
+  assert.match(subtitle, /if subtitles \{[\s\S]*sent_bytes \+ pending.len\(\)[\s\S]*PlaybackFrame::Subtitle/);
+  assert.match(subtitle, /else \{[\s\S]*s\.display_name\.clone\(\)[\s\S]*"state":"speaking","name":name,"text":text/);
+  assert.match(rtc, /if pcm\.is_empty\(\) \{ None \} else \{ first\.take\(\) \}/);
+  assert.match(rtc, /ready\.await\?;[\s\S]*PlayerCmd::Subtitle\(text\.to_owned\(\)\)[\s\S]*sender\.pcm\(epoch, head\)\.await\?;\s*accepted\(\)/);
+  assert.match(read("pc/src/dashboard/RealtimeChatPanel.jsx"), /synthesizing: "正在合成语音"/);
 });
 
 test("reply audio is cancelled only after ASR verifies two characters or explicit stop", () => {
@@ -204,7 +215,7 @@ test("failure status survives fast exit, cancellation bypasses audio queues, dev
 test("live captions are isolated from Agent state and follow PCM playback", () => {
   const rtc = read("pc/src-tauri/src/realtime_chat.rs");
   assert.match(rtc, /pointer\("\/features\/conversationSubtitles"\)/);
-  assert.match(rtc, /"offsetBytes":sent_bytes \+ pending.len\(\) as u64/);
+  assert.match(rtc, /"audio\/play_subtitle", json!\(\{"sessionId":turn,"offsetBytes":offset,"text":text/);
   assert.match(rtc, /"role":"user","final":final_text/);
   assert.match(rtc, /Some\("playback_completed"\)/);
   assert.match(rtc, /completed_playback\.lock\(\).map\(\|id\| \*id == turn_id\)/);

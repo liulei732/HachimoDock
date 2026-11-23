@@ -18,8 +18,8 @@ typedef struct {char component[48];char title[PET_NOTIFY_TITLE_BYTES+1];char tex
 typedef struct {char component[48];uint64_t last_ms;bool used;} pet_notify_slot_t;
 typedef struct {pet_notify_slot_t slots[PET_NOTIFY_SLOTS];} pet_notify_limiter_t;
 static inline bool pet_notify_text_ok(const char *s,unsigned max,bool nonempty){
-  if(!s)return false;unsigned i=0;
-  for(;s[i];i++){unsigned char c=(unsigned char)s[i];if(i>=max||c<32||c==127)return false;}
+  if (!s) return false;
+  unsigned i = 0; for(;s[i];i++){unsigned char c=(unsigned char)s[i];if(i>=max||c<32||c==127)return false;}
   return !nonempty||i>0;
 }
 static inline bool pet_notify_component_ok(const char *s){

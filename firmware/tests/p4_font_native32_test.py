@@ -157,6 +157,7 @@ static void lv_font_glyph_release_draw_data(lv_font_glyph_dsc_t*g){releases++;me
  code=code.replace('typedef struct{const lv_font_t*resolved_font;int adv_w,box_w,box_h,ofs_x,ofs_y,req_raw_bitmap;}lv_font_glyph_dsc_t;', 'struct glyph{const lv_font_t*resolved_font;int adv_w,box_w,box_h,ofs_x,ofs_y,req_raw_bitmap;bool is_placeholder;};')
  code=code.replace('={18,3},pet_p4_font_cn_32={36,6};','={18,3,bitmap},pet_p4_font_cn_32={36,6,bitmap};')
  code+=r'''
+static bool draw_shared_bubble_glyph(uint32_t cp,int x,int y,uint16_t c,bool m){(void)cp;(void)x;(void)y;(void)c;(void)m;return false;}
 static bool draw_bubble_cell(uint32_t cp,int x,int y,uint16_t c,bool m){(void)cp;(void)x;(void)y;(void)c;(void)m;return false;}
 static unsigned pixels;static int min_x,min_y,max_x,max_y;
 static void blend_px(int x,int y,uint8_t r,uint8_t g,uint8_t b,uint8_t a){(void)r;(void)g;(void)b;assert(a==255);if(!pixels){min_x=max_x=x;min_y=max_y=y;}else{if(x<min_x)min_x=x;if(x>max_x)max_x=x;if(y<min_y)min_y=y;if(y>max_y)max_y=y;}pixels++;}

@@ -449,7 +449,70 @@ static void test_gomoku_ai_work_stays_bounded_from_an_empty_board(void) {
   assert(game.game_over && game.gomoku_outcome == 2);
 }
 
+static void test_blocks_rotate_at_wall_without_crossing_a_pile(void) {
+  pet_p4_game_engine_t g;
+  assert(pet_p4_game_configure(&g, PET_P4_GAME_BLOCKS, 480, 7));
+  assert(pet_p4_game_command(&g, PET_P4_GAME_COMMAND_START, 1));
+  g.block_piece = 0; /* I, vertical in column 2 of the shape mask. */
+  g.block_rotation = 1;
+  g.block_x = -2;
+  assert(pet_p4_game_command(&g, PET_P4_GAME_COMMAND_ROTATE, 2));
+  assert(g.block_rotation == 2 && g.block_x == 0);
+  g.block_rotation = 1;
+  g.block_x = 7;
+  g.board[g.width + 6] = 1;
+  assert(!pet_p4_game_command(&g, PET_P4_GAME_COMMAND_ROTATE, 3));
+  assert(g.block_x == 7 && g.block_rotation == 1);
+  g.board[g.width + 6] = 0;
+  assert(pet_p4_game_command(&g, PET_P4_GAME_COMMAND_ROTATE, 4));
+  assert(g.block_x == 6 && g.block_rotation == 2);
+}
+
+static void test_snake_last_two_meals_preserve_head_on_full_board(void) {
+  pet_p4_game_engine_t g;
+  assert(pet_p4_game_configure(&g, PET_P4_GAME_SNAKE, 220, 11));
+  assert(pet_p4_game_command(&g, PET_P4_GAME_COMMAND_START, 1));
+  /* Serpentine body fills every cell except (1,0) and (0,0). */
+  g.snake_length = 0;
+  for (unsigned y = 0; y < g.height; ++y) {
+    for (unsigned col = 0; col < g.width; ++col) {
+      unsigned x = y % 2 ? g.width - 1 - col : col;
+      if (y == 0 && x < 2) continue;
+      g.snake_x[g.snake_length] = x;
+      g.snake_y[g.snake_length++] = y;
+    }
+  }
+  g.snake_direction = 2;
+  g.food_x = 1;
+  g.food_y = 0;
+  assert(pet_p4_game_process(&g, 221));
+  assert(g.food_x == 0 && g.food_y == 0 && !g.game_over);
+  assert(pet_p4_game_process(&g, 441));
+  assert(g.game_over && !g.running && g.snake_length == 160 && g.score == 2);
+  assert(g.frame.cells[0] == 3);
+  for (int i = 1; i < 160; ++i) assert(g.frame.cells[i] == 1);
+}
+
+static void test_flappy_leaving_pipe_on_fatal_tick(void) {
+  for (int fatal = 0; fatal <= 1; ++fatal) {
+    pet_p4_game_engine_t g;
+    assert(pet_p4_game_configure(&g, PET_P4_GAME_FLAPPY, 100, 13));
+    assert(pet_p4_game_set_vertical_speed(&g, 50));
+    assert(pet_p4_game_command(&g, PET_P4_GAME_COMMAND_FLAP, 1));
+    g.flappy_pipe_x[0] = 2;
+    g.flappy_scroll_phase = 1;
+    g.flappy_y_q8 = (fatal ? 9 : 4) * 256;
+    g.flappy_velocity_q8 = 512;
+    assert(pet_p4_game_process(&g, 101));
+    assert(g.game_over == fatal && g.score == !fatal);
+    if (fatal) assert(g.frame.cells[9 * g.width + 3] == 3);
+  }
+}
+
 int main(void) {
+  test_blocks_rotate_at_wall_without_crossing_a_pile();
+  test_snake_last_two_meals_preserve_head_on_full_board();
+  test_flappy_leaving_pipe_on_fatal_tick();
   test_gomoku_player_wins_in_all_four_directions();
   test_gomoku_ai_replies_on_tick_and_blocks_an_open_four();
   test_gomoku_ai_completes_its_own_five_over_blocking();

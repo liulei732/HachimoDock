@@ -55,6 +55,7 @@ namespace System.Windows.Automation {
   }
 }
 public static class CodexVoiceNative {
+  public static bool LastInputRejectedBeforeSend = false;
   public static int Clicks;
   public static int Enters;
   public static int ClickX, ClickY;
@@ -94,13 +95,16 @@ public static class WorkBuddyUia {
   public static int RootReads;
   public static object FromHandle(System.IntPtr window) { RootReads++; return Root; }
   public static object FocusedElement() { return Focused; }
+  public static object[] FocusedAncestors(System.IntPtr window) { return new object[] { Focused }; }
+  public static object[] FindEditable(System.IntPtr window, int budgetMs, int cap) { return new object[0]; }
+  public static string DiagnosticSummary() { return "fixture"; }
   public static object[] FindBounded(System.IntPtr window, bool rawView, int budgetMs, int maxNodes) { return new object[0]; }
   public static object[] FindAtPoints(System.IntPtr window, double[] xRatios, double[] yRatios, int budgetMs) { return new object[0]; }
 }
 '@
 $names = @('Normalize-Label', 'Normalize-ComposerText', 'Test-AllowedComposerValue',
   'Test-FiniteWindowRectangle', 'Test-WorkBuddyWritablePattern', 'Get-ComposerCandidates',
-  'Get-ElementRuntimeId', 'Select-WorkBuddyComposer', 'Find-WorkBuddyFocusedComposer',
+  'Test-CurrentElectronAgent','Get-ComposerProperty','Record-ComposerReject','Get-ElementRuntimeId', 'Select-WorkBuddyComposer', 'Find-WorkBuddyFocusedComposer',
   'Initialize-WorkBuddyAccessibility', 'Get-WorkBuddyTarget',
   'Get-ComposerSubmitLabelScore', 'Test-CodexSubmitPoint', 'Invoke-CodexTaskSubmit', 'Invoke-SendButton',
   'Get-TaskDraftSnapshot', 'Assert-TaskDraftSnapshot', 'Set-ComposerText', 'Join-VoiceDraft')
@@ -110,11 +114,13 @@ foreach ($name in $names) {
   Invoke-Expression $function.Extent.Text
 }
 # UIA adapters are fixtures; filtering and selection above are production code.
+$script:ComposerRejects = @{}
+function Test-ComposerElementOwner($root,$element) { return $element.Owned }
 function Test-WorkBuddyElementOwner($root, $element) { return $element.Owned }
 function Get-ComposerText($element) { return @($element.Pattern, $element.Value) }
 function Assert($condition, $label) { if (-not $condition) { throw "FAILED: $label" }; Write-Output "PASS: $label" }
 function Rect($x, $y, $w, $h) { return [pscustomobject]@{Left=$x; Top=$y; Width=$w; Height=$h; Right=($x+$w); Bottom=($y+$h); IsEmpty=$false} }
-$root = [pscustomobject]@{Current=[pscustomobject]@{BoundingRectangle=(Rect 0 0 1200 900)}}
+$root = [pscustomobject]@{Current=[pscustomobject]@{NativeWindowHandle=10;BoundingRectangle=(Rect 0 0 1200 900)}}
 function Editor($type, $role = '', $name = '') {
   $e = [pscustomobject]@{
     Current=[pscustomobject]@{IsEnabled=$true; IsOffscreen=$false; IsKeyboardFocusable=$true; HasKeyboardFocus=$false;
@@ -127,7 +133,7 @@ function Editor($type, $role = '', $name = '') {
 }
 $document = Editor ([System.Windows.Automation.ControlType]::Document) 'textbox'
 Assert (@((Get-ComposerCandidates $root @($document) $null $true).Candidates).Count -eq 1) 'editable textbox Document accepted for WorkBuddy'
-Assert (@((Get-ComposerCandidates $root @($document) $null).Candidates).Count -eq 0) 'other Agent policy unchanged'
+Assert (@((Get-ComposerCandidates $root @($document) $null).Candidates).Count -eq 1) 'explicit textbox Document accepted through the shared candidate filter'
 $document.Pattern.Current.IsReadOnly = $true
 Assert (@((Get-ComposerCandidates $root @($document) $null $true).Candidates).Count -eq 0) 'readonly document excluded'
 $document.Pattern.Current.IsReadOnly = $false
@@ -218,7 +224,6 @@ function Get-Process {
   $process | Add-Member ScriptMethod Refresh {}
   return $process
 }
-$root.Current | Add-Member NoteProperty NativeWindowHandle 10
 [WorkBuddyUia]::Root = $root
 Reset-ActivationFixture
 $ready = Editor ([System.Windows.Automation.ControlType]::Edit)
@@ -271,7 +276,7 @@ function Reset-SubmitFixture {
   [System.Windows.Automation.AutomationElement]::Hit = $script:SubmitButton
   [System.Windows.Automation.TreeWalker]::Parents[$script:SubmitButton] = $script:SubmitRoot
   $script:SubmitState = [pscustomobject]@{
-    Agent='codex'; CurrentTask=$true; WindowHandle=10; Root=$script:SubmitRoot
+    Agent='codex'; CurrentTask=$true; WriteAttempted=$false; WindowHandle=10; Root=$script:SubmitRoot
     Composer=$script:SubmitEditor; LastValue='exact task'
     ProcessId=20; RootHandle=10; ComposerRuntimeId='42,1'; TaskIdentity='current-thread'
   }
@@ -356,6 +361,7 @@ $failure = ''
 try { Assert-TaskDraftSnapshot $SubmitState ([pscustomobject]$snapshot) } catch { $failure = $_.Exception.Message }
 Assert ($failure.Contains('DESKTOP_TASK_TARGET_CHANGED')) 'snapshot cannot be appended to another conversation'
 Reset-SubmitFixture
+function Get-BoundComposerRoot($state) { Assert-TargetCurrent $state $true; return $state.Root }
 function Focus-Composer($state) {}
 function Wait-ComposerText($state, $text, $timeoutMs) { return $true }
 $SubmitState | Add-Member NoteProperty BaseValue ''
@@ -391,5 +397,5 @@ function Wait-ComposerText($state, $text, $timeoutMs) { return $false }
 [CodexVoiceNative]::Replacements = 0
 $failure = ''
 try { Set-ComposerText $SubmitState 'another request' $true $true } catch { $failure = $_.Exception.Message }
-Assert ($failure.Contains('Visible composer update failed') -and [CodexVoiceNative]::Replacements -eq 1) 'uncertain WorkBuddy writes are never retried'
+Assert ($failure.Contains('COMPOSER_WRITE_ACK_UNKNOWN') -and [CodexVoiceNative]::Replacements -eq 1) 'uncertain WorkBuddy writes are never retried'
 Write-Output 'Embedded PowerShell parse, native C# compile and mocked policy/orchestration cases passed. No native Windows UI tested.'

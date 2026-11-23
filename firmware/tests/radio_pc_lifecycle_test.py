@@ -24,6 +24,16 @@ def fixture():
     #[derive(Clone,Default)] struct UsbConnectionStatus {connected:bool, connection_id:String,board_device_id:String,boot_id:String,capabilities:Value}
     #[derive(Clone)] struct UsbSerialManager(Arc<Mutex<UsbConnectionStatus>>);
     impl UsbSerialManager {fn status(&self)->UsbConnectionStatus{self.0.lock().unwrap().clone()}}
+    // This fixture drives the physical USB lane. Paired mode 25 has separate
+    // authenticated loopback and device-view tests.
+    mod lan_agent {pub mod component_av {
+        use super::super::{UsbSerialManager,UsbConnectionStatus};
+        pub struct Binding{pub boot:String}
+        impl Binding {pub fn board(&self)->&str{unreachable!()}pub fn radio_key(&self)->String{unreachable!()}}
+        pub type Board=UsbConnectionStatus;
+        pub fn radio(_: &str,_:&UsbSerialManager)->Option<Binding>{None}
+        pub fn board_status(usb:&UsbSerialManager,_:Option<&Binding>)->Board{usb.status()}
+    }}
     mod owner {
      #[derive(Clone,Debug,PartialEq,Eq)] pub struct Scope {pub board:String,pub boot:String}
      pub struct Guard;

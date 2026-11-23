@@ -386,8 +386,24 @@ def test_flags_default_off_and_capability_env_enables_them():
 
 def test_hello_hooks_and_audio_exclusivity_wiring():
     protocol = (FW / 'main/pet_p4_protocol.c').read_text()
-    for flag, key, value in (('PET_P4_SEQUENCE', 'widgetSequence', 'p4-sequence-v1'), ('PET_P4_SAMPLES', 'widgetSamples', 'p4-samples-v1'), ('PET_P4_CLIP', 'widgetClip', 'p4-clip-v1'), ('PET_P4_BIG_IMAGE', 'widgetBigImage', 'p4-big-image-v1'), ('PET_P4_EVENTS', 'widgetEvents', 'p4-events-v1')):
-        assert f'#if {flag}\n  cJSON_AddStringToObject(capabilities, "{key}", "{value}");\n#endif' in protocol, key
+    advertised = {
+        "PET_P4_SEQUENCE": ("widgetSequence", "p4-sequence-v1"),
+        "PET_P4_SAMPLES": ("widgetSamples", "p4-samples-v1"),
+        "PET_P4_CLIP": ("widgetClip", "p4-clip-v1"),
+        "PET_P4_BIG_IMAGE": ("widgetBigImage", "p4-big-image-v1"),
+        "PET_P4_EVENTS": ("widgetEvents", "p4-events-v1"),
+    }
+    # Check actual preprocessor gates, including adjacent or nested advertisements.
+    start = protocol.index('#if PET_P4_SEQUENCE\n  cJSON_AddStringToObject(capabilities, "widgetSequence"')
+    end = protocol.index('cJSON_AddStringToObject(capabilities, "widgetMotion"', start)
+    gated = protocol[start:end]
+    for enabled in [set(), *({flag} for flag in advertised), set(advertised)]:
+        flags = [f'-D{flag}={int(flag in enabled)}' for flag in advertised]
+        output = subprocess.check_output(['cc', '-E', '-P', '-x', 'c', *flags, '-'],
+                                         input=gated, text=True)
+        for flag, (key, version) in advertised.items():
+            call = f'cJSON_AddStringToObject(capabilities, "{key}", "{version}");'
+            assert output.count(call) == int(flag in enabled), (enabled, key)
     assert '"component/alarm_policy"' in protocol and '"capabilityExt"' in protocol
     audio = (FW / 'main/pet_p4_audio.c').read_text()
     block = audio[audio.index('static bool cext_mix_step'):audio.index('static bool sfx_drain_step')]

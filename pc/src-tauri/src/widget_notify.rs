@@ -70,7 +70,7 @@ pub fn post(app: Option<&tauri::AppHandle>, usb: Option<&crate::usb_serial::UsbS
     let device = match usb {
         Some(usb) if !from_device => {
             let status = usb.status();
-            if !status.connected { Err("设备未连接".into()) }
+            if !status.connected { crate::lan_agent::runtime_events::notify(usb, payload) }
             else if status.capabilities[CAPABILITY] != ENGINE { Err("设备未声明 p4-notify-v1，仅显示客户端提示".into()) }
             else { usb.send(TOPIC, payload) }
         }

@@ -41,6 +41,8 @@ def test_radio_stream_chunked_mp3_timeout_and_format_rejection(tmp_path):
         "esp_tls.h": """
 #pragma once
 #include <sys/types.h>
+#include <stdbool.h>
+#include <stdint.h>
 #define ESP_OK 0
 typedef int esp_err_t;
 typedef int *esp_tls_error_handle_t;
@@ -60,8 +62,23 @@ ssize_t esp_tls_conn_read(esp_tls_t *, void *, size_t);
 ssize_t esp_tls_conn_write(esp_tls_t *, const void *, size_t);
 void esp_tls_conn_destroy(esp_tls_t *);
 """,
+        "lwip/dns.h": """
+#pragma once
+#include <stdint.h>
+typedef uint32_t ip_addr_t;
+typedef int err_t;
+#define DNS_MAX_HOST_IP 2
+#define IP_IS_V4(p) (1)
+#define ip_2_ip4(p) (p)
+#define ip4_addr_get_u32(p) (*(p))
+#define ERR_INPROGRESS 1
+#define ERR_OK 0
+#define LWIP_DNS_ADDRTYPE_IPV4 0
+err_t dns_gethostbyname_addrtype(const char *, ip_addr_t *, void (*)(const char *,const ip_addr_t *,void *), void *, unsigned);
+""",
+        "lwip/tcpip.h": "int tcpip_try_callback(void (*)(void *),void *);",
+        "lwip/sockets.h": "#include <sys/socket.h>",
         "esp_crt_bundle.h": "esp_err_t esp_crt_bundle_attach(void *);\n",
-        "lwip/netdb.h": "#include <netdb.h>\n",
         "lwip/inet.h": "#include <arpa/inet.h>\n",
         "esp_tls_errors.h": """
 #define ESP_TLS_ERR_SSL_WANT_READ -1
@@ -103,5 +120,5 @@ void vTaskDelete(void *);
     exe = tmp_path / "radio-stream-test"
     subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
                     "-DPET_P4_SYSTEM_WIFI=1", "-DESP_PLATFORM", "-D_POSIX_C_SOURCE=200809L", "-I", str(tmp_path), "-I", str(ROOT / "main"),
-                    str(ROOT / "tests/p4_radio_stream_test.c"), "-o", str(exe)], check=True)
+                    str(ROOT / "tests/p4_radio_stream_test.c"), str(ROOT / "main/pet_p4_live_tls.c"), "-o", str(exe)], check=True)
     subprocess.run([str(exe), str(fixture), str(finite_mp3), str(finite_wav)], check=True, timeout=10)

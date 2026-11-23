@@ -50,7 +50,7 @@ try {
  $node=Join-Path $ResourceRoot 'bridge/runtime/node.exe'
  $ffmpeg=Join-Path $ResourceRoot 'tools/ffmpeg.exe'
  $nodeHash=Check-X64Pe $node
- if ($nodeHash -ne 'e921fe5307e29bf6fd00000dd594356affd3a7b044e52720c7f10decbdc305b9') { throw 'Node executable differs from reviewed offline Windows runtime' }
+ if ($nodeHash -ne 'f5109dc868ec38703ad8f305e0aceece717cb60d4889873f434017af4e96cccb') { throw 'Node executable differs from reviewed offline Windows runtime' }
  $nodeVersion=(& $node --version 2>$null|Out-String).Trim()
  if ($LASTEXITCODE -ne 0 -or $nodeVersion -notmatch '^v\d+\.\d+\.\d+$') { throw 'Bundled Node execution failed' }
  $ffmpegHash=Check-X64Pe $ffmpeg

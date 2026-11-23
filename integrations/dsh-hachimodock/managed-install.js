@@ -11,7 +11,10 @@ const { pathToFileURL } = require('node:url')
 const yaml = require('./vendor/js-yaml.cjs')
 const { windowsAcl } = require('./windows-acl')
 const { profileMetadataAcl } = require('./profile-metadata-windows-acl')
-const FILES = ['package.json', 'index.js', 'dsh-bridge.js', 'server.js', 'client.js', 'capability.js', 'windows-acl.js', 'windows-acl.ps1', 'host-contract.js', 'dsh-state-contract.js', 'profile-metadata-windows-acl.js', 'profile-metadata-windows-acl.ps1']
+const FILES = ['package.json', 'index.js', 'dsh-bridge.js', 'server.js', 'client.js', 'capability.js', 'windows-acl.js', 'host-contract.js', 'dsh-state-contract.js', 'profile-metadata-windows-acl.js']
+const NATIVE_ACL = 'windows-acl.exe'
+const LEGACY_SCRIPTS = new Set(['windows-acl.ps1', 'profile-metadata-windows-acl.ps1'])
+const packageLimit = name => name === NATIVE_ACL ? 2 * 1024 * 1024 : 300000
 const BEGIN = '# BEGIN HACHIMODOCK MANAGED BRIDGE v1'
 const END = '# END HACHIMODOCK MANAGED BRIDGE v1'
 const hash = bytes => createHash('sha256').update(bytes).digest('hex')
@@ -116,9 +119,9 @@ async function install() {
         if (u.protocol !== 'http:' || u.hostname !== '127.0.0.1' || !u.port || u.origin !== r.baseUrl) fail('invalid-managed-connection')
         const installed = path.join(managed, r.package)
         check(installed, true, true)
-        if (!r.files || ['package.json', 'index.js', 'server.js', 'client.js', 'dsh-bridge.js', 'capability.js'].some(n => !r.files[n]) || Object.keys(r.files).some(n => !FILES.includes(n) || !/^[a-f0-9]{64}$/.test(r.files[n] || ''))) fail('invalid-managed-receipt')
+        if (!r.files || ['package.json', 'index.js', 'server.js', 'client.js', 'dsh-bridge.js', 'capability.js'].some(n => !r.files[n]) || Object.keys(r.files).some(n => !(FILES.includes(n) || LEGACY_SCRIPTS.has(n) || n === NATIVE_ACL) || !/^[a-f0-9]{64}$/.test(r.files[n] || ''))) fail('invalid-managed-receipt')
         for (const name of Object.keys(r.files)) {
-          const data = read(path.join(installed, name), 300000, true)
+          const data = read(path.join(installed, name), packageLimit(name), true)
           if (hash(data) !== r.files[name]) fail('managed-package-changed')
           if (name.endsWith('.js')) for (const match of data.toString('utf8').matchAll(/require\(['"](\.[^'"]+)['"]\)/g)) {
             const relative = path.posix.normalize(path.posix.join(path.posix.dirname(name), match[1]))
@@ -140,10 +143,11 @@ async function install() {
     exclusive(lock, String(process.pid)); locked = true
     if (!read(patch).equals(original)) fail('profile-changed')
     const bytes = new Map()
-    for (const name of FILES) {
+    const files = process.platform === 'win32' ? [...FILES, NATIVE_ACL] : FILES
+    for (const name of files) {
       const source = path.join(__dirname, name)
       const st = fs.lstatSync(source)
-      if (!st.isFile() || st.isSymbolicLink() || st.size > 300000) fail('invalid-bundled-plugin')
+      if (!st.isFile() || st.isSymbolicLink() || st.size > packageLimit(name)) fail('invalid-bundled-plugin')
       bytes.set(name, fs.readFileSync(source))
     }
     const sourceHash = hash(Buffer.concat([...bytes].flatMap(([name, data]) => [Buffer.from(name + '\0'), data])))
@@ -166,7 +170,7 @@ async function install() {
     mkdir(installed)
     for (const [name, data] of bytes) {
       const dest = path.join(installed, name)
-      if (fs.existsSync(dest)) { if (!read(dest, 300000, true).equals(data)) fail('managed-package-changed') }
+      if (fs.existsSync(dest)) { if (!read(dest, packageLimit(name), true).equals(data)) fail('managed-package-changed') }
       else exclusive(dest, data)
     }
     const nl = raw.includes('\r\n') ? '\r\n' : '\n'

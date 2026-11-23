@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { initializeProviderConfigs, loadProviderConfig, saveProviderConfig, STORAGE_KEY_PREFIX } from "./avatar-pipeline/provider-config.js";
 import { navigateTabs } from "./tab-navigation.js";
 import { setExitReason, installBrowserExitProtection } from "./exit-protection.js";
-import { componentRequiresPc } from "../component-center/catalog-state.js";
+import { componentFeatures } from "../component-center/component-features.js";
 import { componentUiMetadata } from "../../scripts/component-ui-metadata.mjs";
 
 test("list metadata omits corpora without mutating resource packs or controls", () => {
@@ -68,9 +68,8 @@ test("exit guard survives overlapping identical reasons and cleans up after all 
   } finally {setExitReason("a","");setExitReason("b","");if(old===undefined)delete globalThis.window;else globalThis.window=old;}
 });
 
-test("PC dependence badge and filter use one contract including media", () => {
-  assert.equal(componentRequiresPc({}),false);
-  assert.equal(componentRequiresPc({id:"token-usage"}),true);
-  for(const key of ["pcApplication","pcExtension","dataSource","mediaSource"]) assert.equal(componentRequiresPc({[key]:{}}),true);
-  assert.equal(componentRequiresPc({appRuntime:{host:{}}}),true);
+test("uncatalogued or invalid component metadata remains unknown", () => {
+  for (const item of [{}, {isDeviceOnly:true}, {valid:false,dataSource:"wifi.feed"}]) {
+    assert.deepEqual(componentFeatures(item,null).modes, ["unknown"]);
+  }
 });

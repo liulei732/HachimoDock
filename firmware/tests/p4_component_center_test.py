@@ -22,33 +22,39 @@ HARNESS = r'''
 typedef struct {
  char widget_id[64],title[128];
  bool active;
- uint32_t center_title_checksum;
+ uint32_t center_title_checksum,center_thumb_checksum;
+ uint8_t center_thumb_generation;
  uint8_t center_title_slot,center_title_generation;
 } pet_p4_miniapp_catalog_entry_t;
 static size_t pet_p4_miniapp_center_read_title(const pet_p4_miniapp_catalog_entry_t *entry,uint8_t *data,size_t capacity){
  (void)entry;(void)data;(void)capacity;return 0;
 }
 static size_t count,selected,reads;
+static uint32_t test_package_checksums[4];
 static pet_center_filter_t active_filter;
 static pet_center_filter_t pet_p4_miniapp_center_filter(void){return active_filter;}
 static bool preview;
+static unsigned fallback_tiles;
 static const char *ids[]={"city-radio","xiangqi","wasm-2046","wasm-piano"};
 static const char *titles[]={"城市电台","中国象棋","2046","模拟琴键"};
-static const char *media_ids[]={"city-radio","daily-news","book-pocket","hachimi-sounds","hachimi-learn"};
-static const char *media_titles[]={"城市电台","每日新鲜事","每天一本书","自然声景","每日新知"};
+static const char *media_ids[]={"city-radio","book-pocket","hachimi-learn","hachimi-sounds"};
+static const char *media_titles[]={"城市电台","每天一本书","每日新知","自然声景"};
 static size_t pet_p4_miniapp_center_count(void){return count;}
 static size_t pet_p4_miniapp_center_selected(void){return selected;}
 static bool pet_p4_miniapp_center_get(size_t i,pet_p4_miniapp_catalog_entry_t *out){
  assert(i<count);assert(i/4==selected/4);++reads;
  const bool media=active_filter==PET_CENTER_MEDIA;
- const char *id=media&&i<5?media_ids[i]:i<4?ids[i]:"other";
- const char *title=media&&i<5?media_titles[i]:i<4?titles[i]:"名称很长很长很长的组件";
+ const char *id=media&&i<4?media_ids[i]:i<4?ids[i]:"other";
+ const char *title=media&&i<4?media_titles[i]:i<4?titles[i]:"名称很长很长很长的组件";
+ if(i<4)out->center_thumb_checksum=test_package_checksums[i];
+ out->center_title_slot=i;
  snprintf(out->widget_id,sizeof(out->widget_id),"%s",id);
  snprintf(out->title,sizeof(out->title),"%s",title);out->active=i==0;return true;
 }
 static uint16_t rgb565(int r,int g,int b){return ((r>>3)<<11)|((g>>2)<<5)|(b>>3);}
 static void bounds(int x,int y,int w,int h){assert(x>=0&&y>=0&&w>0&&h>0&&x+w<=640&&y+h<=480);}
 static void fill_round_rect(int x,int y,int w,int h,int r,uint16_t c){
+ if(w==44&&h==44&&r==12)++fallback_tiles;
  bounds(x,y,w,h);assert(r>=0&&r<=w/2&&r<=h/2);
  if(preview)printf("[\"rect\",%d,%d,%d,%d,%d,%u]\n",x,y,w,h,r,c);
 }
@@ -91,16 +97,22 @@ typedef struct { unsigned unused; } tinfl_decompressor;
 typedef int tinfl_status;
 enum { MALLOC_CAP_SPIRAM = 1, MALLOC_CAP_8BIT = 2, TINFL_STATUS_DONE = 0,
        TINFL_FLAG_PARSE_ZLIB_HEADER = 1, TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF = 2 };
+static unsigned outstanding, inflations;
+static bool fail_allocation;
 static void *heap_caps_malloc(size_t size, unsigned caps) {
  assert(caps == (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
- return malloc(size);
+ if(fail_allocation)return NULL;
+ ++outstanding;return malloc(size);
 }
-static void heap_caps_free(void *p){ free(p); }
+static void *heap_caps_calloc(size_t n,size_t size,unsigned caps){
+ void *p=heap_caps_malloc(n*size,caps);if(p)memset(p,0,n*size);return p;
+}
+static void heap_caps_free(void *p){ assert(p&&outstanding);--outstanding;free(p); }
 static void tinfl_init(tinfl_decompressor *state){ state->unused=0; }
 static tinfl_status tinfl_decompress(tinfl_decompressor *state, const uint8_t *input,
                                      size_t *in_len, uint8_t *start, uint8_t *output,
                                      size_t *out_len, unsigned flags){
- assert(state->unused==0 && start==output);
+ ++inflations;assert(state->unused==0 && start==output);
  assert(flags==(TINFL_FLAG_PARSE_ZLIB_HEADER|TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF));
  z_stream stream={.next_in=(Bytef *)input,.avail_in=(uInt)*in_len,
                   .next_out=output,.avail_out=(uInt)*out_len};
@@ -113,32 +125,73 @@ static tinfl_status tinfl_decompress(tinfl_decompressor *state, const uint8_t *i
 }
 
 static uint16_t *center_background=background_pixels;
-static void center_art_prepare(void){if(preview)puts("[\"background\"]");}
-static bool center_draw_thumbnail(const char *id,int x,int y){
- for(size_t i=0;i<CENTER_ART_COUNT;i++)if(!strcmp(id,center_art_catalog[i].id)&&center_art_catalog[i].art){
-  bounds(x,y,64,48);if(preview)printf("[\"thumbnail\",\"%s\",%d,%d]\n",id,x,y);return true;
- }
- return false;
+static int64_t clock_us;
+static int64_t esp_timer_get_time(void){return clock_us;}
+static unsigned package_reads;
+#define PET_CENTER_THUMB_BYTES 1568u
+static bool storage_busy;
+static bool center_thumbnail_storage_busy(void){return storage_busy;}
+static FILE *open_thumb_in_test_directory(const char *path,const char *mode){
+ assert(!strncmp(path,"/spiffs/",8)&&!strcmp(mode,"rb"));++package_reads;
+ return fopen(path+8,mode);
 }
+#define fopen open_thumb_in_test_directory
+#define PET_WIDGET_TRACE_SCOPE(scope,event)
+#include "thumb_reader.h"
+#undef fopen
+#include "thumb_blob.h"
+#define center_thumbs_z_end (center_thumbs_z+sizeof(center_thumbs_z))
+#include "pet_p4_center_thumbnails.inc"
+static void center_art_prepare(void){
+ if(!center_thumb_page)center_thumbnails_prepare();
+ if(preview)puts("[\"background\"]");
+}
+static center_thumb_state_t observed_thumbnail(const pet_p4_miniapp_catalog_entry_t *e,unsigned slot,int x,int y,bool *allow){
+ center_thumb_state_t state=center_draw_thumbnail(e,slot,x,y,allow);
+ if(preview&&state==CENTER_THUMB_DRAWN){
+   bounds(x,y,64,48);
+   printf("[\"thumbnail\",%d,%d,\"",x,y);
+   for(int row=0;row<48;++row)for(int col=0;col<64;++col)
+     printf("%04x",center_thumb_page->cards[slot].pixels[row*64+col]);
+   puts("\"]");
+ }
+ return state;
+}
+#define center_draw_thumbnail observed_thumbnail
+
 '''
 MAIN = r'''
 int main(int argc,char **argv){
+ test_thumbnail_cache();
  (void)argv;
- for(count=0;count<=32;++count){
+ for(count=0;count<=41;++count){
    for(selected=0;selected<(count?count:1);++selected){
      reads=0;render_component_center_page(false);
      size_t remaining=count-selected/4*4;assert(reads==(remaining<4?remaining:4));
    }
  }
+ /* Page two contains unknown legacy packages. All four receive the geometric icon. */
+ count=8;selected=4;fallback_tiles=0;
+ render_component_center_page(false);assert(fallback_tiles==4);
+ /* Mapped art is visible on the first frame, even when storage reads are disabled. */
+ selected=0;fallback_tiles=0;
+ unsigned before=inflations;
+ render_component_center_page(true);assert(fallback_tiles==0&&before+4==inflations);
+ for(int i=0;i<4;++i){
+   fallback_tiles=0;render_component_center_page(false);
+   assert(fallback_tiles==0&&before+4==inflations);
+ }
  count=0;selected=99;render_component_center_page(true);
  for(active_filter=PET_CENTER_GAMES;active_filter<PET_CENTER_FILTER_COUNT;++active_filter)render_component_center_page(false);
  active_filter=PET_CENTER_ALL;
  if(argc>1){
-   preview=true;
+
    active_filter=!strcmp(argv[1],"media")?PET_CENTER_MEDIA:PET_CENTER_ALL;
-   count=active_filter==PET_CENTER_MEDIA?5:CENTER_ART_COUNT;selected=0;
-   render_component_center_page(false);
+   count=active_filter==PET_CENTER_MEDIA?4:CENTER_ART_COUNT;selected=0;
+   for(unsigned i=0;i<4;++i)render_component_center_page(false);
+   preview=true;render_component_center_page(false);
  }
+ center_thumbnails_release();assert(outstanding==0);
  return 0;
 }
 '''
@@ -155,9 +208,34 @@ def run_renderer(preview=False):
     with tempfile.TemporaryDirectory() as tmp:
         code, binary = Path(tmp)/"cards.c", Path(tmp)/"cards"
         headers = '#include "pet_p4_center_layout.h"\n#include <stdbool.h>\n#include <stdlib.h>\n#include <zlib.h>\n#include "pet_p4_center_text.h"\n#include "../assets/component-center/catalog.h"\n#include "../assets/component-center/text_masks.h"\n'
-        code.write_text(headers + HARNESS + renderer + MAIN)
+        blob = (ROOT / "assets/component-center/center_thumbs.deflate").read_bytes()
+        (Path(tmp) / "thumb_blob.h").write_text("static uint8_t center_thumbs_z[]={" +
+            ",".join(map(str, blob)) + "};")
+        # Run the firmware reader on real temporary files. Only the SPIFFS mount
+        # is redirected; paths, exact-size checks, hashes and bank selection are production C.
+        miniapp = (ROOT / "main/pet_p4_miniapp.c").read_text()
+        start = miniapp.index("static uint32_t miniapp_checksum(const char *data, size_t len) {")
+        checksum = miniapp[start:miniapp.index("\n}", start)+2]
+        reader = (ROOT / "main/pet_p4_center_thumb.inc").read_text().split(
+            "static bool center_thumb_matches(", 1)[0]
+        (Path(tmp) / "thumb_reader.h").write_text(checksum + "\n" + reader)
+        checks = (ROOT / "tests/p4_center_thumbnails_test.inc").read_text()
+        # Exercise the actual time gate with a static view and no input events.
+        main = (ROOT / "main/pet_p4_main.c").read_text()
+        gate_start = main.index("lcd_err == ESP_OK && !transfer_active\n")
+        gate = main[gate_start:main.index(") {", gate_start)]
+        scheduler = """
+#define PET_P4_MAIN_RENDER_INTERVAL_MS 50
+static bool pet_p4_miniapp_slicing_active(void){return false;}
+static bool pet_p4_miniapp_media_surface_animated(void){return false;}
+static bool static_center_frame_due(uint64_t now_ms,uint64_t last_render_ms){
+ struct { const char *screen_page; } g_state={"components"};
+ const bool transfer_active=false;
+ const int lcd_err=0, ESP_OK=0;
+ return """ + gate + ";\n}\n"
+        code.write_text(headers + HARNESS + renderer + scheduler + checks + MAIN)
         subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-I", str(ROOT / "main"), str(code), "-lz", "-o", str(binary)], check=True)
-        return subprocess.check_output([str(binary)] + ([preview] if preview else []), text=True)
+        return subprocess.check_output([str(binary)] + ([preview] if preview else []), text=True, cwd=tmp)
 
 
 def test_card_renderer_bounds_empty_single_partial_full_pages():
@@ -177,26 +255,21 @@ def preview(path, category):
     draw = ImageDraw.Draw(image)
     font_path = "/System/Library/Fonts/STHeiti Medium.ttc"
     color = lambda n: ((n >> 11)*255//31, ((n >> 5)&63)*255//63, (n&31)*255//31)
-    import re
     import struct
-    import zlib
-    asset_root=ROOT/'assets/component-center'
-    thumbnail_ids=re.findall(r'^  \{"([^"]+)",', (asset_root/'catalog.h').read_text(), re.MULTILINE)
-    thumbs=zlib.decompress((asset_root/'center_thumbs.deflate').read_bytes())
     for line in run_renderer(category).splitlines():
         op, *a = json.loads(line)
         if op == "background":
             image.paste(Image.open(ROOT / 'assets/component-center/center_background.jpg').convert('RGB'))
         elif op == "thumbnail":
-            ident,x,y=a
-            size=32+64*48//2
-            start=thumbnail_ids.index(ident)*size
-            palette=struct.unpack("<16H",thumbs[start:start+32])
-            indices=thumbs[start+32:start+size]
-            thumb=Image.frombytes("RGB",(64,48),bytes(c for pair in indices
-                for index in (pair>>4,pair&15) for c in color(palette[index])))
+            x,y,hex_pixels=a
+            pixels=struct.unpack(">3072H",bytes.fromhex(hex_pixels))
+            thumb=Image.frombytes("RGB",(64,48),bytes(c for pixel in pixels for c in color(pixel)))
             mask=Image.new("L",(64,48))
-            ImageDraw.Draw(mask).rounded_rectangle((0,0,63,47),7,fill=255)
+            mask_draw=ImageDraw.Draw(mask)
+            for row in range(48):
+                dy=max(7-row,row-40,0)
+                inset=7-int((49-dy*dy)**0.5)
+                mask_draw.line((inset,row,63-inset,row),fill=255)
             image.paste(thumb,(x,y),mask)
         elif op == "rect":
             x,y,w,h,r,c=a;draw.rounded_rectangle((x,y,x+w-1,y+h-1),r,fill=color(c))

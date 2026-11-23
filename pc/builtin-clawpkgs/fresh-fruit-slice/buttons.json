@@ -3,7 +3,7 @@
     "action": "slice.restart",
     "control": "SW1",
     "event": "button.sw1.short_press",
-    "label": "开始或重新开始"
+    "label": "开始／继续／再玩"
   },
   {
     "action": "slice.pause",

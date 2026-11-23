@@ -507,9 +507,30 @@ static char *prepare_status(
   if(save_stack&&!cJSON_AddItemToObject(runtime,"saveWorkerStack",save_stack))cJSON_Delete(save_stack);
 #endif
   pet_p4_render_metrics_t render = pet_p4_renderer_metrics();
+#if BSP_LCD_PANEL_AUTO
+  pet_lcd_panel_model_t panel = pet_p4_lcd_panel_model();
+  const bool nv3049 = panel == PET_LCD_PANEL_NV3049;
+  const bool identified = panel != PET_LCD_PANEL_UNKNOWN;
+  cJSON_AddStringToObject(runtime, "lcdProfile",
+    pet_p4_lcd_no_touch_profile() ? "nv3049-no-touch" : "auto");
+  cJSON_AddStringToObject(runtime, "lcdPanel", !identified ? "unidentified" : nv3049 ? "NV3049F" : "ST7701S");
+  if (nv3049) {
+    cJSON_AddStringToObject(runtime, "lcdRgb888Converter",
+      pet_p4_lcd_nv3049_ppa_active() ? "ppa" : "cpu");
+    cJSON_AddNumberToObject(runtime, "lcdRefreshMaxGapMs",
+      pet_p4_lcd_nv3049_max_refresh_gap() * portTICK_PERIOD_MS);
+  }
+  cJSON_AddNumberToObject(runtime, "lcdDsiLanes",
+    !identified ? 0 : nv3049 ? BSP_LCD_NV3049_LANES : BSP_LCD_MIPI_DSI_LANE_NUM);
+  cJSON_AddNumberToObject(runtime, "lcdDsiLaneMbps",
+    !identified ? 0 : nv3049 ? BSP_LCD_NV3049_LANE_MBPS : BSP_LCD_MIPI_DSI_LANE_BITRATE_MBPS);
+  cJSON_AddNumberToObject(runtime, "lcdPixelClockMHz",
+    !identified ? 0 : nv3049 ? BSP_LCD_NV3049_CLOCK_MHZ : BSP_LCD_DPI_CLOCK_MHZ);
+#else
   cJSON_AddNumberToObject(runtime, "lcdDsiLanes", BSP_LCD_MIPI_DSI_LANE_NUM);
   cJSON_AddNumberToObject(runtime, "lcdDsiLaneMbps", BSP_LCD_MIPI_DSI_LANE_BITRATE_MBPS);
   cJSON_AddNumberToObject(runtime, "lcdPixelClockMHz", BSP_LCD_DPI_CLOCK_MHZ);
+#endif
 #if PET_P4_SYSTEM_WIFI
   add_lcd_scanout(runtime);
 #endif
@@ -1000,6 +1021,21 @@ bool pet_p4_diagnostics_handle_topic_with_reply(
       err == ESP_OK,
       err == ESP_OK ? "input bindings restored to safe defaults" : esp_err_to_name(err)
     );
+#if BSP_LCD_PANEL_AUTO
+  } else if (strcmp(topic, "system/lcd-profile") == 0) {
+    const cJSON *profile = cJSON_GetObjectItemCaseSensitive(payload, "profile");
+    const char *name = cJSON_IsString(profile) ? profile->valuestring : "";
+    const bool no_touch = strcmp(name, "nv3049-no-touch") == 0;
+    if (!no_touch && strcmp(name, "auto") != 0) {
+      send_action(payload, send_line, ctx, "lcd-profile", false, "expected auto or nv3049-no-touch");
+    } else if (pet_p4_ota_active() || (state && state->asset_transfer_active)) {
+      send_action(payload, send_line, ctx, "lcd-profile", false, "device transfer is active");
+    } else {
+      esp_err_t err = pet_p4_lcd_save_no_touch_profile(no_touch);
+      send_action(payload, send_line, ctx, "lcd-profile", err == ESP_OK,
+        err == ESP_OK ? "LCD profile saved; reboot to apply" : esp_err_to_name(err));
+    }
+#endif
   } else if (strcmp(topic, "system/reboot") == 0) {
     const bool accepted = schedule_reboot_locked(state);
     send_action(payload, send_line, ctx, "reboot", accepted, accepted

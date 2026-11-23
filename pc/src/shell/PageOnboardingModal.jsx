@@ -8,6 +8,7 @@
  *        `pc/src/.folder.md`, and `pc/src/shell/.folder.md`.
  */
 
+import { useDialogFocus } from "../component-center/use-dialog-focus.js";
 import React, { useCallback, useEffect, useState } from "react";
 import { Compass, X } from "lucide-react";
 import {
@@ -47,14 +48,7 @@ export default function PageOnboardingModal({
     if (open) setDontShowAgain(true);
   }, [open]);
 
-  useEffect(() => {
-    if (!open) return undefined;
-    const handleKeyDown = (event) => {
-      if (event.key === "Escape") onClose?.(dontShowAgain);
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [dontShowAgain, onClose, open]);
+  const dialogRef = useDialogFocus(() => onClose?.(dontShowAgain), false, open);
 
   if (!open) return null;
 
@@ -64,6 +58,7 @@ export default function PageOnboardingModal({
   return (
     <div className="modal-backdrop" onClick={handleClose}>
       <section
+        ref={dialogRef} tabIndex={-1}
         className="modal-card page-onboarding-modal"
         role="dialog"
         aria-modal="true"

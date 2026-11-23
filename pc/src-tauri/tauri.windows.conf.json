@@ -16,6 +16,7 @@
       }
     },
     "resources": {
+      "generated-runtime/windows-acl.exe": "dsh-bridge/windows-acl.exe",
       "generated-runtime/node.exe": "bridge/runtime/node.exe",
       "generated-runtime/ffmpeg.exe": "tools/ffmpeg.exe",
       "generated-runtime/ffmpeg.LICENSE": "tools/ffmpeg.LICENSE",

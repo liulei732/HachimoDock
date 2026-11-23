@@ -31,8 +31,8 @@ export function klingVideoParameters(model, value = {}) {
 }
 
 export function requireKlingVideoModel(config = {}) {
-  if (!config.apiKey?.trim()) throw new Error("请先在 API 配置中保存可灵 AI 的 API Key。");
+  if (!config.apiKey?.trim()) throw new Error("请先在模型配置中保存可灵 AI 的 API Key。");
   const model = klingModel(config.model || KLING_MODELS[0].id);
-  if (!model) throw new Error("请在 API 配置中选择新版可灵视频模型。");
+  if (!model) throw new Error("请在模型配置中选择新版可灵视频模型。");
   return model;
 }

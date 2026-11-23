@@ -25,6 +25,9 @@ static bool miniapp_ext_abort(pet_cext_publish_ticket_t *ticket);
 /* Compatibility immediate transaction, not a catalog rollback boundary. */
 static bool miniapp_ext_publish(miniapp_runtime_t *next, size_t slot, uint8_t generation);
 static void miniapp_ext_installed(const miniapp_runtime_t *next);
+#if PET_P4_EVENTS
+static void miniapp_ext_forget_events(const char *widget_id);
+#endif
 static void miniapp_ext_removed(const char *widget_id, size_t slot);
 static bool miniapp_ext_install_chunk(const cJSON *payload, const char *path, const char *data, long index, char *error, size_t error_size);
 static bool miniapp_ext_save_text(char *out, size_t cap);

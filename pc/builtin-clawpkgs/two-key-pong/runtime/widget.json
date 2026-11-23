@@ -203,6 +203,11 @@
         "with": "bat",
         "do": [
           {
+            "op": "place",
+            "entity": "orb",
+            "y": 11
+          },
+          {
             "op": "bounce",
             "entity": "orb",
             "axis": "y"

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {BACKGROUND_IDLE,backgroundSnapshot,createProgramBackgroundController,supportsBackgroundPrograms,supportsBackgroundProgramEngine} from './program-background.js';
+import {wirelessMaintenanceTarget,BACKGROUND_IDLE,backgroundSnapshot,createProgramBackgroundController,supportsBackgroundPrograms,supportsBackgroundProgramEngine} from './program-background.js';
 const bootId='0123456789abcdef';
 const row={widgetId:'focus',registration:'18446744073709551615',live:true,stopped:false,checkpointPending:true,revision:1,phase:1,lastStepUs:50,maxStepUs:100};
 const snapshot=(items=[row])=>({bootId,items});
@@ -77,4 +77,30 @@ test('invalid or failed confirmation stays unknown without private error reflect
   }
   const c=createProgramBackgroundController({board:'p4-test',invoke:name=>{if(name==='usb_get_background_programs')return snapshot();throw Error('private-path-key');}});
   await c.refresh();await c.start('focus');assert.equal(JSON.stringify(c.getState()).includes('private-path-key'),false);
+});
+
+test('maintenance requires a trusted full descriptor for the current Wi-Fi session',()=>{
+  const boardDeviceId='p4-0123456789ab';
+  const target={boardDeviceId,bootId,association:3,capabilities:{widgetMaintenance:'paired-component-maintenance-v1'}};
+  const wifi={boardDeviceId,bootId,controlTrusted:true,wifiConnected:true,componentBundle:true,componentTarget:target};
+  assert.equal(wirelessMaintenanceTarget(wifi),target);
+  for(const patch of [{controlTrusted:false},{wifiConnected:false},{componentBundle:false},{boardDeviceId:'p4-000000000000'},
+    {bootId:'fedcba9876543210'},{componentTarget:null},{componentTarget:{...target,capabilities:{}}},
+    {componentTarget:{...target,association:0}},{componentTarget:{...target,association:4294967296}}]){
+    assert.equal(wirelessMaintenanceTarget({...wifi,...patch}),null);
+  }
+});
+test('wireless background operations keep the same scope and reject replies from a new boot',async()=>{
+  const calls=[],scope={bootId,association:23},board='p4-0123456789ab';
+  let reply=snapshot([]);
+  const c=createProgramBackgroundController({board,maintenanceTarget:scope,invoke:(name,args)=>{
+    calls.push([name,args]);return name==='usb_get_background_programs'?reply:{confirmed:true,snapshot:{...snapshot(),bootId:'ffffffffffffffff'}};
+  }});
+  await c.refresh();await c.start('focus');
+  assert.equal(c.getState().status,'unknown');
+  await assert.rejects(c.start('focus'),/not_ready/);
+  reply={...snapshot(),bootId:'ffffffffffffffff'};
+  await c.refresh();assert.equal(c.getState().status,'error');
+  assert.equal(calls.filter(([name])=>name==='usb_start_background_program').length,1);
+  for(const [,args] of calls){assert.deepEqual(args.maintenanceTarget,scope);assert.equal(args.expectedBoardDeviceId,board);}
 });

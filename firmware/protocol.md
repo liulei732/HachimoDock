@@ -1,5 +1,25 @@
 # ESP-P4 USB Protocol
 
+## Display profile
+
+Wi-Fi 6 and Pico v1/v3 use the existing firmware project identity for both
+LCDs on each target. The default ST7701S path starts the display before configuring legacy
+touch. A verified CST328 identity or an explicit USB profile selects NV3049F.
+A failed probe or I2C timeout leaves the standard panel path available.
+
+The physical USB protocol can save the mode for the next boot:
+
+```json
+{"topic":"system/lcd-profile","payload":{"profile":"nv3049-no-touch","requestId":"lcd-profile-config"}}
+```
+
+The supported profiles are `auto` and `nv3049-no-touch`. Confirm the
+`diagnostics/action` reply reports success before sending `system/reboot`.
+The profile is retained in NVS across application OTA. The runtime diagnostics
+include `lcdPanel`, `lcdProfile`, the selected DSI timing and the existing
+touch health fields. NV3049F also reports `lcdRgb888Converter` and
+`lcdRefreshMaxGapMs`. A transfer in progress blocks profile changes.
+
 ## Device approval modal
 
 The host may send a single pending approval request. Example (synthetic values):
@@ -530,6 +550,10 @@ R172 候选的 `renderLifetime.sameFramePhases.contentStagesInclusive` 增加 bu
 
 现代 `asset/slot-query` 的 observationSchema、queryNonce、expectedBoardDeviceId、expectedBootId、transferId 必须逐项唯一、类型正确且与当前设备匹配。忙碌回复使用 `ok=false, proof=false, quiescent=false`，保留 queryNonce/boardDeviceId/bootId，并给出 errorCode=`appearance_query_busy`；这是身份绑定的“尚无证明”，不含 slots，不表示安全静默。操作结果未知优先给出 `appearance_query_outcome_unknown`，不得当成可重试的忙碌、升级提示或清理授权。PC 仅对前者在同一连接代次内做有界只读等待，完整正向静默证明前不归档旧未知操作、不重放写入。
 
+USB 与受信 Wi‑Fi 共用形象槽位读回。固件读到确定的空槽才报告无有效包。分区头暂时读失败、内存紧张或并发读取时，请求方应重新查询。设备包标识匹配时，只需激活并回读槽位，素材传输量为零。
+
+配对 Wi‑Fi 的形象操作使用 mode 18。已认证的单字节 `2` 表示工作线程尚未执行本步，可在同一启动和配对下短暂等待后重试。单字节 `0` 无法证明写入结果。只有只读查询和具备重复分块校验的原始视频允许安全重试。重复视频块须属于同一传输，路径、序号、长度和内容校验均须相符。提交或激活的回执不明确时，客户端回读实际槽位。
+
 0.7.100-p4：新增 `widgetMediaQueueMax=128` 与 `widgetMediaLifecycle=p4-media-lifecycle-v1`。媒体队列超过 20 项时，key 至多 80 UTF-8 字节、标题至多 90 字节；上限 128，刷新按 key 保留选中项，不修改音频会话。`media/event` 新增 `operation=visibility`，包含 `source/boot/epoch/visible`；进入或离开递增 epoch，可见时每 2 秒发送心跳。宿主只有资源包声明自动播放、当前可见且新的进入事件时才准备播放，停止/离开取消未开始的播放；目录刷新不重新触发播放。能力与配置为通用媒体机制，不绑定特定组件 ID。
 
 0.7.83-p4 媒体重入：从组件中心重新进入当前已验证的媒体组件只恢复界面，不重写目录或失效图片缓存，避免后台音频因同步 Flash 操作欠载。切到其他组件、安装更新及游戏重开仍走原有加载/校验路径；媒体会话与全局退出语义不变。
@@ -540,7 +564,7 @@ R172 候选的 `renderLifetime.sameFramePhases.contentStagesInclusive` 增加 bu
 
 ## PC 音频播放器（0.7.66-p4）
 
-0.7.69-p4：离开随身听组件允许后台播放。在宠物主页触发配置的全局 `page_back` 时，设备立即停止音乐并清空音乐缓冲，上报 `media/event {operation:"stop"}`，同时 input/event 标记 action=media_stop、handledLocally=true。即使 PC 尚在准备歌曲也上报，以取消对应任务；PC 不在接收线程阻塞等待 USB，补发的清理只针对当时的音乐会话。保留曲库，不自动下一首；实时对话中的退出优先于停止音乐。
+离开媒体组件时，设备停止该组件的播放并清空对应缓冲。对电脑代播的媒体源，设备先发带 source 的 `media/event {operation:"stop"}` 取消当前播放及准备任务，再报告 `visibility=false`。在宠物主页触发配置的全局 `page_back` 仍可取消播放准备，并发送 action=media_stop、handledLocally=true 的按键事件。曲库保留，实时对话优先处理其退出操作。
 
 能力 `widgetMedia=p4-media-v1` 表示支持 v4 工具的 `media.source=audio.player` 原生播放器。
 `media/begin/chunk/end/query/control/stop/metadata/cover/library` 的每个请求使用唯一 requestId，
@@ -1101,6 +1125,17 @@ PC to board:
   subject to their shared component resource capacity, and fixed two- or
   four-page memory. A single sprite remains bounded to 65,536 bytes.
 
+The trusted LAN status request (mode 6, selector 1, `rtcKey & 64`) supports
+selector 2 for a compact bundle descriptor (1 KiB). Bit 7 additionally offers
+selector 3 for the full component capabilities and runtime limits from USB hello.
+The encrypted response binds them to `boardDeviceId`, `bootId` and a nonzero
+`association`, established after checking the SSID and security of the current
+association. Mode 14 accepts a 16-byte boot ID followed by the big-endian u32
+association. Losing that association invalidates outstanding installation work.
+The transfer advertises `widgetTransferChunkBytes`, `widgetTransferMaxFiles` and
+`widgetTransferMaxBytes` from the receiver's limits; audio-capable targets
+also report `widgetWasmAudioMaxBytes`. The per-resource limits still apply.
+
 When hello advertises `widgetTransfer: p4-widget-files-v2`, desktop installs can opt in
 with `transferProtocol`, `packageSha256`, `fileCount`, and `totalBytes` on
 `widget/begin`. The manifest digest covers each nonempty file in ascending UTF-8
@@ -1135,6 +1170,17 @@ keep the original envelope and uncertain-write behavior.
   rectangle. It saves the mask with the package generation and checks its
   catalog checksum before drawing. A missing or invalid mask falls back
   to the built-in title rendering.
+  On USB, `capabilities.widgetCenterThumb="p4t-64x48-v1"` advertises launcher
+  covers. Trusted Wi-Fi component transfers negotiate the same tile support.
+  Pet Manager derives `runtime/center-thumb.p4t` from the package's
+  `pc/cover.png`. The tile is exactly 1,568 bytes. Its first 32 bytes are
+  16 little-endian RGB565 colors. The remaining bytes encode 64 × 48 pixels
+  in row order, with the left pixel in the high nibble. Normal installations
+  send the tile with the package. A cover-only repair sends the tile alongside
+  `runtime/center-thumb.match`, the 32-byte SHA-256 digest of the prepared
+  device runtime JSON. The device checks the installed ID and runtime before
+  switching its catalog entry to the replacement tile. The existing component
+  and its saved state stay active during a cover-only repair.
   For the built-in `token-usage` package only, Pet Manager removes its Linux host
   reader/fetcher declarations before transfer. Firmware then updates its four
   declared display variables from the validated bounded stats model; arbitrary
@@ -1330,6 +1376,19 @@ The `keyboard/config-state` response contains the board identity, mode, bonded
 and connected state, pairing state, and the stored chord values in a 20-slot array. A zero chord
 clears a slot. A nonzero chord encodes the keyboard modifier bits in the upper
 byte and the standard keyboard HID usage in the lower byte.
+
+On WiFi6 builds with NimBLE, an upgraded board advertises
+`"conditionalUpdate":"keyboard-cas-v1"` in its live configuration response over
+both USB and authenticated LAN mode 15. Bind the read and write to the same
+device session. For a conditional slot update send, for example,
+`{"slot":0,"expectedChord":262,"setChord":0}`. For a conditional mode update
+send `{"expectedEnabled":false,"setEnabled":true}`. Keep legacy mutation fields
+out of these requests. The device compares only the specified slot or mode and
+applies the change under the same state mutex as local settings. On a mismatch
+it returns `ok:false` and `error:"keyboard_conflict"` before invoking the setter.
+Success includes `conditionalApplied:true` and the normal full readback.
+An ambiguous response requires a fresh read. With older firmware the desktop
+uses the existing preflight, unconditional update and readback flow.
 
 Slots 0–8 represent SW1, SW2, and SW3, each in single, double, long order.
 Slots 9 and 11 map short and long joystick center presses.
@@ -1599,6 +1658,34 @@ recognition without opening the PC microphone; legacy boards may still use the
 local voice-service relay at `127.0.0.1:50001`. `audio/error` terminates the
 current session. `audioCapture.codec` reports `ES7210`, `ES8311`, or
 `unavailable` according to the initialized capture path.
+
+### USB PTT bottom bar
+
+A device advertising `capabilities.voiceFeedback: "p4-voice-feedback-v2"`
+includes a nonzero `voiceFeedbackToken` in `audio/begin` for USB button
+capture on the pet page. The firmware meters the existing PCM locally every
+80 ms for the waveform.
+
+The desktop coalesces display updates into one slot and sends them at most
+once per 150 ms on the admitted USB connection. The payload uses the
+firmware's `audio/begin.sessionId` as `captureId`.
+
+```json
+{"topic":"ui/voice-feedback","payload":{"boardDeviceId":"p4-...","bootId":"<debugBootId>","captureId":"p4-audio-123-1","token":7,"revision":2,"phase":"draft_ready","text":"你好","draftInserted":true}}
+```
+
+Phases are `listening`, `partial`, `finalizing`, `draft_ready`,
+`submitting`, `submitted`, `queued`, `error`, `submit_unknown` and
+`cancelled`. Text is a single line of up to 384 UTF-8 bytes. The firmware
+accepts updates for the current capture and boot, then retires the display on
+USB rebind, disconnect, timeout or when realtime conversation takes over.
+
+While a rendered draft is visible, the bound short-press Confirm action
+emits the existing `input/event` with `voiceDraftVisible: true`,
+`voiceUtteranceId` equal to the capture ID and the same `voiceFeedbackToken`.
+The desktop checks the native board, boot and connection as well. After
+12 seconds of draft display, the device discards the bottom bar and the
+draft stays on the desktop. The feedback topic carries display state only.
 
 ## Realtime Conversation Audio
 
@@ -2367,6 +2454,10 @@ shell+canvas 组合目前在 Python/Rust/C 一致拒绝；shell 的页 0/4/11 �
 
 ### Read-only miniapp content observation
 
+A Wi-Fi news query projects the current headline, cache age and footer with the same foreground rules as the renderer. An active component also reports `cachedSaveState` across its RAM save slots. Values are `pending`, `clean`, `blocked` or `unknown`. While pending, `oldestPendingEditMs` is the age of the oldest queued write window for a non-deleted slot. Audio can defer a write beyond the ordinary 30-second debounce. A clean cache describes the observed slots only. Use cold readback to verify an entire saved view.
+
+The Wi-Fi settings query includes boot-local MQTT totals for successful subscriptions (`mqttSubscriptions`), matching PUBLISH packets (`mqttMessages`) and snapshots accepted by the data store (`mqttApplied`). Empty payloads advance the message counter only.
+
 `miniapp/query` echoes `requestId` in `miniapp/state`, with `widgetId`, `bootId`, `observationAvailable` and (when available) `instanceGeneration` (8 lowercase hex digits, meaningful only paired with bootId). Hello advertises `widgetStateObservation=p4-miniapp-observation-fnv1a32-v1`. Native view and digest input are captured under one model lock; VM capture uses existing owner serialization and per-call PSRAM scratch. Queries do not pump, save, flush, restore or dispatch. `durability` is explicitly `not_observed`. No ACK, digest or checkpointPending=false proves a durable write. Persistence HIL may instead explicitly reboot, require a different bootId, reopen the same fixture and compare its expected readback digests. This has not been device-tested here.
 
 Hashes are FNV-1a32 (offset2166136261, prime16777619), lowercase hex8, non-cryptographic content evidence. Integers encode LE32 (signed values as two's complement); strings are UTF-8 plus NUL. `cellsDigest={cols,rows,bits,count,hash}` hashes LE32 cols/rows/bits followed by row-major uint8 grid values (up to256). `vmDigest={schema,cells,revision,hash}` hashes LE32 schema/cell-count, all committed LE32 cell values, then8 LE32 outputs; revision is metadata excluded from hash. `persistProjectionDigest` hashes LE32 save-version/save-vars-mask, saved state string (empty if no save-version), saved page string (empty unless save-page), then each selected variable in declaration order: name string, type byte(1 integer/2 string), LE32 integer or string value. Instance/revision and unsaved vars are excluded. This digest does not expose or attest private saved bytes.
@@ -2526,6 +2617,12 @@ The original before/after epoch/revision/lease checks still gate the response.
 `globalAudioCues: "p4-global-audio-cues-v1"` 表示支持跨形象共用的提示音设置。
 音频专用 `asset/audio-*` 请求增加 `scope: "global"`。请求仍绑定当前设备、启动身份、当前物理形象槽及其 packId，以验证传输权限；持久化身份独立于视频包和形象槽。每阶段必须保持 scope 一致。仅 WAV 数据进入独立音频双银行，提交后对所有形象生效，空集合提交恢复默认提示音。上传、删除和下发均不准备、重传、清空或激活视频。旧 `p4-audio-patch-v1` 保留兼容，新的客户端要求全局能力后才下发全局音效，不回退到完整形象同步。
 
+受信 WiFi6 通过认证状态字段 `rtcKey` 的位掩码 `0x10` 声明无线全局提示音能力。客户端使用本次启动的 `boardDeviceId` 和 `bootId` 调用 `lan_sync_global_audio_cues`。未声明该位的设备继续按 USB 握手能力下发。
+
+无线传输沿用配对的 mode 18、16 字节启动标识和原有加密请求及回执。阶段 0 带 `scope: "global"` 查询槽位，返回与 nonce、启动、活动槽和 pack 绑定的静闲证明，可省去视频清单。阶段 6、7、8、9 分别映射到 `asset/audio-begin`、`asset/audio-chunk`、`asset/audio-commit`、`asset/audio-abort`。四个写阶段都要求全局 scope。仅 begin 可使用三层 JSON 以容纳文件对象，其余阶段维持两层。清单上限为 24 个 WAV、每个 1 MiB、合计 2 MiB，每块最多 4096 字节。
+
+接收方复用 USB 的音频银行、文件校验及所有权校验。客户端逐块匹配路径、索引、下一索引和累计字节，最终匹配文件数、总字节及非零 32 位音频代数。仅在已确认的阶段之间显式取消才发送绑定原事务的 abort。提交回执丢失时向调用方返回结果未确认，等待重新核对设备。
+
 The ESP-SR WebRTC NS allocation debug print is suppressed at the firmware link boundary. Its direct console write could interrupt the shared UART audio stream during duplex setup. Frame checksums, sequence checks and DSP protection are unchanged.
 
 按键录音期间，首个 PCM 分片发出后才允许已缓存的 H.264 动画继续解码，最多每 125 ms 提交一次解码。录音启动、实时对话的 AEC 准备和文件读取仍按原互斥规则处理。
@@ -2539,7 +2636,9 @@ The ESP-SR WebRTC NS allocation debug print is suppressed at the firmware link b
 设置内触屏和摇杆直接操作。摇杆中按或 SW1 确认，摇杆中按长按或 SW3 返回。
 系统设置不作为 USB `screen/page` 的远程导航目标。
 
-WIFI配置用 C6 后台扫描并连接附近网络。设备获得 IP 后才保存网络，连接失败会尝试恢复原已保存网络。
+「声音与显示」读取实际音量和可调面板亮度，选择保存后应用。NV3049 亮度可调范围为 10–100%，固定背光面板显示不可调。蓝牙键盘可在本机启停。连接键盘后，SW3 长按未分配 HID 快捷键时可进入设置；已分配时按住旋钮再长按 SW3。配对和账号授权的移除操作需要二次确认。
+
+WIFI配置用 C6 后台扫描并连接附近网络。错误 201 表示未找到热点。已保存网络可按 SSID 和安全类型重新发现后再试一次；刚选中的节点消失时，可释放 BSSID 限制再试一次。设备获得 IP 后才保存网络，连接失败会尝试恢复原已保存网络。
 Wi-Fi 密码只进入本机键盘、连接任务与设备 NVS，不进入画面快照、按键事件、组件或桌面协议。
 该实验构建仍使用现有设备的 NVS 安全配置，未额外启用 Flash 或 NVS 加密。
 
@@ -2630,6 +2729,31 @@ observed installed version. The board requires that version to match the
 currently installed copy and commits through the existing validated staging
 transaction. Older boards continue to support their original operations.
 
+The full authenticated install descriptor (selector 3) can advertise
+`widgetLanCommitReason: "commit-reason-v1"`. Only on that same board, boot and
+Wi-Fi association may the desktop send the final mode-14 record `[3, 1]`.
+Without that capability it sends `[3]`. Legacy commits, chunks, fonts and
+maintenance retain their existing replies. The record nonce, authenticated
+length, one-byte reply payload and publication fence are unchanged.
+
+For the opted-in final record, 1 confirms success, 0 is an unspecified
+refusal and 2 denotes an uncertain publication or catalog readback. Known pre-publication
+refusals can return one of these fixed bytes:
+
+| Byte | Final commit reason |
+| --- | --- |
+| 16 | `commit_storage_deferred` |
+| 17 | `commit_audio_busy` |
+| 18 | `commit_storage_interrupted` |
+| 19–20 | Catalog recovery required / no free component slot |
+| 21–23 | Manifest or digest mismatch / resource declarations mismatch / storage budget exceeded |
+| 24–26 | Insufficient memory / WASM validator busy or unavailable / WASM first-frame validation failed |
+| 27–28 | Component storage preparation or validation failed / incompatible save schema |
+
+Unmapped application errors yield 0. No application error text is transmitted.
+An unknown status byte, malformed or unauthenticated reply, or loss of the final
+ACK leaves the outcome unconfirmed. The desktop never replays the commit.
+
 ### LCD scanout diagnostics
 
 Wi-Fi 6 firmware includes `runtime.lcdScanout` in USB and authenticated LAN
@@ -2671,3 +2795,22 @@ LAN 扩展状态使用 `pf` 表示同一存储状态。
 用户名长度、凭证长度（大端 u16）及五个字段。操作 0 查询、1 设置、2 清除；
 非设置操作不带用户名或凭证。响应是单字节状态，从 0 开始分别为拒绝、
 已配置、未配置、设备安全存储不可用、存储错误、写入忙。响应没有凭证数据。
+
+### 前台麦克风电平
+
+当 P4 麦克风编解码器及采集任务就绪，hello.capabilities 上报 widgetMicLevel=microphone-level-v1。包内 runtime.hardware.service 选择该原生工具，quiet_below 为可选 1–100 整数。实体短按 SW1 只授权当前组件此次前台运行。原生采集任务只向该前台页提供 0–100 的相对峰值。切换、同 ID 替换、退出、争用和帧过期回收授权。该服务没有 USB、LAN 或 WASM 授权命令。
+
+### Component networking on Wi-Fi 6
+
+Wi-Fi 6 v1 and v3 announce `widgetWasmNetwork=component-network-v1`. A device with
+hardware-protected credential storage also announces
+`widgetComponentCredentials=component-credentials-secure-v1`. Components request only
+their declared HTTPS origins, methods and MQTT destinations. Service completions belong
+to the active component generation. Replacement invalidates its queued operations,
+handles and subscriptions. The SDK documents limits, credential binding, the wired
+write-only provisioning message and status codes in the
+[network contract](../pc/skills/petui/references/component-network.md).
+
+### Independent desktop test message
+
+On a physical USB connection, `ui/test-message` replies on `ui/test-message/status`; P4 hello advertises `testMessageReceipt`. The paired Wi-Fi panel uses opcode 13, the 16-byte boot ID and a bounded JSON request. Both transports use the same two phases. Send `phase=prepare` with the board ID, boot ID and a fresh 32-character lowercase hexadecimal intent. USB also carries a per-frame request ID. A `ready` receipt includes a 32-bit token bound to the active agent, session and route. Within five seconds send `phase=send` with the same fields and token. Only the fixed main-screen test notice is eligible for display. A delivered receipt confirms device acceptance. Repeating the same commit cannot extend the three-second display. Busy, changed and expired reservations do not display a notice. The desktop does not repeat a commit after an uncertain result. Session identifiers and message text are absent from these requests and receipts.

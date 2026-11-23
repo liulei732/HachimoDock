@@ -29,7 +29,7 @@ if str(TOOLS_DIR) not in sys.path:
 
 from build_builtin_bundle import read_component_wasm
 from p4_component_sprites import compile_component_sprites, sprite_pack_checksum
-from p4_image_compat import image_revision_range, factory_revision_range
+from p4_image_compat import image_application_version, image_revision_range, factory_revision_range
 
 
 FACTORY_CONFIG_NAME = "factory-config.json"
@@ -694,6 +694,10 @@ def build_default_appearance_tree(
 
     spiffs_tree = build_dir / SPIFFS_TREE_NAME
     reset_generated_directory(spiffs_tree, build_dir)
+    font = (project_dir / "assets/fonts/bubble32-v1.fpk").read_bytes()
+    if hashlib.sha256(font).hexdigest() != "c9dd60d79ed2473a447cab7e1960ff8885192df0ff8bb509492f31b6f25033e7":
+        raise ValueError("invalid shared MiSans font resource")
+    write_spiffs_root_file(spiffs_tree, "bubble32-v1.fpk", font)
     (spiffs_tree / ACTIVE_SLOT_MARKER).write_text(f"{slot}\n", encoding="ascii")
     (spiffs_tree / SLOT_READY_MARKER_TEMPLATE.format(slot=slot)).write_text(
         f"{ready_manifest['packId']}\n", encoding="ascii"
@@ -901,33 +905,33 @@ def validate_segments(segments: list[tuple[int, Path]], flash_size: int) -> None
         )
 
 
-def generate_board_identity_nvs(
-    directory: Path, generator: Path, board: str, device_id: str, size: int
+def generate_factory_nvs(
+    directory: Path, generator: Path, board: str | None, device_id: str | None,
+    size: int, display_profile: str | None,
 ) -> Path:
-    if board not in ("pico", "wifi6") or not re.fullmatch(r"p4-[a-f0-9]{12}", device_id):
-        raise ValueError("factory identity requires a verified board model and P4 device ID")
-    record = directory / "board.csv"
-    record.write_text(
-        "key,type,encoding,value\n"
-        "pet_factory,namespace,,\n"
-        f"board_v1,data,string,{device_id}:{board}\n",
-        encoding="ascii",
-    )
-    image = directory / "factory-board-nvs.bin"
+    rows = ["key,type,encoding,value"]
+    if board or device_id:
+        if board not in ("pico", "wifi6") or not re.fullmatch(r"p4-[a-f0-9]{12}", device_id or ""):
+            raise ValueError("factory identity requires a verified board model and P4 device ID")
+        rows.extend(["pet_factory,namespace,,", f"board_v1,data,string,{device_id}:{board}"])
+    if display_profile:
+        if display_profile != "nv3049-no-touch":
+            raise ValueError("unknown factory display profile")
+        rows.extend(["pet_lcd,namespace,,", "nv3049_no_tp,data,u8,1"])
+    if len(rows) == 1:
+        raise ValueError("no factory settings requested")
+    record = directory / "factory.csv"
+    record.write_text("\n".join(rows) + "\n", encoding="ascii")
+    image = directory / ("factory-settings-nvs.bin" if display_profile else "factory-board-nvs.bin")
     run_checked([sys.executable, str(generator), "generate", str(record), str(image), hex(size)])
     if image.stat().st_size != size:
-        raise ValueError("generated factory board identity must fill the NVS partition")
+        raise ValueError("generated factory settings must fill the NVS partition")
     return image
 
 
 def application_version(build_dir: Path) -> str:
     app = (build_dir / "firmware.bin").read_bytes()
-    if len(app) < 112 or app[32:36] != bytes.fromhex("3254cdab"):
-        raise ValueError("factory application has no valid ESP app descriptor")
-    version = app[48:80].split(b"\0", 1)[0].decode("ascii")
-    if not re.fullmatch(r"[0-9A-Za-z._-]+", version):
-        raise ValueError("invalid factory application version")
-    return version
+    return image_application_version(app)
 
 
 def application_board_model(build_dir: Path):
@@ -949,7 +953,8 @@ def build_factory_image(
     raw_appearance_offset: int,
     esptool: Path,
     output: Path,
-    board_identity_nvs: Path | None = None,
+    factory_nvs: Path | None = None,
+    display_profile: str | None = None,
 ) -> dict:
     layout = validate_factory_partition_layout(project_dir, build_dir)
     if (spiffs_offset != CURRENT_DATA_LAYOUT["storage"][0]
@@ -965,11 +970,11 @@ def build_factory_image(
     flash_size = parse_flash_size(str(settings["flash_size"]))
     segments.append((spiffs_offset, spiffs_image.resolve()))
     segments.append((raw_appearance_offset, raw_appearance_image.resolve()))
-    if board_identity_nvs is not None:
+    if factory_nvs is not None:
         nvs = layout["partitions"]["nvs"]
-        if board_identity_nvs.stat().st_size != nvs["bytes"]:
-            raise ValueError("factory identity NVS image has the wrong size")
-        segments.append((parse_int(nvs["offset"]), board_identity_nvs.resolve()))
+        if factory_nvs.stat().st_size != nvs["bytes"]:
+            raise ValueError("factory settings NVS image has the wrong size")
+        segments.append((parse_int(nvs["offset"]), factory_nvs.resolve()))
     segments.sort(key=lambda item: item[0])
     validate_segments(segments, flash_size)
     if output.exists():
@@ -995,9 +1000,9 @@ def build_factory_image(
 
     if factory_revision_range(output.read_bytes()) != chip_bounds:
         raise ValueError("merged factory image has inconsistent chip revision bounds")
-    if board_identity_nvs is not None:
-        if sha256_region(output, parse_int(nvs["offset"]), nvs["bytes"]) != sha256_file(board_identity_nvs):
-            raise ValueError("merged factory image does not contain the expected board identity")
+    if factory_nvs is not None:
+        if sha256_region(output, parse_int(nvs["offset"]), nvs["bytes"]) != sha256_file(factory_nvs):
+            raise ValueError("merged factory image does not contain the expected factory settings")
 
     if sha256_region(output, spiffs_offset, spiffs_image.stat().st_size) != sha256_file(
         spiffs_image
@@ -1050,6 +1055,8 @@ def build_factory_image(
         ),
         "segments": segment_records,
     }
+    if display_profile:
+        summary["displayProfile"] = display_profile
     manifest_path = output.with_name(FACTORY_MANIFEST_NAME)
     manifest_path.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -1063,6 +1070,8 @@ def flash_factory_image(
     chip: str,
     port: str,
     baud: int,
+    board: str,
+    device_id: str | None,
 ) -> None:
     if chip != "esp32p4" or not port.strip():
         raise ValueError("factory upload requires an explicit ESP32-P4 serial port")
@@ -1071,7 +1080,7 @@ def flash_factory_image(
     if esptool.suffix.lower() == ".py":
         sys.path.insert(0, str(esptool.parent))
     from flash_checked import flash
-    flash(image, port, baud)
+    flash(image, port, baud, manifest=image.with_name(FACTORY_MANIFEST_NAME), board=board, device_id=device_id)
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -1088,14 +1097,19 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--esptool")
     parser.add_argument("--output")
     parser.add_argument("--flash-port")
+    parser.add_argument("--flash-board-model", choices=("pico", "wifi6"), help="Physically checked board for destructive upload")
     parser.add_argument("--flash-baud", type=int, default=921600)
     parser.add_argument("--verified-board-model", choices=("pico", "wifi6"))
     parser.add_argument("--verified-device-id", help="P4 device ID recorded during physical board inspection")
     parser.add_argument("--nvs-generator", type=Path, help="ESP-IDF nvs_partition_gen.py")
+    parser.add_argument("--display-profile", choices=("nv3049-no-touch",),
+                        help="Set only for a physically identified touchless NV3049F screen")
     args = parser.parse_args(argv)
-    identity_args = (args.verified_board_model, args.verified_device_id, args.nvs_generator)
-    if any(identity_args) and (not all(identity_args) or args.flash_port):
-        parser.error("board identity requires all three provisioning options and an offline factory build")
+    if bool(args.verified_board_model) != bool(args.verified_device_id):
+        parser.error("board identity requires both the verified board model and device ID")
+    provision = bool(args.verified_board_model or args.display_profile)
+    if provision != bool(args.nvs_generator) or (provision and args.flash_port):
+        parser.error("factory settings require --nvs-generator and an offline build")
     return args
 
 
@@ -1141,15 +1155,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         appearance,
     )
     with tempfile.TemporaryDirectory(prefix="pet-factory-board-") as staging:
-        board_identity_nvs = None
+        factory_nvs = None
         if args.verified_board_model:
             descriptor = (build_dir / "firmware.bin").read_bytes()[48:80].split(b"\0", 1)[0]
             if not descriptor.endswith(f"-{args.verified_board_model}".encode("ascii")):
                 raise ValueError("factory application and physically verified board model disagree")
+        if args.nvs_generator:
             _, nvs_size = partition_entry(project_dir / "partitions.csv", "nvs")
-            board_identity_nvs = generate_board_identity_nvs(
+            factory_nvs = generate_factory_nvs(
                 Path(staging), args.nvs_generator.resolve(), args.verified_board_model,
-                args.verified_device_id, nvs_size,
+                args.verified_device_id, nvs_size, args.display_profile,
             )
         summary = build_factory_image(
             project_dir,
@@ -1163,7 +1178,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             raw_appearance_offset,
             esptool,
             output,
-            board_identity_nvs,
+            factory_nvs,
+            args.display_profile,
         )
     print(f"[factory] image={output}")
     print(f"[factory] bytes={summary['bytes']}")
@@ -1175,6 +1191,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             str(summary["chip"]),
             args.flash_port,
             args.flash_baud,
+            args.flash_board_model or args.verified_board_model or input("核对实体主板，输入 pico 或 wifi6：").strip(),
+            args.verified_device_id,
         )
         print(f"[factory] flashed={args.flash_port}")
     return 0

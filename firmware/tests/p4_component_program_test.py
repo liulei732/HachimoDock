@@ -158,6 +158,13 @@ def test_full_runtime_validator_requires_actual_capability_and_never_grants_from
     r=copy.deepcopy(SUITE['runtime']);caps={**DEFAULT_CAPABILITIES};errors=[]
     validate_runtime(r,'tool',Path('/nonexistent-test-assets'),caps,errors);assert any('受限组件程序' in e for e in errors)
     caps['widgetProgram']='p4-component-program-v1';errors=[];validate_runtime(r,'tool',Path('/nonexistent-test-assets'),caps,errors);assert not errors,errors
+    r=copy.deepcopy(r)
+    r['program'].update(background=True,timers=[dict(id=1,delayMs=100,intervalMs=100,words=[1])])
+    errors=[];validate_runtime(r,'tool',Path('/nonexistent-test-assets'),caps,errors)
+    assert any('widgetLocalProgramResume' in error for error in errors)
+    caps['widgetLocalProgramResume']='p4-local-program-v1'
+    errors=[];validate_runtime(r,'tool',Path('/nonexistent-test-assets'),caps,errors)
+    assert not errors, errors
 
 def test_authoring_routes_programs_before_other_application_simulators():
     sys.path.insert(0,str(SKILL/'scripts'));from bounded_app import smoke
@@ -198,7 +205,7 @@ static void *heap_caps_malloc(size_t bytes,int caps){assert(caps==3);return mall
 static void heap_caps_free(void *p){free(p);}
 #define MINIAPP_VAR_INT 1
 typedef struct {int type;int32_t int_value;} test_var_t;
-typedef struct {bool active,slicing;unsigned save_version,var_count;char widget_id[48];test_var_t vars[8];
+typedef struct {bool active,slicing;int32_t visible_value;unsigned save_version,var_count;char widget_id[48];test_var_t vars[8];
  pet_component_program_config_t program;pet_program_snapshot_t program_seed;bool program_seed_ready,program_needs_start,program_suspended;} miniapp_runtime_t;
 static miniapp_runtime_t g_runtime;
 static pet_component_program_session_t g_component_program;
@@ -219,7 +226,9 @@ static void miniapp_runtime_lock(void){assert(!locked);locked=true;}
 static void miniapp_runtime_unlock(void){assert(locked);locked=false;}
 static int64_t esp_timer_get_time(void){static int64_t now;return ++now;}
 static void copy_utf8(char *out,size_t length,const char *text){snprintf(out,length,"%s",text);}
-static void refresh_view(miniapp_runtime_t *r){(void)r;assert(locked);refreshes++;}
+static void refresh_view(miniapp_runtime_t *r){
+ assert(r==&g_runtime?locked:!locked);r->visible_value=r->vars[0].int_value;refreshes++;
+}
 static void component_program_retire_locked(void){assert(locked);if(g_component_program_initialized&&(g_component_program.live||g_component_program.retiring))(void)pet_component_program_session_stop(&g_component_program);}
 bool pet_program_host_device_init(pet_program_host_t *h){return pet_program_host_init(h,&backend);}
 bool pet_program_persistence_enqueue(const char *id,const pet_program_snapshot_t *s){assert(!locked&&!strcmp(id,"component"));if(!checkpoint_allowed)return false;stored=*s;writes++;return true;}
@@ -256,12 +265,17 @@ int main(void){
  checkpoint_allowed=false;assert(!save_component_program()&&writes==0);checkpoint_allowed=true;assert(save_component_program()&&writes==1&&stored.values[0]==2);
  // The real preparation function takes the latest live state and quiesces
  // that owner before unlocking for package work; it does not use stale disk.
- miniapp_runtime_t next=g_runtime;next.program_seed.values[0]=-99;loads=0;
+ miniapp_runtime_t next=g_runtime;next.program_seed.values[0]=-99;next.visible_value=0;loads=0;
  assert(restore_component_runtime(&next)&&!g_component_program.live&&!held&&loads==0&&next.program_seed.values[0]==2);
- assert(g_runtime.program_suspended&&!next.program_suspended);
+ assert(g_runtime.program_suspended&&!next.program_suspended&&next.visible_value==2);
  miniapp_runtime_lock();component_program_process_locked(100,true);miniapp_runtime_unlock();assert(!g_component_program.live);
  next.program.image.schema=2;assert(!restore_component_runtime(&next)&&g_runtime.vars[0].int_value==2&&stored.values[0]==2);
  next=g_runtime;strcpy(next.widget_id,"other");load_status=PET_PROGRAM_SAVE_CORRUPT;assert(!restore_component_runtime(&next)&&stored.values[0]==2);
+ // Cold foreground preparation starts with the parse-time dashboard at zero.
+ // Without an input event or VM turn, the first published view must reflect disk.
+ load_status=PET_PROGRAM_SAVE_VALUE;next.visible_value=next.vars[0].int_value=0;
+ assert(restore_component_runtime(&next)&&next.visible_value==2&&next.vars[0].int_value==2);
+ assert(next.program_seed.revision==stored.revision&&!memcmp(&next.program_seed,&stored,sizeof(stored)));
  miniapp_runtime_lock();component_program_process_locked(200,false);component_program_process_locked(300,true);miniapp_runtime_unlock();
  assert(!g_component_program.live&&g_runtime.vars[0].int_value==2&&g_runtime.program_suspended);
  // Visibility recovery cannot restart the foreground owner or its automation.

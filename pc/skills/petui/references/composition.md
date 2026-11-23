@@ -1,5 +1,7 @@
 # 通用绑定与 PC 服务组合 v1
 
+数据源 `python` 使用 [PetUI 桌面 Python 插件](python-plugins.md) 契约，支持按 JSON Pointer 绑定结果。用户在组件详情授权输入并启用后，宿主才会安排脚本运行。
+
 ## 有界稳定 ID 集合视图
 
 组合 v2/v3 可声明 `collection` 数据源，字段为 `kind`、`expression`、`view`。
@@ -96,6 +98,10 @@ v2 仍是本地事务流程，尚未开放网络写入、鉴权、朗读、录�
 
 本能力是有界声明式框架，不执行组件内代码，不按组件 ID 选择逻辑。旧 `pc-app-services-*` 包、旧 dashboard 绑定和存档继续兼容。新包必须协商 `widgetVariableBindings=p4-variable-bindings-v1`，缺少能力时阻止同步，不能依靠固件版本号猜测。
 
+本机数据源的名称与动作由 `scripts/local_telemetry_sources.json` 中的产品注册表定义，桌面端和社区预检均读取该文件。组件用 `local-telemetry` 声明已注册的源，再选择需要显示的字段和动作。账户、凭据和实时数据由宿主维护，包内初始值使用公开占位文案。
+
+使用命名绑定的宿主界面可直接在 runtime 声明静态 `dashboard`。运行 `petui pack` 时，打包器从这一份声明生成 `negative-screen.json.dashboard`。桌面社区预检也会为已安装的同类组件生成一致的发布预览，本地组件源和存档继续由原路径管理。
+
 PC 同样必须支持 pc-app-composition-v1；只有新固件而旧客户端时不能执行组合服务。作者不传能力文件才使用离线创作默认值，显式传入空能力对象不会自动获得新能力。离线默认值不能作为真实设备支持的证据。
 
 ## 设备 UI 与数据
@@ -156,3 +162,22 @@ json-get 只允许无需鉴权的 HTTPS GET、443 端口、1–4 个精确 DNS �
 共享契约 contracts/composition-v1.json 同时供 Rust 与 Python 校验器回归。JS 预览与 Python 模拟器共享状态机向量；还必须验证设备解析、实际绘制/输入、断开重连、存档保留、性能及语音/AEC。编译或模拟通过不能称为实机通过。
 
 本版不是任意原生插件：没有任意脚本、动态 HTML、任意 POST/OAuth、跨组件文件读取或无上限列表。音频、语音、媒体与敏感操作仍用已有受控宿主服务；不得给组合包添加偷偷录音、自动支付或桌面任务执行的能力。超出原语和资源上限的需求应明确指出缺口，不能用组件专用分支冒充泛化支持。
+
+## Codex 独立账号额度与 PC 管理
+
+新增 `kind: "local-telemetry", source: "codex.accounts"`，在 PC 管理最多 8 个独立授权账号。
+只支持 macOS；Windows 在系统凭据隔离完成前明确拒绝启用账号管理与查询。
+需安装提供 `account/login/start`、`account/read` 和 `account/rateLimits/read` 的 Codex CLI。
+宿主从固定安装位置或 PATH 查找 Codex，以独立 CODEX_HOME 启动 app-server。
+登录页面由原生层交给 Chrome；令牌轮换交由 Codex 处理，不调用内部额度 HTTP 接口。
+
+动作 `refresh` 主动只读查询，`previous` / `next` 切换当前组件保存的账号。
+正常查询最短间隔 60 秒，手动 15 秒；五分钟以上标过期。
+邮箱、计划、查询时间和两组额度通过显式绑定的最多 8 个标量投影。
+缺测为 -1，跨过旧重置时间不猜测满额；过期、查询失败和未登录均明确标注。
+组件不包含凭据、路径、URL、请求头、命令或 OAuth 参数。凭据及可恢复移除备份仅在 PC 私有目录。
+
+组件详情提供显示勾选、排序、添加、重新授权、取消及移除。
+修改立即保存；全部隐藏时清空设备旧账号显示。新邮箱须被组件的字体覆盖，否则拒绝投影其额度。
+使用通用 composition 与既有 USB 管理器，不增加设备专用协议或固件分支。
+本地事务不能调用此联网来源。原 `widget/data` 的 `codex.usage` 占位提供器仍保持未启用。

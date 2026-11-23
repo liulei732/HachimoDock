@@ -10,3 +10,11 @@ test("ASR retry prompt remains a listening status, not a failed conversation", (
   }
   assert.equal(isRecoveringAsr(null), false);
 });
+
+test("native model stage distinguishes the same upstream HTTP error", async () => {
+  const {realtimeErrorMessage} = await import("./realtime-feedback.js");
+  const labels = ["asr", "tts", "chat"].map(errorStage =>
+    realtimeErrorMessage({errorStage, error:"HTTP 404", reason:"config"}));
+  assert.equal(new Set(labels).size, 3);
+  for (const label of labels) assert.match(label, /404/);
+});

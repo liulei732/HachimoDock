@@ -1,5 +1,6 @@
 #pragma once
 #include <stdbool.h>
+#include "pet_p4_shared_font.h"
 #include <stddef.h>
 #include <stdint.h>
 #include "cJSON.h"

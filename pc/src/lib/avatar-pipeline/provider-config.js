@@ -117,7 +117,8 @@ export function resolveProviderApiKey(
   providerId,
   savedApiKey,
 ) {
-  if (typeof savedApiKey === "string" && savedApiKey.trim()) return savedApiKey;
+  if (typeof savedApiKey === "string" && savedApiKey.trim() && savedApiKey.trim() !== "hachimidock-bundled-ark-v1"
+      && savedApiKey.trim() !== "••••" && !savedApiKey.includes("…")) return savedApiKey.trim();
   return "";
 }
 
@@ -153,7 +154,7 @@ export function loadProviderConfig(providerId = DEFAULT_PROVIDER_ID, storage = d
     needsKlingApiKey: isKling && !apiKey && Boolean(saved.accessKey || saved.secretKey),
     baseUrl: !isVolcengine && !isKling && typeof saved.baseUrl === "string" ? saved.baseUrl : provider.baseUrl,
     model: selectedKlingModel?.id || (savedModel && hasSavedFastGeneration ? savedModel : provider.models[0] || savedModel || ""),
-    thinkingModel: isVolcengine && (!saved.thinkingModel || saved.thinkingModel === "doubao-seed-2-0-pro-260215")
+    thinkingModel: isVolcengine && (!saved.thinkingModel || (!saved.thinkingModelSelected && saved.thinkingModel === "doubao-seed-2-0-pro-260215"))
       ? VOLCENGINE_THINKING_MODEL
       : typeof saved.thinkingModel === "string"
         ? saved.thinkingModel
@@ -185,6 +186,17 @@ export function loadArkImageConfig(storage = defaultStorage()) {
 }
 
 export function saveProviderConfig(providerId, config, storage = defaultStorage()) {
+  if (!resolveProviderApiKey(providerId, config.apiKey)) {
+    const saved = parseStoredProviderConfig(providerId, storage) || {};
+    const previous = resolveProviderApiKey(providerId, saved.apiKey);
+    const endpoint = value => (value || "").trim().replace(/\/+$/, "");
+    if (previous) {
+      if (providerId === "custom" && endpoint(config.baseUrl) !== endpoint(saved.baseUrl))
+        throw new Error("请填写新接口地址的 API Key");
+      config = { ...config, apiKey: previous };
+    } else if (config.apiKey?.trim()) throw new Error("请填写此服务的 API Key");
+  }
+  if (providerId === "volcengine" && config.thinkingModel) config = { ...config, thinkingModelSelected: true };
   if (nativeRuntime()) {
     if (nativeReadError) return Promise.reject(new Error(`原配置尚未读取，不会覆盖：${nativeReadError}`));
     return invoke("save_generation_provider_config", { providerId, config }).then(() => {

@@ -68,18 +68,18 @@ fn commit_asset(owner:&str,slot:&str,asset:Asset,epoch:u64)->Result<ImageRef>{
 fn get(owner:&str,r:&ImageRef)->Result<Asset>{store().lock().map_err(|_|fail())?.iter().find(|((id,_),a)|id==owner&&a.reference.key==r.key&&a.reference.revision==r.revision&&a.reference.width==r.width&&a.reference.height==r.height).map(|(_,a)|a.clone()).ok_or_else(fail)}
 pub fn preview(owner:&str,r:&ImageRef)->Result<Value>{let a=get(owner,r)?;Ok(json!({"key":r.key,"revision":r.revision,"dataUrl":format!("data:image/png;base64,{}",B64.encode(a.png.as_ref()))}))}
 pub fn clear(owner:&str){if let Ok(mut s)=store().lock(){RETIRE_EPOCH.fetch_add(1,Ordering::AcqRel);s.retain(|(id,_),_|id!=owner);}}
-pub fn send(usb:&crate::usb_serial::UsbSerialManager,board:&str,owner:&str,instance:&str,context:&str,images:&Value)->Result<()>{
+pub fn send(owner:&str,instance:&str,context:&str,images:&Value,chunk_bytes:usize,mut request:impl FnMut(Value)->Result<Value>)->Result<()>{
     let Some(images)=images.as_object()else{return Ok(())};
-    if images.len()>2||!name(instance,31)||context.len()!=64{return Err(fail());}
+    if !matches!(chunk_bytes,1024|2048)||images.len()>2||!name(instance,31)||context.len()!=64{return Err(fail());}
     for (alias,value) in images {
         if !name(alias,15){return Err(fail());}let r=ImageRef::parse(value)?;let asset=get(owner,&r)?;
         let query=json!({"operation":"query","componentId":owner,"instance":instance,"context":context,"alias":alias,"key":r.key,"revision":r.revision,"width":r.width,"height":r.height});
-        if usb.service_image_request(board,query)?["code"]=="ready"{continue;}
-        for (i,bytes) in asset.pixels.chunks(1024).enumerate(){
+        if request(query)?["code"]=="ready"{continue;}
+        for (i,bytes) in asset.pixels.chunks(chunk_bytes).enumerate(){
             // Each chunk rechecks exact current instance/context on the device.
             // No retry on unknown ACK; a later read-only snapshot may republish.
-            let v=json!({"componentId":owner,"instance":instance,"context":context,"alias":alias,"key":r.key,"revision":r.revision,"width":r.width,"height":r.height,"offset":i*1024,"data":B64.encode(bytes)});
-            usb.service_image_request(board,v)?;
+            let v=json!({"componentId":owner,"instance":instance,"context":context,"alias":alias,"key":r.key,"revision":r.revision,"width":r.width,"height":r.height,"offset":i*chunk_bytes,"data":B64.encode(bytes)});
+            request(v)?;
         }
     }Ok(())
 }

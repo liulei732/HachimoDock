@@ -184,6 +184,7 @@ pub struct StockStatus {
 #[derive(Default)]
 struct Service {
     path: PathBuf,
+    load_error: Option<String>,
     settings: Watchlist,
     generation: u64,
     quotes: Vec<Quote>,
@@ -239,35 +240,50 @@ fn validate_settings(input: Watchlist) -> Result<Watchlist, String> {
     }
     Ok(Watchlist { symbols })
 }
+impl Service {
+    fn require_settings(&self) -> Result<(), String> {
+        if let Some(reason) = &self.load_error {
+            return Err(reason.clone());
+        }
+        if self.path.as_os_str().is_empty() {
+            return Err("自选股存储尚未初始化".into());
+        }
+        Ok(())
+    }
+}
+
+fn read_settings(path: &std::path::Path) -> Result<Watchlist, String> {
+    use std::io::{ErrorKind, Read};
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Ok(Watchlist { symbols: vec!["hk01810".into(), "hk09988".into()] });
+        }
+        Err(_) => return Err("无法读取自选股配置".into()),
+    };
+    let mut bytes = Vec::new();
+    file.take(4097).read_to_end(&mut bytes).map_err(|_| "无法读取自选股配置")?;
+    if bytes.len() > 4096 {
+        return Err("自选股配置文件过大".into());
+    }
+    validate_settings(serde_json::from_slice(&bytes).map_err(|_| "自选股配置损坏")?)
+}
+
 pub fn configure(dir: PathBuf) -> Result<(), String> {
     let path = dir.join("stock-watchlist.json");
-    *service().lock().map_err(|_| "自选股状态不可用")? = Service {
-        path: path.clone(),
-        ..Service::default()
-    };
-    let settings = if path.exists() {
-        let metadata = std::fs::metadata(&path).map_err(|_| "无法读取自选股配置")?;
-        if metadata.len() > 4096 {
-            return Err("自选股配置文件过大".into());
-        }
-        let bytes = std::fs::read(&path).map_err(|_| "无法读取自选股配置")?;
-        validate_settings(
-            serde_json::from_slice(&bytes)
-                .map_err(|_| "自选股配置损坏，请检查 stock-watchlist.json")?,
-        )?
-    } else {
-        Watchlist { symbols: vec!["hk01810".into(), "hk09988".into()] }
-    };
-    *service().lock().map_err(|_| "自选股状态不可用")? = Service {
-        path,
-        settings,
-        ..Service::default()
-    };
-    Ok(())
+    let mut service = service().lock().map_err(|_| "自选股状态不可用")?;
+    let mut next = Service { path, generation: service.generation.wrapping_add(1), ..Service::default() };
+    match read_settings(&next.path) {
+        Ok(settings) => next.settings = settings,
+        Err(reason) => next.load_error = Some(format!("{reason}。请检查 stock-watchlist.json 后重新启动客户端。")),
+    }
+    *service = next;
+    service.require_settings()
 }
 #[tauri::command]
 pub fn stock_watchlist_status() -> Result<StockStatus, String> {
     let s = service().lock().map_err(|_| "自选股状态不可用")?;
+    s.require_settings()?;
     let mut quotes = s.quotes.clone();
     if now_ms().saturating_sub(s.fetched_at_ms) > 30_000 {
         for q in &mut quotes {
@@ -291,6 +307,7 @@ pub fn stock_watchlist_save(input: Watchlist) -> Result<StockStatus, String> {
     let settings = validate_settings(input)?;
     {
         let mut s = service().lock().map_err(|_| "自选股状态不可用")?;
+        s.require_settings()?;
         let dir = s
             .path
             .parent()
@@ -462,6 +479,7 @@ async fn refresh(background: bool) -> Result<(), String> {
     };
     let (symbols, generation) = {
         let mut s = service().lock().map_err(|_| "自选股状态不可用")?;
+        s.require_settings()?;
         let interval = refresh_interval_ms(background, s.failures);
         if s.settings.symbols.is_empty() || now_ms().saturating_sub(s.attempted_at_ms) < interval {
             return Ok(());
@@ -599,6 +617,10 @@ fn data_snapshot(status: &StockStatus) -> DataSnapshot {
         rows,
     }
 }
+pub(crate) fn preview_snapshot() -> Result<DataSnapshot, String> {
+    stock_watchlist_status().map(|status| data_snapshot(&status))
+}
+
 fn wire_snapshot(
     snapshot: &StockStatus,
     device_watchlist: bool,
@@ -882,6 +904,22 @@ mod tests {
             stock_watchlist_status().unwrap().settings.symbols,
             saved.settings.symbols
         );
+        let preview = crate::local_widget_data::local_widget_snapshot(SOURCE.into()).unwrap();
+        assert_eq!(preview.rows.iter().map(|row| &row.id).collect::<Vec<_>>(),
+            saved.settings.symbols.iter().collect::<Vec<_>>());
+        let path = dir.path().join("stock-watchlist.json");
+        let valid = std::fs::read(&path).unwrap();
+        for damaged in [b"{broken".to_vec(), vec![b' '; 4097]] {
+            std::fs::write(&path, &damaged).unwrap();
+            let reason = configure(dir.path().to_path_buf()).unwrap_err();
+            assert_eq!(stock_watchlist_status().unwrap_err(), reason);
+            assert_eq!(crate::local_widget_data::local_widget_snapshot(SOURCE.into()).err(), Some(reason.clone()));
+            assert_eq!(stock_watchlist_save(Watchlist::default()).unwrap_err(), reason);
+            assert_eq!(std::fs::read(&path).unwrap(), damaged);
+        }
+        std::fs::write(&path, valid).unwrap();
+        configure(dir.path().to_path_buf()).unwrap();
+        assert_eq!(stock_watchlist_status().unwrap().settings.symbols, saved.settings.symbols);
         let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
         assert_eq!(files.len(), 1);
         stock_watchlist_save(Watchlist::default()).unwrap();

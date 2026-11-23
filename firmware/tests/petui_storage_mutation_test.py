@@ -44,6 +44,10 @@ def _mutation_source(unchanged):
 #include "pet_p4_catalog_profile.h"
 #define PET_P4_MINIAPP_WIDGET_ID_MAX 48
 #define MINIAPP_DELETE_TARGETS 18
+#include <errno.h>
+#include <sys/stat.h>
+#include "pet_p4_file_exact.h"
+#define PET_CENTER_THUMB_BYTES 1568U
 #define PET_CENTER_TITLE_MASK_MAX 256
 #define PET_FILE_CLEANUP_MAX_TARGETS 24
 #define ESP_LOGI(...) ((void)0)
@@ -51,16 +55,17 @@ def _mutation_source(unchanged):
 #define PET_WIDGET_TRACE_SCOPE(name,kind) int name=0
 #define pet_widget_trace_scope_end(name) ((void)(name))
 static unsigned held=1,critical,unlocks,locks,io_calls,commits,cleanups,forgets;
-static bool audio,fail_load,fail_save,fail_schema,forget_fail,requires_touch;
+static bool fail_final_capture,audio,fail_load,fail_save,fail_schema,forget_fail,requires_touch;
 static bool realtime_audio;
 static bool work_current=true,revoke_restore,revoke_commit;
 static int fail_io;
 static uintptr_t task=1;
+#define hardware_leave_locked() assert(critical) /* retire under the publication lock */
 #define miniapp_runtime_lock() do{assert(held&&!critical);critical=1;}while(0)
 #define miniapp_runtime_unlock() do{assert(critical);critical=0;}while(0)
 typedef struct {uint8_t count;size_t data_length,wasm_size;uint8_t pixels[1024];} sprites_t;
-typedef struct {bool active,repair_resources;char widget_id[48],transfer_id[64],widget_json[512],buttons_json[512];size_t widget_len,buttons_len,wasm_len,center_title_len;uint8_t wasm_bytes[64],center_title[256];sprites_t sprites;pet_p4_component_metadata_t package_metadata;} staging_t;
-typedef struct {char widget_id[48],title[64];uint8_t slot,package_generation;uint32_t widget_checksum,buttons_checksum,sprites_checksum,center_title_checksum;uint8_t resource_state,center_category;pet_p4_component_metadata_t package_metadata;} miniapp_catalog_item_t;
+typedef struct {bool active,repair_resources;char widget_id[48],transfer_id[64],widget_json[512],buttons_json[512];struct {unsigned file_count,total_bytes;} files;bool thumb_match_present,thumb_only;uint8_t thumb_match[33],center_thumb[1569];size_t center_thumb_len,widget_len,buttons_len,wasm_len,center_title_len;uint8_t wasm_bytes[64],center_title[256];sprites_t sprites;pet_p4_component_metadata_t package_metadata;} staging_t;
+typedef struct {char widget_id[48],title[64];uint8_t slot,package_generation;uint32_t widget_checksum,buttons_checksum,sprites_checksum,center_title_checksum,center_thumb_checksum;uint8_t center_thumb_generation,resource_state,center_category;pet_p4_component_metadata_t package_metadata;} miniapp_catalog_item_t;
 typedef struct {bool active,slicing;char widget_id[48];struct{char title[64];}view;unsigned state_count,var_count,transition_count,tick_count,center_category;int counter,button_count;struct {char action[48];}buttons[16];} miniapp_runtime_t;
 typedef struct {uint8_t generation;uint32_t sequence;} miniapp_catalog_commit_t;
 typedef struct {char path[48];} pet_file_cleanup_target_t;
@@ -83,7 +88,7 @@ static void lock(void *ctx){(void)ctx;assert(!held&&!critical);held=1;locks++;}
 static void storage_scope_finish(pet_storage_scope_t *scope){if(scope->active)assert(pet_storage_scope_finish(scope));}
 static bool storage_scope_begin(pet_storage_scope_t *scope,bool activation_job){(void)activation_job;return pet_storage_scope_begin(&g_storage_lane,scope);}
 static bool storage_work_current(void){return work_current;}
-typedef struct {uint32_t center_title_checksum;uint8_t center_title_slot,center_title_generation;} pet_p4_miniapp_catalog_entry_t;
+typedef struct {uint32_t center_thumb_checksum,center_title_checksum;uint8_t center_thumb_generation,center_title_slot,center_title_generation;} pet_p4_miniapp_catalog_entry_t;
 static bool fail_wasm;
 static bool pet_p4_wasm_validate_install(const char *id,const uint8_t *bytes,size_t len,bool radio,char *error,size_t size){
  assert(!held && !critical && g_storage_lane.occupied && id[0] && bytes && len && !radio);
@@ -129,7 +134,23 @@ static bool io(void){
  g_runtime.counter++;
  return !fail_io||(unsigned)fail_io!=io_calls;
 }
-static bool save_app_runtime(void){assert(held&&!critical);saved_counter=g_runtime.counter;return true;}
+static bool write_file_atomic(const char *tmp,const char *path,const char *data,size_t size){
+ if(!io())return false;
+ FILE *f=fopen(tmp,"wb");if(!f)return false;
+ bool ok=fwrite(data,1,size,f)==size;return fclose(f)==0&&ok&&rename(tmp,path)==0;
+}
+static bool remove_file_if_present(const char *path){return remove(path)==0 || errno==ENOENT;}
+static bool read_binary_file(const char *path,uint8_t *out,size_t cap,size_t *bytes){
+ FILE*f=fopen(path,"rb");if(!f)return false;*bytes=fread(out,1,cap,f);
+ bool ok=fgetc(f)==EOF&&!ferror(f);return fclose(f)==0&&ok;
+}
+/* Deterministic hash adapter for the storage fault harness. The wire tests
+ * independently hash the PC compiler output with real SHA-256. */
+static int mbedtls_sha256(const uint8_t *in,size_t n,uint8_t out[32],int mode){
+ (void)mode;memset(out,n==2&&!memcmp(in,"{}",2)?1:2,32);return 0;
+}
+''' + (ROOT/'main/pet_p4_center_thumb.inc').read_text().replace('/spiffs/p4th','p4th') + r'''
+static bool save_app_runtime(void){assert(held&&!critical);if(commits&&fail_final_capture)return false;saved_counter=g_runtime.counter;return true;}
 static bool parse_runtime(miniapp_runtime_t *r,const char *id,const char *w,const char *b,const sprites_t *s,char *e,size_t n){
  (void)w;(void)b;(void)s;(void)e;(void)n;assert(!held);r->active=true;r->slicing=requires_touch;snprintf(r->widget_id,48,"%s",id);snprintf(r->view.title,64,"Title");return true;
 }
@@ -147,15 +168,21 @@ static bool restore_component_runtime(miniapp_runtime_t *r){assert(!held);prepar
 static void merge_live_persistent_runtime(miniapp_runtime_t *r){assert(held);r->counter=saved_counter;}
 static bool write_catalog_snapshot_at(const miniapp_catalog_item_t *items,size_t count,const char *id,const char *selected,bool seed_pending,int generation,uint32_t sequence,miniapp_catalog_commit_t *out){
  (void)items;(void)count;(void)id;assert(selected||!count);assert(!seed_pending);assert(sequence==g_catalog_sequence);if(!io())return false;
- commits++;out->generation=generation<0?0:1-generation;out->sequence=sequence+1;if(revoke_commit)work_current=false;return true;
+ commits++;out->generation=generation<0?0:1-generation;center_thumb_catalog(out->generation,items,count,true);out->sequence=sequence+1;if(revoke_commit)work_current=false;return true;
 }
 static void component_cleanup_targets(uint8_t slot,pet_file_cleanup_target_t *out){(void)slot;memset(out,0,sizeof(*out)*MINIAPP_DELETE_TARGETS);}
 static uint32_t cleanup_guard(uint32_t *sequence){return *sequence;}
 static bool pet_file_cleanup_prepare(pet_file_cleanup_plan_t *plan,const char *root,pet_file_cleanup_target_t *targets,size_t n,uint32_t seq){(void)root;(void)targets;(void)n;assert(!held&&commits);plan->sequence=seq;return true;}
 static bool pet_file_cleanup_remove_at(pet_file_cleanup_plan_t *plan,size_t index){(void)index;assert(!held&&g_storage_lane.occupied&&g_catalog_sequence==plan->sequence);cleanups++;return true;}
 #define g_storage_resource_lease 1
+static unsigned syncs,fail_sync;
+static int durable_counter;
+static bool pet_app_store_preserve_with_lease(const char *id,int lease){
+ assert(id&&lease==1&&!held&&!critical);if(++syncs==fail_sync)return false;
+ durable_counter=saved_counter;return true;
+}
 static bool pet_app_store_forget_with_lease(const char *id,int lease){(void)id;assert(lease==1&&!held&&commits);forgets++;return !forget_fail;}
-''' + function((ROOT/'main/pet_p4_wasm_trial.c').read_text(),'pet_p4_wasm_action_key') + function(code,'widget_install_stage_reset') + install + remove + r'''
+''' + function((ROOT/'main/pet_p4_wasm_trial.c').read_text(),'pet_p4_wasm_action_key') + function(code,'widget_install_stage_reset') + install + function(code,'commit_thumb_repair') + remove + r'''
 static void reset(void){
  assert(held&&!g_storage_lane.occupied);memset(g_catalog,0,sizeof(g_catalog));memset(&g_runtime,0,sizeof(g_runtime));memset(&g_staging,0,sizeof(g_staging));
  g_catalog_count=2;g_catalog_selected=0;g_catalog_sequence=20;g_catalog_file_generation=0;
@@ -164,12 +191,47 @@ static void reset(void){
  g_runtime.active=true;strcpy(g_runtime.widget_id,"garden");g_runtime.counter=10;
  g_staging.active=true;strcpy(g_staging.transfer_id,"transfer");strcpy(g_staging.widget_id,"garden");
  strcpy(g_staging.widget_json,"{}");g_staging.widget_len=2;strcpy(g_staging.buttons_json,"{}");g_staging.buttons_len=2;
- io_calls=commits=cleanups=forgets=0;audio=fail_load=fail_save=fail_schema=forget_fail=false;g_catalog_seed_pending=false;fail_io=0;g_catalog_recovery_blocked=false;
+ syncs=fail_sync=0;fail_final_capture=false;durable_counter=-1;io_calls=commits=cleanups=forgets=0;audio=fail_load=fail_save=fail_schema=forget_fail=false;g_catalog_seed_pending=false;fail_io=0;g_catalog_recovery_blocked=false;
  work_current=true;revoke_restore=revoke_commit=false;requires_touch=false;realtime_audio=false;
 }
 int main(void){
  char error[160];cJSON *p=cJSON_Parse("{\"transferId\":\"transfer\",\"widgetId\":\"garden\"}");assert(p);
  assert(pet_storage_lane_configure(&g_storage_lane,unlock,lock,owner,NULL));
+ // Repair only the installed garden thumbnail. Failed catalog publication,
+ // repeated repairs and rollback references must never rewrite private state.
+ reset();assert(pet_storage_lane_enter(&g_storage_lane));
+ FILE *runtime_file=fopen("3-0-0-0","wb");assert(runtime_file);fputs("{}",runtime_file);fclose(runtime_file);
+ center_thumb_catalog(0,g_catalog,g_catalog_count,false);center_thumb_catalog(1,g_catalog,g_catalog_count,false);
+ g_staging.thumb_match_present=true;g_staging.center_thumb_len=PET_CENTER_THUMB_BYTES;
+ g_staging.files.file_count=2;g_staging.files.total_bytes=1600;
+ memset(g_staging.center_thumb,0xa1,PET_CENTER_THUMB_BYTES);
+ assert(!commit_thumb_repair(p,NULL,NULL,error,sizeof(error))&&!commits&&!io_calls);
+ memset(g_staging.thumb_match,1,32);
+ staging_t first_thumb=g_staging;
+ assert(commit_thumb_repair(p,NULL,NULL,error,sizeof(error))&&commits==1&&saved_counter==0);
+ assert(g_catalog[0].package_generation==0&&g_catalog_selected==0&&!forgets&&!cleanups);
+ miniapp_catalog_item_t previous=g_catalog[0];
+ pet_p4_miniapp_catalog_entry_t old_image={.center_title_slot=3,.center_thumb_generation=previous.center_thumb_generation,.center_thumb_checksum=previous.center_thumb_checksum};
+ uint8_t got[PET_CENTER_THUMB_BYTES];assert(pet_p4_miniapp_center_read_thumb(&old_image,got,sizeof(got))&&got[0]==0xa1);
+ g_staging=first_thumb;assert(commit_thumb_repair(p,NULL,NULL,error,sizeof(error))&&commits==1);
+ g_staging=first_thumb;g_staging.center_thumb[0]=0xa2;
+ fail_io=io_calls+2;
+ assert(!commit_thumb_repair(p,NULL,NULL,error,sizeof(error))&&commits==1);
+ assert(g_catalog[0].center_thumb_generation==old_image.center_thumb_generation&&pet_p4_miniapp_center_read_thumb(&old_image,got,sizeof(got))&&got[0]==0xa1);
+ fail_io=0;assert(commit_thumb_repair(p,NULL,NULL,error,sizeof(error))&&commits==2);
+ assert(pet_p4_miniapp_center_read_thumb(&old_image,got,sizeof(got))&&got[0]==0xa1);
+ // Delete/reuse the same slot: the prior catalog still pins its only image.
+ miniapp_catalog_item_t newer=g_catalog[0], fresh={.slot=3};
+ center_thumb_catalog(1,NULL,0,true); /* retire first image, keep newer in catalog 0 */
+ pet_p4_miniapp_catalog_entry_t backup={.center_title_slot=3,.center_thumb_generation=newer.center_thumb_generation,.center_thumb_checksum=newer.center_thumb_checksum};
+ assert(!pet_p4_miniapp_center_read_thumb(&old_image,got,sizeof(got)));
+ assert(!pet_p4_miniapp_center_read_thumb(&(pet_p4_miniapp_catalog_entry_t){.center_title_slot=3},got,sizeof(got)));
+ assert(pet_p4_miniapp_center_read_thumb(&backup,got,sizeof(got))&&got[0]==0xa2);
+ g_staging=first_thumb;g_staging.center_thumb[0]=0xb1;
+ pet_storage_scope_t spare={0};assert(storage_scope_begin(&spare,false)&&pet_storage_scope_advance(&spare,PET_STORAGE_PREPARE)&&pet_storage_scope_unlock(&spare));
+ assert(stage_center_thumb(&fresh)&&fresh.center_thumb_generation!=newer.center_thumb_generation);
+ assert(pet_p4_miniapp_center_read_thumb(&backup,got,sizeof(got))&&got[0]==0xa2);
+ assert(pet_storage_scope_finish(&spare));assert(pet_storage_lane_leave(&g_storage_lane));
  // Late commit belongs to an old transfer: preserve all accepted staging.
  reset();staging_t before_staging=g_staging;
  cJSON *late=cJSON_Parse("{\"transferId\":\"old-transfer\",\"widgetId\":\"garden\"}");assert(late);
@@ -232,12 +294,24 @@ int main(void){
  reset();assert(pet_storage_lane_enter(&g_storage_lane));
  assert(remove_component("garden",error,sizeof(error),true));
  assert(held&&!g_storage_lane.occupied&&commits==1&&cleanups==18&&!forgets);
+ assert(syncs==2&&durable_counter==saved_counter&&durable_counter>10);
  assert(g_catalog_count==1&&!strcmp(g_runtime.widget_id,"book")&&g_catalog_sequence==21);
  assert(pet_storage_lane_leave(&g_storage_lane));
  reset();assert(pet_storage_lane_enter(&g_storage_lane));
  assert(remove_component("book",error,sizeof(error),false));
  assert(g_catalog_count==1&&forgets==1&&cleanups==18&&!strcmp(g_runtime.widget_id,"garden"));
  assert(pet_storage_lane_leave(&g_storage_lane));
+ reset();fail_final_capture=true;assert(pet_storage_lane_enter(&g_storage_lane));
+ assert(!remove_component("garden",error,sizeof(error),true)&&commits==1&&syncs==1);
+ assert(g_catalog_recovery_blocked&&g_catalog_count==2&&!cleanups&&!forgets);
+ assert(!strcmp(g_runtime.widget_id,"garden")&&g_runtime.counter>durable_counter);
+ assert(held&&!g_storage_lane.occupied&&pet_storage_lane_leave(&g_storage_lane));
+ for(unsigned failure=1;failure<=2;failure++){
+   reset();fail_sync=failure;assert(pet_storage_lane_enter(&g_storage_lane));
+   assert(!remove_component("garden",error,sizeof(error),true));
+   assert(syncs==failure&&commits==failure-1&&g_catalog_count==3-failure&&!forgets);
+   assert(held&&!g_storage_lane.occupied&&pet_storage_lane_leave(&g_storage_lane));
+ }
  // A durable catalog deletion with a failed save-clear intent is partial,
  // never reported as successful clear-save. The retained lease still closes.
  reset();forget_fail=true;assert(pet_storage_lane_enter(&g_storage_lane));
@@ -285,12 +359,15 @@ int main(void){
 typedef struct {uint8_t frame_width,frame_height,frames,fps;unsigned data_offset,data_length;} pet_p4_miniapp_sprite_t;
 typedef struct {uint8_t count;size_t data_length,wasm_size;uint8_t pixels[1024];pet_p4_miniapp_sprite_t items[4];} sprites_t;
 ''')
-        helpers=r'''
-#define MINIAPP_SPRITE_FILE_HEADER_SIZE 8
+        physical_adapter=r'''
 typedef struct {bool active;} pet_storage_physical_scope_t;
 static bool g_install_unchanged,physical;
 static bool pet_storage_physical_begin(pet_storage_physical_scope_t*s){assert(!held&&!critical&&!physical);physical=s->active=true;return true;}
 static bool pet_storage_physical_finish(pet_storage_physical_scope_t*s){assert(!held&&!critical&&physical&&s->active);physical=s->active=false;return true;}
+'''
+        source=source.replace('static bool stage_center_thumb(',physical_adapter+'\nstatic bool stage_center_thumb(',1)
+        helpers=r'''
+#define MINIAPP_SPRITE_FILE_HEADER_SIZE 8
 static void catalog_sprite_path(size_t s,uint8_t g,unsigned i,bool t,char*out,size_t n){snprintf(out,n,"%zu-%u-%u-%u-s",s,g,i,t);}
 '''+function(code,'unchanged_storage_current')+'\n'+function(code,'preserve_unchanged_package')
         source='#define PET_P4_STORAGE_PRESERVE_UNCHANGED 1\n#include "pet_p4_file_exact.h"\n'+source

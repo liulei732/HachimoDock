@@ -11,8 +11,12 @@ typedef enum {
   PET_LAN_CONTROL_KEYBOARD = 15,
   PET_LAN_CONTROL_PANEL = 17,
   PET_LAN_CONTROL_APPEARANCE = 18,
-  PET_LAN_CONTROL_WIDGET_DATA = 19
+  PET_LAN_CONTROL_WIDGET_DATA = 19,
+  PET_LAN_CONTROL_APP_HOST = 22
 } pet_lan_control_op_t;
+
+enum { PET_LAN_AUDIO_BEGIN = 6, PET_LAN_AUDIO_CHUNK, PET_LAN_AUDIO_COMMIT, PET_LAN_AUDIO_ABORT };
+#define PET_LAN_STATUS_GLOBAL_CUES 16U
 
 typedef enum {
   PET_LAN_PANEL_READ_INPUT = 1,
@@ -26,7 +30,10 @@ typedef enum {
   PET_LAN_PANEL_ENABLE_MICROPHONE = 9,
   PET_LAN_PANEL_DISABLE_MICROPHONE = 10,
   PET_LAN_PANEL_TEXT_PIXELS = 11,
+  PET_LAN_PANEL_BUBBLE_FONT = 12,
+  PET_LAN_PANEL_TEST_MESSAGE = 13,
 } pet_lan_panel_op_t;
+#include "pet_p4_font_delivery.h"
 cJSON *pet_p4_keyboard_config(const cJSON *request, const char *board);
 
 typedef struct {
@@ -37,7 +44,9 @@ typedef struct {
   bool failed;
 } pet_lan_pair_view_t;
 
+bool pet_p4_lan_app_event(uint32_t token, const cJSON *event);
 void pet_p4_lan_start(void);
+void pet_p4_lan_add_diagnostics(cJSON *out);
 void pet_p4_lan_usb_active(void);
 bool pet_p4_lan_realtime_press(const pet_p4_runtime_state_t *state, uint64_t pressed_ms, uint64_t now_ms);
 bool pet_p4_lan_voice_press(const pet_p4_runtime_state_t *state, uint8_t button, uint64_t now_ms);

@@ -22,6 +22,8 @@ bool pet_audio_volume_ready(void);
 esp_err_t pet_audio_volume_get(pet_audio_volume_status_t *out);
 esp_err_t pet_audio_volume_set(unsigned volume, uint64_t now_ms, pet_audio_volume_status_t *out);
 bool pet_audio_volume_pending(void);
+/* Protocol worker only. Cached NVS receipt; no codec or flash access. */
+void pet_audio_volume_storage_state(int *saved, int *pending, bool *failed);
 /* idle is sampled by main outside its state mutex. still_idle is native only,
  * rechecked at physical boundaries; it must not block or touch mutable model. */
 void pet_audio_volume_idle_commit(uint64_t now_ms, bool idle, bool (*still_idle)(void));

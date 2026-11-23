@@ -3,15 +3,24 @@
 # [Pos] ESP32-P4 main firmware component build definition.
 # [Sync] If this file changes, update `firmware/.folder.md` and `protocol.md`.
 
+if("$ENV{PET_P4_LCD_PANEL_AUTO}" STREQUAL "1")
+  set(panel_touch_source "pet_p4_cst328.c")
+endif()
+
 if("$ENV{PET_P4_SYSTEM_WIFI}" STREQUAL "1")
-  set(settings_requires esp_wifi esp_event esp_netif esp-tls protocomm efuse esp_hw_support bootloader_support)
+  set(settings_requires esp_wifi esp_event esp_netif esp-tls protocomm efuse esp_hw_support bootloader_support mqtt esp_http_client)
   set(settings_sources
     "pet_p4_system_settings.c"
+    "pet_p4_community.c"
+    "pet_p4_community_profile.c"
+    "pet_p4_community_crypto.c"
     "pet_p4_device_wifi.c"
     "pet_p4_wifi_clock.c"
     "pet_p4_lan.c"
     "pet_p4_wifi_data.c"
     "pet_p4_live_tls.c"
+    "pet_component_network.c"
+    "pet_component_network_device.c"
     "pet_p4_private_feed.c"
     "pet_p4_mqtt_feed.c"
     "pet_p4_wifi_data_cache.c"
@@ -20,7 +29,7 @@ if("$ENV{PET_P4_SYSTEM_WIFI}" STREQUAL "1")
   )
   if(CONFIG_BT_NIMBLE_ENABLED)
     list(APPEND settings_requires bt)
-    list(APPEND settings_sources "ble_budget_probe.c")
+    list(APPEND settings_sources "ble_budget_probe.c" "pet_p4_ble_accessory.c")
   endif()
 endif()
 
@@ -55,6 +64,7 @@ idf_component_register(
     # MiSans16/32 share the original license; see licenses/MiSans-Font-License-Agreement.pdf
     # and licenses/MiSans-Embedded-Fonts-NOTICE.txt at the repository root.
     "pet_p4_font_cn.c"
+    "pet_p4_shared_font.c"
     "pet_p4_font_cn_32.c"
     "pet_p4_font_bitmap.c"
     "pet_p4_bubble_pixels.c"
@@ -124,6 +134,7 @@ idf_component_register(
     "pet_p4_raw_assets.c"
     "pet_p4_stats.c"
     "pet_p4_touch.c"
+    ${panel_touch_source}
     "pet_p4_touch_core.c"
     "pet_p4_slice_core.c"
     "pet_p4_fruit_core.c"
@@ -131,6 +142,7 @@ idf_component_register(
     "pet_p4_usb_descriptors.c"
     "pet_p4_renderer.c"
     "pet_p4_view.c"
+    "pet_p4_voice_feedback.c"
   INCLUDE_DIRS
     "."
   PRIV_INCLUDE_DIRS
@@ -163,6 +175,18 @@ idf_component_register(
 )
 
 if("$ENV{PET_P4_SYSTEM_WIFI}" STREQUAL "1")
+  set_property(SOURCE "pet_p4_community.c" "pet_p4_community_crypto.c" "pet_p4_community_profile.c"
+    APPEND PROPERTY COMPILE_OPTIONS "-Oz" "-msave-restore")
+  set(community_generator "${CMAKE_CURRENT_LIST_DIR}/../tools/community_build_config.py")
+  set(community_public "${CMAKE_BINARY_DIR}/config/petui_community_public.generated.h")
+  execute_process(COMMAND "${PYTHON}" "${community_generator}" "${community_public}"
+    RESULT_VARIABLE community_result)
+  if(NOT community_result EQUAL 0)
+    message(FATAL_ERROR "Invalid PETUI_COMMUNITY_CONFIG_INPUT")
+  endif()
+  add_custom_target(pet_community_public_config
+    COMMAND "${PYTHON}" "${community_generator}" "${community_public}" VERBATIM)
+  add_dependencies(${COMPONENT_LIB} pet_community_public_config)
   idf_component_get_property(pet_h264_dir espressif__esp_h264 COMPONENT_DIR)
   target_include_directories(${COMPONENT_LIB} PRIVATE "${pet_h264_dir}/sw/libs/tinyh264_inc")
 endif()
@@ -427,8 +451,20 @@ endif()
 set_property(TARGET ${pet_restart_lib} PROPERTY SOURCES "${pet_restart_replaced}")
 
 
-# Preserve a hardware underrun timestamp without relying on the console reader.
-if("$ENV{PET_P4_SYSTEM_WIFI}" STREQUAL "1")
+# Wi-Fi reports underruns. On v3, NV3049 also needs DMA buffer retirement
+# rather than the bridge VSYNC. Legacy panels keep the SDK's default callback.
+set(pet_lcd_dma_refresh OFF)
+if("$ENV{PET_P4_LCD_PANEL_AUTO}" STREQUAL "1" AND "$ENV{PET_P4_CHIP_FAMILY}" STREQUAL "v3")
+  set(pet_lcd_dma_refresh ON)
+endif()
+if("$ENV{PET_P4_SYSTEM_WIFI}" STREQUAL "1" OR pet_lcd_dma_refresh)
+  set(pet_lcd_patch_flags)
+  if(NOT "$ENV{PET_P4_SYSTEM_WIFI}" STREQUAL "1")
+    list(APPEND pet_lcd_patch_flags --skip-underrun)
+  endif()
+  if(pet_lcd_dma_refresh)
+    list(APPEND pet_lcd_patch_flags --dma-refresh)
+  endif()
   idf_component_get_property(pet_lcd_driver esp_lcd COMPONENT_LIB)
   idf_component_get_property(pet_lcd_dir esp_lcd COMPONENT_DIR)
   set(pet_lcd_source "${pet_lcd_dir}/dsi/esp_lcd_panel_dpi.c")
@@ -436,7 +472,7 @@ if("$ENV{PET_P4_SYSTEM_WIFI}" STREQUAL "1")
   set(pet_lcd_patch "${CMAKE_CURRENT_LIST_DIR}/../tools/patch_p4_lcd_underrun.py")
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${pet_lcd_patch}" "${pet_lcd_source}")
   execute_process(COMMAND "${PYTHON}" "${pet_lcd_patch}" "${pet_lcd_source}" "${pet_lcd_generated}"
-    COMMAND_ERROR_IS_FATAL ANY)
+    ${pet_lcd_patch_flags} COMMAND_ERROR_IS_FATAL ANY)
   get_target_property(pet_lcd_sources ${pet_lcd_driver} SOURCES)
   set(pet_lcd_replaced)
   set(pet_lcd_count 0)
@@ -469,15 +505,9 @@ foreach(ble_size_component bt espressif__esp_hosted)
   idf_component_get_property(ble_size_lib ${ble_size_component} COMPONENT_LIB)
   target_compile_options(${ble_size_lib} PRIVATE "-Oz")
 endforeach()
-# The generated protobuf message layouts are unchanged. Only their identical
-# constant field metadata may share storage; leave application objects alone.
-idf_component_get_property(hosted_rpc_lib espressif__esp_hosted COMPONENT_LIB)
-idf_component_get_property(hosted_rpc_dir espressif__esp_hosted COMPONENT_DIR)
-set_property(SOURCE "${hosted_rpc_dir}/common/proto/esp_hosted_rpc.pb-c.c"
-  TARGET_DIRECTORY ${hosted_rpc_lib} APPEND PROPERTY COMPILE_OPTIONS "-fmerge-all-constants")
 endif()
 
-set_property(SOURCE "ble_budget_probe.c" "pet_p4_protocol.c" "pet_p4_component_ext.c"
+set_property(SOURCE "ble_budget_probe.c" "pet_p4_ble_accessory.c" "pet_p4_protocol.c" "pet_p4_component_ext.c"
   "pet_p4_side_scene.c" "pet_p4_wifi_data_sources.c" "pet_p4_renderer.c"
   APPEND PROPERTY COMPILE_OPTIONS "-Oz")
 
@@ -529,6 +559,19 @@ if("$ENV{PET_P4_SYSTEM_WIFI}" STREQUAL "1" AND "$ENV{PET_P4_CHIP_FAMILY}" STREQU
   endforeach()
 endif()
 
+# Share RISC-V register-save sequences in cold setup/installation code.
+# Keep interrupt handlers, USB, rendering, storage locking and audio untouched.
+if("$ENV{PET_P4_SYSTEM_WIFI}" STREQUAL "1")
+  set_property(SOURCE "pet_p4_program_probe.c" "pet_p4_program_session_probe.c"
+    "pet_p4_program_main_probe.c" "pet_p4_form_v2.c" "pet_p4_form_v3.c"
+    "pet_p4_component_ext.c" "pet_p4_component_program.c" "pet_p4_side_scene_json.c"
+    "pet_p4_private_feed.c" "pet_p4_app_host.c" "pet_p4_app_store.c"
+    "pet_p4_program_image.c" "pet_p4_program_persistence.c"
+    "pet_p4_system_settings.c" "pet_p4_program_registry.c" "pet_p4_trusted_services.c"
+    "pet_p4_protocol.c" "pet_p4_diagnostics.c" "pet_p4_surface.c"
+    APPEND PROPERTY COMPILE_OPTIONS "-msave-restore")
+endif()
+
 # Measured v1 control-plane size profile; PCM/DSP/render/USB data paths retain flags.
 if("$ENV{PET_P4_SYSTEM_WIFI}" STREQUAL "1" AND "$ENV{PET_P4_CHIP_FAMILY}" STREQUAL "v1")
   set_property(SOURCE "pet_p4_boot_dma.c" "pet_p4_fs_activity.c"
@@ -540,4 +583,16 @@ if("$ENV{PET_P4_SYSTEM_WIFI}" STREQUAL "1" AND "$ENV{PET_P4_CHIP_FAMILY}" STREQU
     TARGET_DIRECTORY ${pet_volume_codec_lib} APPEND PROPERTY COMPILE_OPTIONS "-Oz")
   set_property(SOURCE "pet_p4_touch.c" "pet_p4_usb_native.c"
     APPEND PROPERTY COMPILE_DEFINITIONS PET_P4_COLD_INIT_SIZE=1)
+endif()
+
+# Only a provisioned v1 community catalog needs this additional OTA space.
+# Share register prologues in radio configuration and network feed workers.
+if("$ENV{PET_P4_SYSTEM_WIFI}" STREQUAL "1" AND "$ENV{PET_P4_CHIP_FAMILY}" STREQUAL "v1")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${community_public}")
+  file(STRINGS "${community_public}" community_signer REGEX "^#define PET_COMMUNITY_KEY_B64 " LIMIT_COUNT 1)
+  if(community_signer)
+    set_property(SOURCE "pet_p4_device_wifi.c" "pet_p4_wifi_clock.c" "pet_p4_wifi_data.c"
+      "pet_p4_wifi_data_cache.c" "pet_p4_wifi_data_sources.c" "pet_p4_live_tls.c" "pet_p4_mqtt_feed.c"
+      APPEND PROPERTY COMPILE_OPTIONS "-msave-restore")
+  endif()
 endif()

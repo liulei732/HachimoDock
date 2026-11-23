@@ -70,8 +70,8 @@ test("Volcano generation reads centralized credentials and keeps model selection
   assert.match(wizard, /isKling && <KlingVideoSettings/);
   assert.match(wizard, /providerCredentialsConfigured/);
   assert.match(wizard, /generation-api-status/);
-  assert.match(wizard, /打开 API 配置/);
-  assert.match(wizard, /请先在 API 配置中保存火山引擎 API Key/);
+  assert.match(wizard, /打开模型配置/);
+  assert.match(wizard, /请先在模型配置中保存火山引擎 API Key/);
   assert.doesNotMatch(wizard, /type="password"/);
   assert.doesNotMatch(wizard, /placeholder="输入或选择火山 Ark 视频模型名称"/);
   assert.doesNotMatch(wizard, /请先填写 Base URL 和视频生成模型/);

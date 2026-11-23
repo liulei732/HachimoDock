@@ -32,6 +32,8 @@ static void xSemaphoreTake(int mutex,int timeout){
  clock_ms=200;pet_program_timer_spec_t spec={.id=1,.delay_ms=10,.interval_ms=100};
  assert(pet_program_timers_start(&timer,1,clock_ms,&spec,1)==PET_TIMERS_OK);
 }
+static unsigned font_expiry_checks;
+static void pet_p4_font_delivery_expire(void){assert(held);font_expiry_checks++;}
 static void observe(uint64_t now){assert(held&&now==200);processes++;}
 static void pet_p4_diagnostics_process(uint64_t now,int *s){assert(s==&g_state);observe(now);}
 static void pet_p4_ota_process(uint64_t now){observe(now);}
@@ -56,7 +58,7 @@ static void one_actual_turn(void){
   }
 }
 int main(void){
- one_actual_turn();assert(observed==200&&processes==4&&!held&&!timer.cancelled);
+ one_actual_turn();assert(observed==200&&processes==4&&font_expiry_checks==1&&!held&&!timer.cancelled);
  pet_program_timer_diagnostic_t d={0};
  assert(pet_program_timers_tick(&timer,1,199,2,enqueue,NULL,&d)==PET_TIMERS_CLOCK_ERROR&&timer.cancelled);
  return 0;

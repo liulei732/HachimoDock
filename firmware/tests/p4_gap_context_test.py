@@ -36,9 +36,14 @@ def test_main_loop_instrumentation_is_flag_gated_and_env_adds_nothing_else(tmp_p
     assert loop.count('xSemaphoreTake(g_state_mutex, portMAX_DELAY);')==1 and loop.count('xSemaphoreGive(g_state_mutex);')==1
     assert loop.index('loop_wait_started_us = pet_p4_gap_clock_us();')<loop.index('xSemaphoreTake(g_state_mutex, portMAX_DELAY);')<loop.index('loop_held_started_us = pet_p4_gap_clock_us();')
     assert loop.index('loop_miniapp_started_us = pet_p4_gap_clock_us();')<loop.index('pet_p4_miniapp_process(now_ms')<loop.index('loop_miniapp_us = (uint32_t)')
+    start = 'loop_host_started_us = pet_p4_gap_clock_us();'
+    end = 'loop_miniapp_us += (uint32_t)(pet_p4_gap_clock_us() - loop_host_started_us);'
+    assert loop.index('pet_p4_input_process(') < loop.index(start) < loop.index('pet_p4_miniapp_host_process(') < loop.index(end)
+    assert f'#if PET_P4_GAP_PEAK_CONTEXT\n    int64_t {start}\n#endif' in loop
+    assert f'#if PET_P4_GAP_PEAK_CONTEXT\n    {end}\n#endif' in loop
     assert loop.count('esp_timer_get_time()')==1
     assert loop.index('xSemaphoreGive(g_state_mutex);')<main.index('pet_p4_renderer_note_loop(loop_wait_us,')<main.index('pet_p4_renderer_render(g_render_state, &render_view, now_ms)')
-    assert main.count('#if PET_P4_GAP_PEAK_CONTEXT')==6
+    assert main.count('#if PET_P4_GAP_PEAK_CONTEXT')==8
     assert renderer.count('pet_render_gap_context_record(&g_metrics.lifetime,g_render_trace.gap_us,&context);')==1
     assert renderer.index('pet_render_gap_context_record(')<renderer.index('pet_render_lifetime_record(&g_metrics.lifetime,total_us,g_render_trace.gap_us,')
     assert renderer.count('memset(&g_loop_context,0,sizeof(g_loop_context));')==1

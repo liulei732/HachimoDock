@@ -1,0 +1,5 @@
+{
+  "codex.accounts": {
+    "actions": ["refresh", "previous", "next"]
+  }
+}

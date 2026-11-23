@@ -17,6 +17,7 @@ try {
     window.__vite_plugin_react_preamble_installed__=true;
     window.testVolume=0.3; window.testWrites=[]; window.testSaved=false;
     window.__TAURI_INTERNALS__={ invoke:async (command,args)=>{
+      if(command==='load_voice_chat_settings')return {ttsConfigured:true,ttsProvider:'volcengine'};
       if(command==='load_realtime_voice_volume')return window.testVolume;
       if(command==='save_realtime_voice_volume'){window.testVolume=args.volume;return args.volume;}
       if(command==='realtime_chat_update_persona')return false;
@@ -43,7 +44,7 @@ try {
     window.showVolumePet('pet-a',1.5);
   });
   const volume=page.locator('label').filter({hasText:'全局音量'}).locator('input');
-  await page.waitForFunction(()=>document.querySelectorAll('input[type="range"]')[1]?.value==='0.3');
+  await page.waitForFunction(() => [...document.querySelectorAll('label')].find(label => label.textContent.includes('全局音量'))?.querySelector('input')?.value === '0.3');
   assert.equal(await volume.inputValue(),'0.3');
   await page.getByRole('button',{name:'试听',exact:true}).click();
   await page.waitForFunction(()=>window.testPreviewVolume===0.3);
@@ -54,7 +55,7 @@ try {
   await page.waitForFunction(()=>window.testSaved===true);
   assert.equal(await page.evaluate(()=>window.testVolume),0.65);
   await page.evaluate(()=>window.showVolumePet('pet-b',0.2));
-  await page.waitForFunction(()=>document.querySelectorAll('input[type="range"]')[1]?.value==='0.65');
+  await page.waitForFunction(() => [...document.querySelectorAll('label')].find(label => label.textContent.includes('全局音量'))?.querySelector('input')?.value === '0.65');
   assert.equal(await volume.inputValue(),'0.65');
   assert.deepEqual(errors,[]);
   console.log('PASS: global gain overrides both pets; preview, save, factory reset and switching verified.');

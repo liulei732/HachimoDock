@@ -11,6 +11,7 @@
  * [Sync] If this file changes, update `pc/src/component-center/.folder.md`.
  */
 
+import OfflineEditionButton from "./OfflineEditionButton.jsx";
 import React, { useEffect, useRef } from "react";
 import { AlertTriangle, Download, RotateCcw, Save, Settings2, Trash2, X } from "lucide-react";
 import Button from "../shell/Button";
@@ -19,6 +20,9 @@ import { componentKindLabel, resolveComponentKind } from "./CandidateCard";
 import DeviceScreenPreview from "./DeviceScreenPreview";
 
 import StockWatchlist from "./StockWatchlist.jsx";
+import CodexAccounts from "./CodexAccounts.jsx";
+import PythonPlugin, { hasPythonPlugin } from "./PythonPlugin.jsx";
+import { hasCodexAccounts } from "./codex-accounts-model.js";
 import LocalDataPanel from "./LocalDataPanel.jsx";
 import MusicPlayer from "./MusicPlayer.jsx";
 import ComponentMediaPanel from "./ComponentMediaPanel.jsx";
@@ -27,10 +31,13 @@ import { LOCAL_SOURCES, AUTH_SOURCES } from "./local-widget-model.js";
 import AuthProviderPanel from "./AuthProviderPanel.jsx";
 import {ProgramBackgroundStart} from './ProgramBackground.jsx';
 
+import {componentFeatures} from "./component-features.js";
+
 const WasmComponentPreview = React.lazy(() => import("./WasmComponentPreview.jsx"));
 
 export default function ComponentPreviewModal({
   active = true,
+  capabilityTarget,
   component,
   usb,
   kind,
@@ -51,9 +58,11 @@ export default function ComponentPreviewModal({
   componentButtonsWillApply = false,
   installBlockedReason = "",
   onInstall,
+  onRepairThumbnail,
   onDelete,
   onClose,
   onSourceChange,
+  onEditionImported,
 }) {
   const isDeviceOnly = component.isDeviceOnly === true;
   const isUpdatingCurrent = !isDeviceOnly && (
@@ -111,6 +120,7 @@ export default function ComponentPreviewModal({
     };
   }, []);
 
+  const features = componentFeatures(component,capabilityTarget);
   return (
     <div
       className="modal-backdrop"
@@ -152,7 +162,12 @@ export default function ComponentPreviewModal({
         <div className="modal-body">
           {component.sourceAlternatives?.length>1&&<label className="component-source-picker">资源来源（切换会放弃未保存的按钮草稿）<select aria-label="选择组件来源" value={component.isLocal?'local':'builtin'} onChange={e=>{const selected=component.sourceAlternatives.find(c=>Boolean(c.isLocal)===(e.target.value==='local'));if(selected)onSourceChange?.({...selected,sourceAlternatives:component.sourceAlternatives});}} disabled={installing}>{component.sourceAlternatives.map(c=><option key={c.isLocal?'local':'builtin'} value={c.isLocal?'local':'builtin'}>{c.isLocal?'本地创作 / 下载':'客户端内置'} · {c.version||'版本未知'}</option>)}</select></label>}
           <p className="component-preview-mode">{isDeviceOnly?'设备清单信息：本机没有安装源，不能试玩、修改按钮或重新同步；可以查看信息或移除设备副本。':component.appRuntime?.program?'画面为本机预览；后台程序按钮实际控制设备已安装版本。预览与设备存档独立，不会自动安装、录音或播放。':component.pcApplication||component.pcExtension||LOCAL_SOURCES.has(component.dataSource)||component.dataSource==='stocks.watchlist'?'真实服务控制：服务设置和数据操作会立即保存；底部“取消”只放弃未同步的按钮设置，不撤销已执行的服务操作。':'试玩预览：此处操作不会修改设备存档。按钮设置仅在同步成功后保存，取消不会修改设置。'}</p>
+          <section aria-label="功能与数据来源"><h4>功能与数据来源</h4>
+            {features.rows.length ? <dl>{features.rows.map(row=><React.Fragment key={row.id}><dt>{row.label}</dt><dd>{row.detail}{row.evidence&&<details><summary>查看所需能力</summary><small>{row.evidence}</small></details>}</dd></React.Fragment>)}</dl> : <p>{features.summary}</p>}
+          </section>
           <ProgramBackgroundStart key={`${component.id}:${component.versionHash}`} component={component} isInstalled={isInstalled} installing={installing}/>
+          {hasCodexAccounts(component) && <CodexAccounts key={`accounts-${component.id}:${component.versionHash}`} component={component} />}
+          {hasPythonPlugin(component) && <PythonPlugin key={`python-${component.id}:${component.versionHash}`} component={component} />}
           {(component.mediaSource === "audio.player" || component.id === "music-player") && <MusicPlayer />}
           {component.pcExtension && <ComponentMediaPanel key={`${component.id}:${component.versionHash}`} component={component} />}
           {component.pcApplication && <ComponentAppPanel key={`${component.id}:${component.versionHash}`} component={{...component,defaultBindings:bindings}} active={active} />}
@@ -184,6 +199,9 @@ export default function ComponentPreviewModal({
                   <span className="component-preview-modal__kind">{componentKind}</span>
                 </div>
                 {component.goal && <p>{component.goal}</p>}
+                {!isDeviceOnly && onEditionImported && (
+                  <OfflineEditionButton componentId={component.id} disabled={installing} onImported={onEditionImported} />
+                )}
                 {playGuide && (
                   <p className="component-preview-modal__play-guide">
                     <strong>怎么玩：</strong>{playGuide}
@@ -331,6 +349,7 @@ export default function ComponentPreviewModal({
             >
               {isDeviceOnly ? "关闭" : "取消"}
             </Button>
+            {onRepairThumbnail && <Button variant="secondary" disabled={installing} onClick={onRepairThumbnail}>仅补设备封面</Button>}
             {!isDeviceOnly && typeof onInstall === "function" && (
               <Button
                 variant="primary"

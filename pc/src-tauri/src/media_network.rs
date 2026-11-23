@@ -99,14 +99,18 @@ fn pinned_client(host: &str, addresses: &[SocketAddr]) -> Result<Client, String>
 fn get_scoped(raw: &str, hosts: Option<&[String]>) -> Result<Response, String> {
     get_scoped_policy(raw,hosts,false)
 }
+fn scoped_host<'a>(url: &'a Url, hosts: Option<&[String]>, https_443: bool) -> Result<&'a str, String> {
+    let host = url.host_str().ok_or("电台缺少域名")?;
+    if https_443 && (url.scheme() != "https" || url.port_or_known_default() != Some(443))
+        || hosts.is_some_and(|hosts| url.scheme() != "https" || !hosts.iter().any(|h| h == host)) {
+        return Err("请求超出组件声明的域名权限".into());
+    }
+    Ok(host)
+}
 fn get_scoped_policy(raw: &str, hosts: Option<&[String]>, https_443:bool) -> Result<Response, String> {
     let mut url = valid_url(raw)?;
     for _ in 0..5 {
-        let host = url.host_str().ok_or("电台缺少域名")?;
-        if https_443&&(url.scheme()!="https"||url.port_or_known_default()!=Some(443))
-            ||hosts.is_some_and(|hosts| url.scheme() != "https" || !hosts.iter().any(|h| h == host)) {
-            return Err("请求超出组件声明的域名权限".into());
-        }
+        let host = scoped_host(&url, hosts, https_443)?;
         let addresses = crate::media_dns::resolve(host, url.port_or_known_default().unwrap())?;
         // Pin the checked answers; do not let redirects, proxies or a second DNS
         // lookup turn an untrusted catalogue entry into a local-network request.
@@ -150,6 +154,45 @@ pub(crate) fn scoped_json(raw: &str, hosts: &[String], max: usize) -> Result<ser
 /// Keep HTTPS/443 on every redirect without changing legacy radio policy.
 pub(crate) fn scoped_json_https(raw:&str,hosts:&[String],max:usize)->Result<serde_json::Value,String>{
     bounded_json(get_scoped_policy(raw,Some(hosts),true)?,max)
+}
+/// The caller can drop this future while connecting or reading a slow body.
+pub(crate) async fn python_json(
+    raw: &str, hosts: &[String], max: usize,
+    check: impl Fn() -> Result<(), String> + Clone + Send + 'static,
+) -> Result<serde_json::Value, String> {
+    static DNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    let mut url = valid_url(raw)?;
+    for _ in 0..5 {
+        let host = scoped_host(&url, Some(hosts), true)?.to_owned();
+        let query = host.clone();
+        check()?;
+        // An abandoned blocking resolver retains both its slot and the original
+        // broker lease. A cancelled lookup cannot start a new DoH fallback.
+        let resolver_check = check.clone();
+        let slot = DNS.try_acquire().map_err(|_| "域名解析繁忙")?;
+        let addresses = tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            crate::media_dns::resolve_checked(&query, 443, resolver_check)
+        }).await.map_err(|_| "域名解析失败")??;
+        check()?;
+        let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(&host, &addresses).connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15)).build().map_err(|_| "组件网络初始化失败")?;
+        let mut response = client.get(url.clone()).send().await.map_err(|_| "组件 HTTPS 请求失败")?;
+        if response.status().is_redirection() {
+            let location = response.headers().get("location").and_then(|v| v.to_str().ok()).ok_or("组件跳转无效")?;
+            url = valid_url(url.join(location).map_err(|_| "组件跳转无效")?.as_str())?;
+            continue;
+        }
+        if !response.status().is_success() { return Err("组件 HTTPS 状态异常".into()); }
+        let mut data = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| "组件响应中断")? {
+            if chunk.len() > max - data.len() { return Err("目录响应超过安全上限".into()); }
+            data.extend_from_slice(&chunk);
+        }
+        return serde_json::from_slice(&data).map_err(|_| "目录 JSON 无效".into());
+    }
+    Err("组件跳转次数过多".into())
 }
 fn bounded_json(response:Response,max:usize)->Result<serde_json::Value,String>{
     let mut data=Vec::new();

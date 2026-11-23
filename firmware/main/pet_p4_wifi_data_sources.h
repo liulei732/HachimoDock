@@ -46,6 +46,7 @@ bool pet_wifi_watchlist_parse(const cJSON *symbols, pet_wifi_watchlist_t *out);
 cJSON *pet_wifi_stock_snapshot(char *body, const pet_wifi_watchlist_t *list, uint64_t utc_ms);
 bool pet_wifi_news_ids(const char *body, size_t length, uint32_t ids[8], unsigned *count);
 bool pet_wifi_news_add(cJSON *snapshot, const char *body, size_t length, uint32_t id, uint64_t utc_ms);
+bool pet_wifi_data_snapshot_date(cJSON *snapshot, uint64_t utc_ms);
 cJSON *pet_wifi_data_snapshot(const char *source, const char *status, const char *message,
                             uint32_t ttl_ms, uint64_t utc_ms);
 /* Parse the original schema=1 envelope or project a validated response map.

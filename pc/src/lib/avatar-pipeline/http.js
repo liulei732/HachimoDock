@@ -54,7 +54,7 @@ function buildTransportError(err, { url, method, label, diagnostic }) {
   // native/plugin exceptions, which can contain query credentials and proxy URLs.
   const hint = label === "tauri-invoke" || label === "download-bytes"
     ? raw.replace(/https?:\/\/[^\s）)]+/gi, "[服务地址]")
-    : "请检查网络、证书及 API 配置中的云服务网络设置。";
+    : "请检查网络、证书及模型配置中的云服务网络设置。";
   return new Error(`云服务请求失败：${hint}`);
 }
 
@@ -105,6 +105,15 @@ export async function pipelineFetch(input, init = {}) {
   const url = typeof input === "string" ? input : String(input);
   const method = init?.method || "GET";
   const invoke = await getTauriInvoke();
+  // Keep only a public service label. The URL itself may carry a token.
+  let requestProvider = "";
+  if (init.diagnosticStage && init.diagnosticStage !== "download") {
+    try {
+      const host = new URL(url).hostname;
+      requestProvider = host === "ark.cn-beijing.volces.com" ? "火山方舟"
+        : host === "api-beijing.klingai.com" ? "可灵" : "自定义";
+    } catch { /* A malformed endpoint establishes no provider identity. */ }
+  }
   const started = Date.now();
   const fallbackDiagnostic = (phase, outcome, response) => ({
     timestampMs: started, localId: globalThis.crypto?.randomUUID?.() || `local-${started}`,
@@ -127,6 +136,7 @@ export async function pipelineFetch(input, init = {}) {
       const response = new Response(result?.body ?? "", {
         status: Number(result?.status) || 200,
       });
+      response.requestProvider = requestProvider;
       response.generationDiagnostic = recordDiagnostic(result.diagnostic || fallbackDiagnostic("complete", response.ok ? "success" : "http_error", response));
       return response;
     } catch (err) {
@@ -135,6 +145,8 @@ export async function pipelineFetch(input, init = {}) {
       }
       if (!isMissingTauriCommand(err)) {
         const safeError = buildTransportError(err, { url, method, label: "tauri-invoke" });
+        safeError.requestStage = init.diagnosticStage;
+        safeError.requestProvider = requestProvider;
         console.error("[pipelineFetch/tauri-invoke]", safeError.message);
         throw safeError;
       }
@@ -147,11 +159,13 @@ export async function pipelineFetch(input, init = {}) {
   try {
     const impl = tauriFetch || fetch;
     const response = await impl(input, init);
+    response.requestProvider = requestProvider;
     response.generationDiagnostic = recordDiagnostic(fallbackDiagnostic("response_body", response.ok ? "success" : "http_error", response));
     return response;
   } catch (err) {
     if (err?.name === "AbortError") throw err;
     const safeError = buildTransportError(err, { url, method, label, diagnostic: fallbackDiagnostic("unknown", "transport_error") });
+    safeError.requestProvider = requestProvider;
     console.error(`[pipelineFetch/${label}]`, safeError.message);
     throw safeError;
   }
@@ -297,6 +311,7 @@ export async function readJsonOrThrow(response, label) {
       }
     } catch { /* incomplete/unstructured errors never authorize image POST retry */ }
     error.diagnostic = response.generationDiagnostic;
+    error.requestProvider = response.requestProvider;
     throw error;
   }
   if (!text) return null;

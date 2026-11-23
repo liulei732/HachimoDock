@@ -33,7 +33,7 @@ def image(p, runtime=None):
     return p
 def validate(runtime):
     if 'program' not in runtime:return None
-    p=runtime['program'];need(isinstance(p,dict) and set(p)=={'engine','image','outputs','actions','timers'} and p['engine'] in (ENGINE,'p4-component-program-v2'))
+    p=runtime['program'];need(isinstance(p,dict) and set(p)-{'background'}=={'engine','image','outputs','actions','timers'} and p['engine'] in (ENGINE,'p4-component-program-v2'))
     need(runtime.get('engine')=='p4-bounded-runtime-v4' and runtime.get('surface',{}).get('engine')=='p4-app-surface-v1' and runtime.get('input',{}).get('engine')=='p4-input-v1')
     writers=variable_owners(runtime)
     need(('host' not in runtime or writers['mixed']) and not any(k in runtime for k in ('local','scene','game','media','instrument','data')));image(p['image'],runtime)
@@ -67,6 +67,7 @@ def validate(runtime):
             if number(word,-2147483648,2147483647):continue
             need(isinstance(word,dict) and set(word)=={'var'} and isinstance(word['var'],str) and vars.get(word['var'],{}).get('type')=='int')
     timers=p['timers'];need(isinstance(timers,list) and len(timers)<=8);ids=set()
+    if 'background' in p: need(p['background'] is True and bool(timers))
     for t in timers:
         need(isinstance(t,dict) and set(t)=={'id','delayMs','intervalMs','words'} and number(t['id'],1,65535) and t['id'] not in ids)
         need(number(t['delayMs'],0,4294967295) and number(t['intervalMs'],0,4294967295) and (t['intervalMs']==0 or t['intervalMs']>=100))

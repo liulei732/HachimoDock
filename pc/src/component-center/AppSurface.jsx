@@ -363,7 +363,14 @@ function ToolAppPreview({component,active,interactive,hostSnapshot,onHostAction}
   if(!runtime||!state)return <div role="status">组件预览数据未就绪</div>;
   const presented=mixedHostSnapshot(runtime,{...state,data},hostSnapshot);
   if((runtime.host&&!runtime.ownership||component.pcApplication?.engine==='pc-fetch-v1')&&hostSnapshot){presented.vars={...presented.vars,...hostSnapshot.variables};presented.values=hostSnapshot.values;presented.ui=hostSnapshot.ui;presented.data=hostSnapshot.data;}
-  const dispatch=(a,confirmation,node)=>{if(!active||!actionEnabled(runtime,presented,a))return;if(hostAction(runtime,a)||component.pcApplication?.engine==='pc-fetch-v1'&&Object.hasOwn(component.pcApplication.actions||{},a)){onHostAction?.(a,confirmation);return;}setState(s=>dAction(runtime,s,a,node)||appAction(runtime,dSnapshot(runtime,s),a));};
+  const dispatch=(a,confirmation,node)=>{if(!active||!actionEnabled(runtime,presented,a))return;if(hostAction(runtime,a)||component.pcApplication?.engine==='pc-fetch-v1'&&Object.hasOwn(component.pcApplication.actions||{},a)){onHostAction?.(a,confirmation);return;}setState(s=>{
+    const navigation=dAction(runtime,s,a,node);
+    if(navigation)return navigation;
+    if(!runtime.data)return appAction(runtime,dSnapshot(runtime,s),a);
+    // Page eligibility uses the current feed. Keep that feed out of the ticking simulator state.
+    const {data: feed,...next}=appAction(runtime,dSnapshot(runtime,{...s,data}),a);
+    return next;
+  });};
   const view=<><AppSurface componentId={component.id} runtime={runtime} snapshot={presented} active={active} images={component.sceneSprites} bindings={component.defaultBindings} inputActionRef={inputAction} onConfirmationChange={setConfirming} onAction={interactive&&(!runtime.host||runtime.ownership)?dispatch:undefined}/></>;
   if(!runtime.form)return view;
   // Expose the actual declared mappings, including forms with no touch nodes.

@@ -127,7 +127,7 @@ impl UsbSerialManager {
         struct Busy<'a>(&'a UsbSerialManager);
         impl Drop for Busy<'_> { fn drop(&mut self) { self.0.finish_appearance_sync(); } }
         let _busy = Busy(self);
-        let observed = self.observe_pending_appearance_owned(board, &intent, &_exclusive)?;
+        let observed = self.observe_pending_appearance_owned(board, &intent, None, &_exclusive)?;
         Ok(serde_json::json!({ "status": "observed_current_state_quiescent", "oldResult": "unknown",
             "mutationSent": false, "requiresFreshUserIntent": true,
             "activeSlot": observed.active_slot, "activePackId": observed.active_pack_id }))
@@ -135,7 +135,7 @@ impl UsbSerialManager {
     // All callers own the same asset gate. This never acquires it recursively
     // or resets cancellation/busy state owned by the current follow IPC.
     fn observe_pending_appearance_owned(
-        &self, board: &str, intent: &str, _exclusive: &std::sync::MutexGuard<'_, ()>,
+        &self, board: &str, intent: &str, expected: Option<(u64, &str)>, _exclusive: &std::sync::MutexGuard<'_, ()>,
     ) -> Result<Observation, String> {
         if self.active_appearance_attempt()?.is_some() { return Err("appearance_recovery_busy".into()); }
         #[cfg(test)] let journal = self.appearance_journal.clone();
@@ -154,6 +154,9 @@ impl UsbSerialManager {
             journal.pending_for_recovery(&board, &intent)?;
             if c.capabilities["appearance"]["quiescentQuery"].as_str() != Some(SCHEMA) { return Err(UPDATE.into()); }
             let boot = c.capabilities["debugBootId"].as_str().filter(|s| !s.is_empty() && s.len() <= 128).ok_or(UPDATE)?.to_owned();
+            if expected.is_some_and(|(generation, id)| c.connection_id != generation || boot != id) {
+                return Err("appearance_recovery_connection_changed".into());
+            }
             (c.connection_id, boot)
         };
         let pending = journal.pending_for_recovery(&board, &intent)?;
@@ -193,18 +196,18 @@ impl UsbSerialManager {
     /// Entry only for a NEW explicit appearance-sync invocation, before its
     /// mutation Attempt exists. Never call from a failed-attempt catch/retry.
     pub(super) fn with_appearance_user_intent<T>(
-        &self, board: &str, exclusive: &std::sync::MutexGuard<'_, ()>,
+        &self, board: &str, expected: Option<(u64, &str)>, exclusive: &std::sync::MutexGuard<'_, ()>,
         work: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
         #[cfg(test)] let journal = self.appearance_journal.clone();
         #[cfg(not(test))] let journal = appearance_safety::journal_for_recovery()?;
         if !journal.needs_observation(board)? {
-            return self.with_appearance_attempt(board, work);
+            return self.with_appearance_attempt_bound(board, expected, work);
         }
         self.ensure_appearance_sync_not_cancelled(None)?;
         // A fresh observation nonce and intent, never the old transfer/attempt.
         let intent = uuid::Uuid::new_v4().to_string();
-        let observed = self.observe_pending_appearance_owned(board, &intent, exclusive)?;
+        let observed = self.observe_pending_appearance_owned(board, &intent, expected, exclusive)?;
         self.ensure_appearance_sync_not_cancelled(None)?;
         transfer_log::record("appearance","current_intent_observed_quiescent",
             serde_json::json!({"oldResult":"unknown","mutationReplayed":false,"newAttempt":true}));

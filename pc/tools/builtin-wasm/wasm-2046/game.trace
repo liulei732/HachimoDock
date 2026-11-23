@@ -1,0 +1,23 @@
+seed-save 0 4369
+seed-save 4 12
+seed-save 6 42
+seed-save 7 7
+frame 0
+text 2048
+observe
+event 4 1 0
+frame 160
+slot-changed 4 20
+changed
+observe
+event 1 570 444
+event 3 570 444
+frame 0
+slot-changed 4 12
+changed
+event 4 5 0
+frame 0
+text 开启新的一局？
+event 4 6 0
+frame 0
+text 2048

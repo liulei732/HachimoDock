@@ -1,0 +1,32 @@
+[
+  {
+    "action": "work",
+    "label": "Work",
+    "event": "button.sw1.short_press",
+    "control": "SW1"
+  },
+  {
+    "action": "rest",
+    "label": "Rest",
+    "event": "button.sw2.short_press",
+    "control": "SW2"
+  },
+  {
+    "action": "browse",
+    "label": "Browse",
+    "event": "button.encoder.short_press",
+    "control": "前方摇杆"
+  },
+  {
+    "action": "slot.up",
+    "label": "Slot +",
+    "event": "knob.rotate_cw",
+    "control": "前方摇杆"
+  },
+  {
+    "action": "first",
+    "label": "First slot",
+    "event": "knob.rotate_ccw",
+    "control": "前方摇杆"
+  }
+]

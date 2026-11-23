@@ -65,7 +65,6 @@ def test_dispatcher_wrapper_and_worker_route_are_flag_gated(tmp_path):
     setter=text[text.index('void pet_p4_protocol_set_deferred_reply(pet_p4_query_reply_t *reply){'):]
     assert 'g_deferred_reply=reply;' in setter
     worker=function(main,'protocol_worker_task')
-    assert worker.index('pet_p4_protocol_set_deferred_reply(&query_reply);')<worker.index('pet_p4_handle_line_with_reply(&g_state, request.line')<worker.index('pet_p4_protocol_set_deferred_reply(NULL);')<worker.index('xSemaphoreGive(g_state_mutex);')
     assert 'return pet_p4_handle_line_with_reply(state, line, send_line, ctx, NULL);' in text
     assert '#if PET_P4_QUERY_REPLY_DEFERRED || PET_P4_QUERY_REPLY_TRACE || PET_P4_MUTATION_ACK_DEFERRED' in main
     # A retired ingress is freed before dispatch and must never reach a reply.
@@ -77,6 +76,7 @@ def test_dispatcher_wrapper_and_worker_route_are_flag_gated(tmp_path):
     assert 'free(request.line); release_protocol_memory(request.charged_bytes); continue;' in retired_guard
     assert retired_end<worker.index('bool handled_debug')<worker.index('if (!handled_debug) {')
     dispatch=worker[worker.index('if (!handled_debug) {'):]
+    assert dispatch.index('pet_p4_protocol_set_deferred_reply(&query_reply);')<dispatch.index('pet_p4_handle_line_with_reply(&g_state, request.line')<dispatch.index('pet_p4_protocol_set_deferred_reply(NULL);')<dispatch.index('xSemaphoreGive(g_state_mutex);')
     assert dispatch.index('xSemaphoreGive(g_state_mutex);')<dispatch.index('if (query_reply.line) {')<dispatch.index('free(request.line);')
     config=configparser.ConfigParser(interpolation=None);config.read(ROOT/'platformio.ini')
     for section in config.sections():

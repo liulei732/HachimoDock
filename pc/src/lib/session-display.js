@@ -59,7 +59,7 @@ function canonicalTerminalState(session) {
   return ["error", "failed"].includes(state) ? "error" : "done";
 }
 
-function isImplicitTerminalDeviceSession(session) {
+export function isImplicitTerminalDeviceSession(session) {
   // Registry inactivity is independent of lifecycle completion for DSH.
   return session?.activitySource !== "live-agent-status"
     && IMPLICIT_TERMINAL_DEVICE_SESSION_STATE_SET.has(normalizedSessionState(session));

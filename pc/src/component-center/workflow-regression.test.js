@@ -11,8 +11,7 @@ test('UI confirmations stay inside app and publication sources retain custom var
   for(const ui of [community,center])assert.doesNotMatch(ui,/\bwindow\s*\.\s*(?:confirm|prompt|alert)\s*\(/);
   assert.match(community,/WorkflowConfirm title="放弃未提交修改/);
   assert.match(center,/WorkflowConfirm title="设备版本更高/);
-  assert.match(community,/localItems=\{publicationItems\.filter/);
-  assert.match(community,/publicationItems=localItems\.flatMap\(item=>item\.sourceAlternatives\?\.filter\(source=>source\.isLocal\)/);
+  assert.match(community,/localItems=\{publicationItems\}/);
   assert.match(community,/setSelectedCovers\(null\);\s*setReadingCovers\(false\);\s*pending\.current=null;\s*dirty\.current=false/);
   const publish=community.slice(community.indexOf('function Publish('),community.indexOf('export default function CommunityCenter('));
   assert.doesNotMatch(publish,/\bset(?:Rights|Privacy|Tested)\b|type=["']checkbox["']/);
@@ -31,9 +30,9 @@ function publicationHarness({license='',canPublish=true}={}){
   const form={author:'fixture author',summary:'fixture summary',description:'fixture description',category:'tool',releaseNotes:'',sourceUrl:''};
   if(license!==undefined)form.license=license;
   const env={
-    busy:false,submitting:{current:false},prepared:{id:'fixture-component',canPublish,contentHash:'a'.repeat(64)},
+    busy:false,submitting:{current:false},currentPackage:{id:'fixture-component',canPublish,contentHash:'a'.repeat(64)},
     publishBlocker:canPublish?'':'组件文件尚未通过发布检查。',
-    path:'/fixture/component',form,covers:['data:image/png;base64,c2NyZWVuc2hvdA=='],pending:{current:null},
+    path:'/fixture/component',form,selectedCovers:[],covers:['data:image/png;base64,c2NyZWVuc2hvdA=='],pending:{current:null},
     TextEncoder,Uint8Array,crypto:{subtle:webcrypto.subtle,randomUUID:()=> 'fixture-publication-request'},
     localStorage:{getItem:key=>storage.get(key)??null,setItem:(key,value)=>storage.set(key,value),removeItem:key=>storage.delete(key)},
     NAME_KEY:'fixture-author',setBusy:()=>{},setError:value=>errors.push(value),errorText:String,
@@ -55,7 +54,7 @@ test('publication accepts empty or omitted license without fabricating human ack
     assert.equal(action,'publish');
     assert.deepEqual(Object.keys(input).sort(),['covers','expectedContentHash','metadata','path','requestId']);
     assert.deepEqual(input.metadata,h.env.form);
-    assert.deepEqual(input.covers,['c2NyZWVuc2hvdA==']);
+    assert.deepEqual(input.covers,[]);
     assert.equal(input.expectedContentHash,'a'.repeat(64));
     assert.equal(input.requestId,'fixture-publication-request');
     assert.deepEqual(h.published,[{id:'fixture-component',status:'pending'}]);
@@ -68,17 +67,23 @@ test('optional publication license retains screenshot, scan, integrity and moder
   const community=source('CommunityCenter.jsx'),native=source('../../src-tauri/src/community.rs');
   const publish=native.slice(native.indexOf('        "publish" => {'),native.indexOf('        "download" => {'));
   assert.match(community,/accept="image\/png,image\/jpeg,image\/webp"/);
-  assert.match(community,/files\.length > 3/);
+  assert.match(community,/files\.length > 2/);
   assert.match(community,/file\.size > 2 \* 1024 \* 1024/);
   assert.match(community,/disabled=\{Boolean\(publishBlocker\)\}/);
   assert.match(community,/新作品和更新均需审核，审核通过后才会公开/);
-  assert.match(native,/"canPublish":true/);
-  assert.match(native,/collect\(&canonical, &canonical, has_wasm, false, &mut files, &mut expanded\)\?/);
-  assert.match(native,/if sensitive_json\(&v\)/);
-  assert.match(native,/if sensitive_text\(std::str::from_utf8\(&bytes\)/);
+  const prepare = native.slice(native.indexOf('        "prepare" => {'), native.indexOf('        "publish" => {'));
+  assert.match(prepare, /check_server_publication\(home, &prepared\)\?;[\s\S]*"canPublish":true/);
+  const serverCheck = native.slice(native.indexOf('fn check_server_publication('), native.indexOf('pub fn execute('));
+  assert.match(serverCheck, /"\/api\/v1\/works\/preflight"/);
+  assert.match(serverCheck, /result\["id"\] != prepared.entry.id/);
+  assert.match(serverCheck, /result\["contentHash"\] != prepared.hash/);
+  assert.doesNotMatch(serverCheck, /Ok\(false\)/);
+  assert.match(native,/collect\(&canonical, &canonical, [^\n]*FileUse::Publish, &mut files, &mut expanded\)\?/);
+  assert.match(native,/sensitive_json\(&value\)/);
+  assert.match(native,/text\.is_ok_and\(sensitive_text\)/);
   assert.match(publish,/let prepared = prepare\(home,/);
   assert.match(publish,/input\.expected_content_hash\.as_deref\(\) != Some\(prepared\.hash\.as_str\(\)\)/);
-  assert.match(publish,/covers\.is_empty\(\)[\s\S]*covers\.len\(\) > 3/);
+  assert.match(publish,/covers\.len\(\) > 2/);
   assert.match(publish,/if sensitive_json\(&metadata\)/);
   assert.match(publish,/result\["contentHash"\] != prepared\.hash/);
   assert.doesNotMatch(publish,/rights_confirmed|privacy_confirmed|LICENSE\.txt|"(?:rightsConfirmed|privacyConfirmed)":true/);
@@ -88,22 +93,24 @@ test('publication starts with the component cover and preserves the package-chec
   const community=source('CommunityCenter.jsx');
   const start=community.indexOf('  const currentPackage =');
   const end=community.indexOf('  useExitProtection(',start);
-  const select=new Function('prepared','path','selectedCovers','checking','prepareError','readingCovers',
+  const select=new Function('prepared','sourceKey','selected','selectedCovers','checking','prepareError','readingCovers',
     community.slice(start,end)+'return {covers,publishBlocker};');
   const path='/fixture/component';
   const cover='data:image/png;base64,Y292ZXI=';
-  const prepared={path,canPublish:true,coverDataUrl:cover};
-  const defaults=select(prepared,path,null,false,'',false);
+  const prepared={sourceKey:path,canPublish:true,coverDataUrl:cover};
+  const check=(value,key,extra,checking=false,error='',reading=false)=>
+    select(value,key,Boolean(key),extra,checking,error,reading);
+  const defaults=check(prepared,path,null);
   assert.deepEqual(defaults,{covers:[cover],publishBlocker:''});
-  assert.deepEqual(select(prepared,path,['other'],false,'',false).covers,['other']);
-  assert.ok(select({...prepared,coverDataUrl:null},path,null,false,'',false).publishBlocker);
-  assert.ok(select(prepared,'/new-component',null,false,'',false).publishBlocker);
-  assert.equal(select(null,path,['other'],false,'组件校验失败',false).publishBlocker,'组件校验失败');
-  assert.ok(select(prepared,path,null,false,'',true).publishBlocker);
+  assert.deepEqual(check(prepared,path,['other']).covers,[cover,'other']);
+  assert.equal(check({...prepared,coverDataUrl:null},path,null).publishBlocker,'');
+  assert.ok(check(prepared,'/new-component',null).publishBlocker);
+  assert.equal(check(null,path,['other'],false,'社区拒绝此包').publishBlocker,'社区拒绝此包');
+  assert.ok(check(prepared,path,null,false,'',true).publishBlocker);
   const submission=publicationHarness();
-  submission.env.covers.splice(0,1,...defaults.covers);
+  submission.env.selectedCovers.push('data:image/png;base64,b3RoZXI=');
   await submission.submit();
-  assert.deepEqual(submission.calls[0].input.covers,['Y292ZXI=']);
+  assert.deepEqual(submission.calls[0].input.covers,['b3RoZXI=']);
 });
 test('background refresh retains same-identity data but never reuses a different query result',()=>{
   const community=source('CommunityCenter.jsx');

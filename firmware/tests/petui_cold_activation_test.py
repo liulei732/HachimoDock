@@ -48,6 +48,7 @@ static uintptr_t task=1;
 static uint64_t queued_token;
 static int hook;
 static bool boot;
+#define hardware_leave_locked() assert(critical) /* retire under the publication lock */
 #define miniapp_runtime_lock() do{assert(held&&!critical);critical=true;}while(0)
 #define miniapp_runtime_unlock() do{assert(critical);critical=false;}while(0)
 #define ESP_LOGW(...) ((void)0)

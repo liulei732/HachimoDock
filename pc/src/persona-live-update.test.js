@@ -44,7 +44,7 @@ test("the voice modal loads and saves a shared volume and factory persona reset 
   assert.match(runtime, /BASE64.encode\(&pcm\)/);
   const synthesis = runtime.slice(runtime.indexOf("async fn speak_one_logged"), runtime.indexOf("async fn wait_playback"));
   assert.doesNotMatch(synthesis, /scale_pcm16/);
-  assert.match(synthesis, /PlayerCmd::Pcm\(pcm.to_vec\(\)\)/);
+  assert.match(synthesis, /sender\.pcm\(epoch, &bytes\)\.await/);
 });
 
 test("device context updates only the edited appearance and its immediate button target", () => {

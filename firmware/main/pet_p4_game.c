@@ -728,6 +728,28 @@ static bool blocks_can_place(
   return true;
 }
 
+static bool blocks_rotate(pet_p4_game_engine_t *game) {
+  uint8_t rotation = (uint8_t)((game->block_rotation + 1U) % 4U);
+  int x = game->block_x;
+  if (!blocks_can_place(game, game->block_piece, rotation, x, game->block_y)) {
+    // Only correct horizontal overhang at the wall. A pile or floor is solid.
+    int left = 3, right = 0;
+    for (int py = 0; py < 4; ++py) {
+      for (int px = 0; px < 4; ++px) {
+        if (!block_mask_cell(game->block_piece, rotation, px, py)) continue;
+        if (px < left) left = px;
+        if (px > right) right = px;
+      }
+    }
+    x = bounded_clamp(x, -left, game->width - 1 - right);
+    if (x == game->block_x ||
+        !blocks_can_place(game, game->block_piece, rotation, x, game->block_y)) return false;
+  }
+  game->block_x = (int8_t)x;
+  game->block_rotation = rotation;
+  return true;
+}
+
 static void game_refresh_frame(pet_p4_game_engine_t *game) {
   pet_p4_game_frame_t *frame;
   if (!game) return;
@@ -796,7 +818,7 @@ static void game_refresh_frame(pet_p4_game_engine_t *game) {
         }
       }
     }
-    int bird_y = game->flappy_y_q8 >> 8;
+    int bird_y = bounded_clamp(game->flappy_y_q8 >> 8, 0, game->height - 1);
     int bird_index = game_cell_index(game, FLAPPY_BIRD_X, bird_y);
     int wing_index = game_cell_index(game, FLAPPY_BIRD_X - 1, bird_y);
     if (wing_index >= 0) frame->cells[wing_index] = 4;
@@ -923,16 +945,22 @@ static bool snake_contains(
 static void snake_place_food(pet_p4_game_engine_t *game) {
   uint16_t capacity = (uint16_t) game->width * game->height;
   uint16_t start = (uint16_t) (game_random(game) % capacity);
+  uint8_t occupied[(SNAKE_WIDTH * SNAKE_HEIGHT + 7) / 8] = {0};
+  for (uint16_t i = 0; i < game->snake_length; ++i) {
+    unsigned cell = game->snake_y[i] * game->width + game->snake_x[i];
+    occupied[cell / 8] |= (uint8_t)(1U << (cell % 8));
+  }
   for (uint16_t offset = 0; offset < capacity; offset += 1) {
     uint16_t index = (uint16_t) ((start + offset) % capacity);
     uint8_t x = (uint8_t) (index % game->width);
     uint8_t y = (uint8_t) (index / game->width);
-    if (!snake_contains(game, x, y, game->snake_length)) {
+    if (!(occupied[index / 8] & (1U << (index % 8)))) {
       game->food_x = x;
       game->food_y = y;
       return;
     }
   }
+  game->food_x = UINT8_MAX;  // A full board has no remaining food to render.
   game->running = false;
   game->game_over = true;
 }
@@ -1049,11 +1077,6 @@ static bool flappy_step(pet_p4_game_engine_t *game) {
     game->flappy_scroll_phase = 0;
     for (size_t pipe = 0; pipe < 2; pipe += 1) {
       game->flappy_pipe_x[pipe] -= 1;
-      if (!game->flappy_pipe_scored[pipe]
-          && game->flappy_pipe_x[pipe] + FLAPPY_PIPE_WIDTH <= FLAPPY_BIRD_X) {
-        game->flappy_pipe_scored[pipe] = true;
-        game->score += 1;
-      }
       if (game->flappy_pipe_x[pipe] + FLAPPY_PIPE_WIDTH < 0) {
         size_t other = pipe == 0 ? 1 : 0;
         flappy_place_pipe(
@@ -1068,6 +1091,14 @@ static bool flappy_step(pet_p4_game_engine_t *game) {
   if (flappy_collides(game)) {
     game->running = false;
     game->game_over = true;
+  } else if (game->flappy_scroll_phase == 0) {
+    for (size_t pipe = 0; pipe < 2; ++pipe) {
+      if (!game->flappy_pipe_scored[pipe]
+          && game->flappy_pipe_x[pipe] + FLAPPY_PIPE_WIDTH <= FLAPPY_BIRD_X) {
+        game->flappy_pipe_scored[pipe] = true;
+        game->score += 1;
+      }
+    }
   }
   return true;
 }
@@ -1491,12 +1522,7 @@ bool pet_p4_game_command(
       game->block_x += 1;
       changed = true;
     } else if (command == PET_P4_GAME_COMMAND_ROTATE) {
-      uint8_t next_rotation = (uint8_t) ((game->block_rotation + 1U) % 4U);
-      if (blocks_can_place(game, game->block_piece, next_rotation,
-                           game->block_x, game->block_y)) {
-        game->block_rotation = next_rotation;
-        changed = true;
-      }
+      changed = blocks_rotate(game);
     } else if(command==PET_P4_GAME_COMMAND_SOFT_DROP) {
       if(blocks_can_place(game,game->block_piece,game->block_rotation,game->block_x,game->block_y+1)){
         game->block_y++;game->score++;changed=true;

@@ -133,12 +133,18 @@ static void runtime_tests(esp_codec_dev_handle_t dev,const char *scenario){
   assert(reads+writes==untouched);
   p=wire("{\"topic\":\"audio/volume\",\"payload\":{\"operation\":\"set\",\"volume\":35.0,\"requestId\":\"set-35\",\"expectedBoardDeviceId\":\"board-1\"}}",true);
   assert(cJSON_GetObjectItemCaseSensitive(p,"volume")->valueint==35 && cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(p,"persisted")));cJSON_Delete(p);
+  int durable_volume,pending_volume; bool failed_save;
+  untouched=reads+writes+nvs_reads+nvs_writes;
+  pet_audio_volume_storage_state(&durable_volume,&pending_volume,&failed_save);
+  assert(pending_volume==35 && !failed_save && untouched==reads+writes+nvs_reads+nvs_writes);
   int saved=nvs_writes;pet_audio_volume_idle_commit(999,true,idle);assert(nvs_writes==saved);
   audio_idle=false;pet_audio_volume_idle_commit(1000,true,idle);audio_idle=true;assert(nvs_writes==saved);
   pet_resource_realtime_t rt={0};assert(pet_resources_realtime_begin(&broker,&rt)==PET_RESOURCE_OK);
   pet_audio_volume_idle_commit(1000,true,idle);assert(nvs_writes==saved);pet_resources_realtime_finish(&broker,rt);
   pet_audio_volume_idle_commit(1000,true,idle);assert(nvs_writes==saved+1 && stored_value==35);no_resources();
   assert(pet_audio_volume_get(&s)==0 && s.persisted && !s.save_pending);
+  pet_audio_volume_storage_state(&durable_volume,&pending_volume,&failed_save);
+  assert(durable_volume==35 && pending_volume==-1 && !failed_save);
   int same_writes=writes;assert(pet_audio_volume_set(35,1050,&s)==0 && writes==same_writes && !s.save_pending);
   assert(pet_audio_volume_set(0,1100,&s)==0 && s.volume==0 && (regs[0x31]&0x60)==0x60);
   assert(pet_audio_volume_set(1,1200,&s)==0 && !(regs[0x31]&0x60));
@@ -173,6 +179,8 @@ static void runtime_tests(esp_codec_dev_handle_t dev,const char *scenario){
   nvs_fail_commit=ESP_FAIL;
   pet_audio_volume_idle_commit(22000,true,idle);assert(pet_audio_volume_pending());no_resources();
   assert(pet_audio_volume_get(&s)==0 && !s.persisted && s.save_error);
+  pet_audio_volume_storage_state(&durable_volume,&pending_volume,&failed_save);
+  assert(durable_volume==-1 && pending_volume==70 && failed_save);
   saved=nvs_writes;nvs_fail_commit=0;
   pet_audio_volume_idle_commit(51999,true,idle);assert(nvs_writes==saved);
   pet_audio_volume_idle_commit(52000,true,idle);assert(nvs_writes==saved+1);no_resources();

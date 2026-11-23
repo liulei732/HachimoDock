@@ -67,3 +67,30 @@ test('a pending read retry is retired on reconnect, and a busy set is never repe
   assert.equal(await c.apply(80),false);
   assert.deepEqual(calls.map(args=>args.volume),[undefined,undefined,80]);
 });
+
+test('hidden settings defer USB reads and retire a hidden retry without interrupting a write', async () => {
+  const pause = deferred(), waiting = deferred(), write = deferred(), calls = [];
+  const controller = createDeviceVolumeController({
+    async invoke(_, args) {
+      calls.push(args);
+      if (calls.length === 1) throw Error('device transfer busy; volume not submitted');
+      return args.volume === undefined ? reply(45) : write.promise;
+    },
+    wait() { waiting.resolve(); return pause.promise; },
+  });
+  await controller.setTarget(target, false);
+  assert.equal(calls.length, 0);
+  const first = controller.setTarget(target, true);
+  await waiting.promise;
+  await controller.setTarget(target, false);
+  pause.resolve();
+  assert.equal(await first, false);
+  assert.equal(calls.length, 1);
+  await controller.setTarget(target, true);
+  const setting = controller.apply(25);
+  await controller.setTarget(target, false);
+  write.resolve(reply(25));
+  assert.equal(await setting, true);
+  assert.equal(controller.getSnapshot().value, 25);
+  assert.equal(calls.length, 3);
+});

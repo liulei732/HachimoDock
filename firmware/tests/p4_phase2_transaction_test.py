@@ -50,7 +50,7 @@ def begin_binary(tmp_path_factory,request):
 #ifndef PET_P4_CAPABILITY_EXT
 #define PET_P4_CAPABILITY_EXT EXT_VALUE
 #endif
-static struct {bool active,repair_resources,preserve_unchanged;char transfer_id[64],widget_id[48],widget_json[200];unsigned char sprites[128];}g_staging;
+static struct {bool active,repair_resources,preserve_unchanged,thumb_only;char transfer_id[64],widget_id[48],widget_json[200];unsigned char sprites[128];}g_staging;
 static unsigned g_image_used,g_image_next;static char g_image_id[32];
 static bool g_lan_bundle_owned;
 static void reap_lan_bundle(void) {}
@@ -81,20 +81,21 @@ int main(int argc,char **argv){
  if(mode==8)busy=true;
  if(mode==9)json="{\"transferId\":\"new\",\"widgetId\":\"music-player\"}";
  if(mode==10)g_catalog_recovery_blocked=true;
+ if(mode==11)json="{\"transferId\":\"new\",\"widgetId\":\"book\",\"thumbOnly\":true,\"preserveUnchanged\":true}";
  cJSON *p=cJSON_Parse(json);assert(p);
  bool ok=pet_p4_miniapp_install_begin(p,error,sizeof(error));
- if(mode){assert(!ok&&error[0]);assert(!memcmp(old,&g_staging,sizeof(old)));
+ if(mode!=0&&mode!=11){assert(!ok&&error[0]);assert(!memcmp(old,&g_staging,sizeof(old)));
   assert(!memcmp(media,old_media,sizeof(media))&&media_resets==0);
   assert(g_image_used==91&&g_image_next==3&&!strcmp(g_image_id,"accepted-image"));
   cJSON *old_request=cJSON_Parse("{\"transferId\":\"accepted\"}");assert(transfer_matches(old_request));cJSON_Delete(old_request);
  }else{assert(ok&&g_staging.active&&!strcmp(g_staging.transfer_id,"new")&&!strcmp(g_staging.widget_id,"book"));
   assert(!g_staging.widget_json[0]&&g_image_used==0&&g_image_next==0&&!g_image_id[0]);
-  assert(g_staging.preserve_unchanged&&media_resets==PET_P4_CAPABILITY_EXT);}
+  assert(g_staging.thumb_only==(mode==11)&&g_staging.preserve_unchanged&&media_resets==PET_P4_CAPABILITY_EXT);}
  cJSON_Delete(p);return 0;
 }
 """
     return compile_c(tmp_path_factory.mktemp('begin'),fixture,'begin')
-@pytest.mark.parametrize('case',range(11))
+@pytest.mark.parametrize('case',range(12))
 def test_real_begin_reject_preserves_accepted_staging(begin_binary,case):execute(begin_binary,case)
 @pytest.fixture(scope='module')
 def close_binary(tmp_path_factory):

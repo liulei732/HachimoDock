@@ -4,6 +4,10 @@ HachimiDock firmware uses glyph data rendered from Xiaomi MiSans Medium:
 - 16 px, 1 bpp font data in pet_p4_font_cn.c;
 - 32 px, 2 bpp font data, 199 glyphs, in pet_p4_font_cn_32.c.
 
+The optional bubble32-v1.fpk device resource contains 6,988 MiSans Medium
+glyphs rasterized at 32 px with 2-bit grayscale coverage. The bubble renderer
+also uses this face for 24 px body text with area downsampling.
+
 MiSans is provided by Xiaomi Inc. under the MiSans Font Intellectual Property
 License Agreement. Its license is separate from HachimiDock's own license.
 The existing MiSans attribution in THIRD_PARTY_NOTICES.md applies to this

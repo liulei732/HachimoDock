@@ -60,8 +60,11 @@ def test_async_hello_retains_full_payload_identity_readiness_and_existing_tasks(
     assert 'state->' not in builder and '"boardDeviceId", board_id ? board_id : "p4-unknown"' in builder
     assert 'state ? state->board_device_id : NULL' in wrapper
     assert 'send_topic_payload(send_line, ctx, "hello", payload)' in builder
-    for field in ('"audioAec"','"audioVad"','"audioFullDuplex"','"widgetVariableOwners"'):
+    for field in ('"audioAec"','"audioVad"','"audioFullDuplex"'):
         assert field in builder
+    assert 'pet_p4_add_component_capabilities(capabilities)' in builder
+    capabilities = function(source, 'pet_p4_add_component_capabilities')
+    assert '"widgetVariableOwners",PET_VARIABLE_OWNERS_ENGINE' in capabilities
     main=(ROOT/'main/pet_p4_main.c').read_text()
     worker=function(main,'protocol_worker_task');run=function(main,'run_unsolicited_hello');enqueue=function(main,'enqueue_unsolicited_hello')
     assert worker.index('if(request.unsolicited_hello)')<worker.index('protocol_debug_source_bounded(request.line)')

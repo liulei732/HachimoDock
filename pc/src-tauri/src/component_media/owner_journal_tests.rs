@@ -265,15 +265,31 @@ fn real_adapter_replacement_readers_observe_whole_old_or_new_json() {
         session: "one".into(),
     };
     journal.write(&[pending]).unwrap();
+    #[cfg(not(windows))]
     let old_handle = fs::File::open(&path).unwrap();
+    #[cfg(windows)]
+    let old_handle = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+        fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&path).unwrap()
+    };
     let stopped = owner::Record {
         scope: first_scope(),
         unresolved: false,
         owner: String::new(),
         session: String::new(),
     };
-    journal.write(&[stopped.clone()]).unwrap();
+    #[cfg(not(windows))]
+    journal.write(std::slice::from_ref(&stopped)).unwrap();
+    #[cfg(windows)]
+    {
+        // A reader denying delete sharing prevents replacement on Windows.
+        assert!(journal.write(std::slice::from_ref(&stopped)).is_err());
+        assert_eq!(read_json(&path)["records"][0]["unresolved"], true);
+    }
     let old: Value = serde_json::from_reader(old_handle).unwrap();
+    #[cfg(windows)]
+    journal.write(std::slice::from_ref(&stopped)).unwrap();
     assert_eq!(old["records"][0]["unresolved"], true);
     assert_eq!(read_json(&path)["records"][0]["unresolved"], false);
     assert_eq!(journal.read().unwrap(), vec![stopped]);

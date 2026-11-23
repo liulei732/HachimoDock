@@ -4,13 +4,14 @@
 #define PET_P4_MEDIA_QUEUE_MAX 128
 #define PET_P4_MEDIA_LYRIC_MAX 256
 #define PET_P4_MEDIA_LYRIC_BYTES 181
+#define PET_P4_MEDIA_SOURCE_MAX 52
 typedef struct {
   char title[121], artist[91], status[20], message[100];
   uint32_t position_ms, duration_ms;
   uint32_t queue_revision;
   uint8_t volume, page, selected, count;
   bool seeking, cover_ready;
-  char source[48];
+  char source[PET_P4_MEDIA_SOURCE_MAX];
   uint8_t level;
   char queue[PET_P4_MEDIA_QUEUE_MAX][91];
   bool lyrics_ready;

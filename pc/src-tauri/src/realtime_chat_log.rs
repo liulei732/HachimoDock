@@ -1,8 +1,16 @@
 //! Bounded, metadata-only realtime diagnostics. Never persist keys, prompts, transcripts or PCM.
 use serde_json::{json, Value};
-use std::{fs::{self, OpenOptions}, io::Write, path::{Path, PathBuf}, sync::{Mutex, OnceLock}, time::{SystemTime, UNIX_EPOCH}};
+use std::{fs::{self, File, OpenOptions}, io::Write, path::{Path, PathBuf}, sync::{atomic::{AtomicU64, Ordering}, mpsc, OnceLock}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
-static LOG: OnceLock<Mutex<PathBuf>> = OnceLock::new();
+enum Message {
+    Entry(Value),
+    Flush(mpsc::Sender<bool>),
+}
+
+static LOG: OnceLock<mpsc::SyncSender<Message>> = OnceLock::new();
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+const BATCH: usize = 32;
+const FLUSH_INTERVAL: Duration = Duration::from_millis(40);
 const MAX_BYTES: u64 = 1024 * 1024;
 
 #[path = "realtime_aec_diagnostics.rs"]
@@ -19,7 +27,14 @@ pub fn termination_error_kind(reason: &str, error: &str) -> &'static str {
 pub fn configure(dir: &Path) -> Result<(), String> {
     let dir = dir.join("logs");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let _ = LOG.set(Mutex::new(dir.join("realtime-chat.jsonl")));
+    if LOG.get().is_none() {
+        let path = dir.join("realtime-chat.jsonl");
+        let (tx, rx) = mpsc::sync_channel(256);
+        std::thread::Builder::new().name("realtime-diagnostics".into()).spawn(move || {
+            writer_loop(path, rx, &DROPPED);
+        }).map_err(|e| e.to_string())?;
+        let _ = LOG.set(tx);
+    }
     #[cfg(target_os = "macos")]
     let ax_granted = crate::codex_composer::CodexComposerBridge::accessibility_permission_granted();
     #[cfg(not(target_os = "macos"))]
@@ -38,7 +53,7 @@ pub fn error_kind(error: &str) -> &'static str {
         }
         return "io_error";
     }
-    if text.contains("mismatch") || text.contains("55000000") { "tts_resource_mismatch" }
+    if text.contains("mismatch") || text.contains("音色与资源不匹配") { "tts_resource_mismatch" }
     else if text.contains("certificate") || text.contains("证书") { "tls_certificate" }
     else if text.contains("401") || text.contains("鉴权") { "authentication" }
     else if text.contains("403") || text.contains("授权") { "resource_permission" }
@@ -132,30 +147,163 @@ fn metadata(details: Value) -> Value {
 }
 
 pub fn record(session: &str, event: &str, details: Value) {
-    let Some(lock) = LOG.get() else { return };
-    let Ok(path) = lock.lock() else { return };
-    let _ = append(&path, session, event, details);
+    if let Some(tx) = LOG.get() {
+        // Diagnostic overload must never stall capture, playback or cancellation.
+        enqueue(tx, log_entry(session, event, details), &DROPPED);
+    }
 }
 
-fn append(path: &Path, session: &str, event: &str, details: Value) -> std::io::Result<()> {
-    if fs::metadata(path).map(|m| m.len() >= MAX_BYTES).unwrap_or(false) {
-        let previous = path.with_file_name("realtime-chat.previous.jsonl");
-        if previous.exists() { fs::remove_file(&previous)?; }
-        fs::rename(path, previous)?;
-    }
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
-    let mut file = options.open(path)?;
+fn log_entry(session: &str, event: &str, details: Value) -> Value {
     let safe_session: String = session.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(80).collect();
-    let entry = json!({"timestampMs": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
-        "sessionId": safe_session, "event": event, "details": metadata(details)});
-    writeln!(file, "{entry}")
+    json!({"timestampMs": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
+        "sessionId": safe_session, "event": event, "details": metadata(details)})
+}
+
+fn enqueue(tx: &mpsc::SyncSender<Message>, entry: Value, dropped: &AtomicU64) {
+    if tx.try_send(Message::Entry(entry)).is_err() {
+        dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// Only the application exit path waits. All realtime producers use try_send.
+pub fn flush() {
+    if let Some(tx) = LOG.get() {
+        let (done, wait) = mpsc::channel();
+        if tx.send(Message::Flush(done)).is_err() || wait.recv() != Ok(true) {
+            eprintln!("[realtime-chat] diagnostic flush failed, dropped={}", DROPPED.load(Ordering::Relaxed));
+        }
+    }
+}
+
+struct LogFile {
+    path: PathBuf,
+    file: Option<File>,
+    size: u64,
+}
+
+impl LogFile {
+    fn new(path: PathBuf) -> Self { Self { path, file: None, size: 0 } }
+
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if self.file.is_none() {
+            self.size = match fs::metadata(&self.path) {
+                Ok(meta) => meta.len(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(e) => return Err(e),
+            };
+        }
+        // Rotate complete batches. The current name and its predecessor hold intact lines.
+        if self.size > 0 && self.size.saturating_add(bytes.len() as u64) > MAX_BYTES {
+            self.file.take(); // Windows requires the handle closed before rename.
+            let previous = self.path.with_file_name("realtime-chat.previous.jsonl");
+            if previous.exists() { fs::remove_file(&previous)?; }
+            fs::rename(&self.path, previous)?;
+            self.size = 0;
+        }
+        if self.file.is_none() {
+            let mut options = OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+            self.file = Some(options.open(&self.path)?);
+        }
+        let file = self.file.as_mut().unwrap();
+        file.write_all(bytes)?;
+        file.flush()?;
+        self.size += bytes.len() as u64;
+        Ok(())
+    }
+}
+
+fn writer_loop(path: PathBuf, rx: mpsc::Receiver<Message>, dropped: &AtomicU64) {
+    let mut log = LogFile::new(path);
+    let mut buffer = Vec::new();
+    while let Ok(first) = rx.recv() {
+        buffer.clear();
+        let deadline = Instant::now() + FLUSH_INTERVAL;
+        let mut count = 0;
+        let mut barrier = None;
+        let following = std::iter::from_fn(|| rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok());
+        for message in std::iter::once(first).chain(following).take(BATCH) {
+            match message {
+                Message::Entry(entry) => {
+                    writeln!(buffer, "{entry}").unwrap();
+                    count += 1;
+                }
+                Message::Flush(done) => { barrier = Some(done); break; }
+            }
+        }
+        let lost = dropped.swap(0, Ordering::Relaxed);
+        if lost != 0 {
+            writeln!(buffer, "{}", log_entry("", "diagnostic_dropped", json!({"count":lost}))).unwrap();
+        }
+        let written = buffer.is_empty() || log.write(&buffer).is_ok();
+        if !written {
+            log.file.take();
+            dropped.fetch_add(lost + count, Ordering::Relaxed);
+        }
+        if let Some(done) = barrier { let _ = done.send(written); }
+    }
+}
+
+#[cfg(test)]
+fn append(path: &Path, session: &str, event: &str, details: Value) -> std::io::Result<()> {
+    let line = format!("{}\n", log_entry(session, event, details));
+    LogFile::new(path.into()).write(line.as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_channel_counts_drops_and_exit_barrier_flushes_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("realtime-chat.jsonl");
+        let (tx, rx) = mpsc::sync_channel(3);
+        let dropped = std::sync::Arc::new(AtomicU64::new(0));
+        for index in 0..8 {
+            enqueue(&tx, log_entry("rtc", "frame", json!({"seq":index,"text":"SECRET"})), &dropped);
+        }
+        assert_eq!(dropped.load(Ordering::Relaxed), 5);
+        let worker_path = path.clone();
+        let counters = dropped.clone();
+        let worker = std::thread::spawn(move || writer_loop(worker_path, rx, &counters));
+        let (done, wait) = mpsc::channel();
+        tx.send(Message::Flush(done)).unwrap();
+        assert!(wait.recv().unwrap());
+        let raw = fs::read_to_string(path).unwrap();
+        let rows: Vec<Value> = raw.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[3]["event"], "diagnostic_dropped");
+        assert_eq!(rows[3]["details"], json!({"count":5}));
+        assert_eq!(rows[2]["details"], json!({"seq":2}));
+        assert!(!raw.contains("SECRET"));
+        drop(tx);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn failed_batch_is_accounted_after_writer_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("logs");
+        let path = parent.join("realtime-chat.jsonl");
+        let worker_path = path.clone();
+        let (tx, rx) = mpsc::sync_channel(4);
+        let worker = std::thread::spawn(move || writer_loop(worker_path, rx, &AtomicU64::new(0)));
+        let barrier = || {
+            let (done, wait) = mpsc::channel();
+            tx.send(Message::Flush(done)).unwrap();
+            wait.recv().unwrap()
+        };
+        tx.send(Message::Entry(json!({"seq":1}))).unwrap();
+        assert!(!barrier());
+        fs::create_dir(parent).unwrap();
+        assert!(barrier());
+        let row: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(row["details"], json!({"count":1}));
+        drop(tx);
+        worker.join().unwrap();
+    }
 
     #[test]
     fn audio_length_diagnostic_keeps_only_closed_types_and_counts() {

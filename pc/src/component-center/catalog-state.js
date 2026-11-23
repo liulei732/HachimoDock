@@ -1,8 +1,4 @@
 // Shared PC catalog semantics. Unknown versions must never mean “up to date”.
-export function componentRequiresPc(component) {
-  // Legacy Token telemetry is host-fed without a data.source declaration.
-  return Boolean(component?.id === "token-usage" || component?.pcApplication || component?.pcExtension || component?.dataSource || component?.mediaSource || component?.appRuntime?.host);
-}
 export function compareVersions(a, b) {
   const parse = value => {
     const m = String(value || '').trim().match(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([\da-zA-Z-]+(?:\.[\da-zA-Z-]+)*))?(?:\+[\da-zA-Z-]+(?:\.[\da-zA-Z-]+)*)?$/);
@@ -38,7 +34,7 @@ export function readCenterPreference(key, fallback) {
   try{
     const value=JSON.parse(localStorage.getItem(`pet-manager:center:${key}`));
     if(value===null||typeof value!==typeof fallback)return fallback;
-    const choices={kind:['all','game','tool'],status:['all','installed','update','pc','offline'],tab:['discover','local','favorites','created']};
+    const choices={kind:['all','game','tool'],status:['all','installed','update','pc','offline','network','mixed'],tab:['discover','local','favorites','created']};
     return choices[key]&&!choices[key].includes(value)?fallback:value;
   }catch{return fallback;}
 }

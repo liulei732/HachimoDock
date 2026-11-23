@@ -8,6 +8,7 @@
  * [Sync] If this file changes, update this header and `pc/src/.folder.md`.
  */
 
+import { formatModelIssue } from "./lib/model-issue.js";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, ImageUp, AlertCircle, CheckCircle2, KeyRound } from "lucide-react";
 import {
@@ -109,7 +110,7 @@ export default function CustomAvatarWizard({ onExit, onOpenApiSettings }) {
         setModelDiscovery({ loading: false, error: "" });
       })
       .catch(error => {
-        if (!controller.signal.aborted) setModelDiscovery({ loading: false, error: error.message || "视频模型加载失败，请重试。" });
+        if (!controller.signal.aborted) setModelDiscovery({ loading: false, error: formatModelIssue("catalog", "火山方舟", error) });
       });
     return () => controller.abort();
   }, [step, isVolcengine, apiKey, baseUrl, model, modelRetry]);
@@ -205,18 +206,18 @@ export default function CustomAvatarWizard({ onExit, onOpenApiSettings }) {
     if (!manualReview && providerId === "custom") return "此服务暂不支持自动视觉检查，请在高级设置开启逐步确认模式。";
     if (providerId === "kling") {
       if (!apiKey.trim()) {
-        return "请先在 API 配置中保存可灵 AI 的 API Key。";
+        return "请先在模型配置中保存可灵 AI 的 API Key。";
       }
       if (!model.trim()) return "请先选择可灵视频生成模型。";
       return "";
     }
 
     if (isVolcengine) {
-      if (!apiKey.trim()) return "请先在 API 配置中保存火山引擎 API Key。";
+      if (!apiKey.trim()) return "请先在模型配置中保存火山引擎 API Key。";
       if (!model.trim()) return modelDiscovery.loading || !modelDiscovery.error
         ? "正在自动选择视频模型，请稍候…" : modelDiscovery.error;
     }
-    if (!apiKey.trim()) return "请先在 API 配置中保存当前服务的 API Key。";
+    if (!apiKey.trim()) return "请先在模型配置中保存当前服务的 API Key。";
     if (!baseUrl.trim() || !model.trim()) return "请先填写接口地址和视频生成模型。";
     return "";
   }, [providerId, apiKey, baseUrl, model, isVolcengine, manualReview, modelDiscovery]);
@@ -248,7 +249,7 @@ export default function CustomAvatarWizard({ onExit, onOpenApiSettings }) {
     try { await persistConfig(); } catch (error) {
       startingRef.current = false;
       setStarting(false);
-      setSubmitError(error.message || "配置未保存，请重试。");
+      setSubmitError(formatModelIssue("storage", "本机生成配置", error));
       return;
     }
     // Leaving the wizard while the vault is opening must not start a paid task later.
@@ -326,7 +327,7 @@ export default function CustomAvatarWizard({ onExit, onOpenApiSettings }) {
       <div className="page-toolbar" style={{ marginBottom: 4 }}>
         <button className="btn-ghost" onClick={onExit}>
           <ArrowLeft size={16} />
-          返回宠物图册
+          返回形象画廊
         </button>
       </div>
 
@@ -335,9 +336,10 @@ export default function CustomAvatarWizard({ onExit, onOpenApiSettings }) {
           {["选图并生成", "高级设置（可选）"].map((label, index) => (
             <div
               key={label}
+              aria-current={step === index ? "step" : undefined}
               className={`ca-tab ${step === index ? "active" : step > index ? "done" : ""}`}
             >
-              {step > index ? "OK" : index + 1} · {label}
+              {step > index ? "✓" : index + 1} · {label}
             </div>
           ))}
         </div>
@@ -345,7 +347,7 @@ export default function CustomAvatarWizard({ onExit, onOpenApiSettings }) {
         {taskRunning && (
           <div className="message-banner" style={{ marginBottom: 12, background: "var(--surface-muted)" }}>
             <AlertCircle size={14} />
-            已有一个形象正在后台生成，完成后会在宠物图册里收到通知。
+            已有一个形象正在后台生成，完成后会在形象画廊里收到通知。
           </div>
         )}
 
@@ -372,7 +374,7 @@ export default function CustomAvatarWizard({ onExit, onOpenApiSettings }) {
               onCancel={()=>previewController.current.invalidate()}
               disabled={!file || !processBackground || taskRunning || starting}
               processingEnabled={processBackground}/>
-            {isVolcengine && <p className="muted small">默认自动清理主体并检查参考图，再为 11 个动作分别生成不同的起始姿势图片，检查后生成对应动画，不需要中途确认。会产生参考图、每个动作起始图、检查和视频费用；已有结果自动复用。请保持客户端运行，完成后可一键应用到设备。</p>}
+            {isVolcengine && <p className="muted small">默认自动清理主体并检查参考图，再为 11 个动作分别生成不同的起始姿势图片，检查后生成对应动画，不需要中途确认。首帧重复或未通过检查时，每个动作最多自动重画一次，再次失败会保留结果供你处理。图片、重画、检查和视频按服务商计费，已完成的视频会复用。请保持客户端运行，完成后可一键应用到设备。</p>}
             <p className="muted small">支持人物、动物、玩偶和机器人。留空使用默认风格；开启主体清理后可预览，生成时会复用预览结果。</p>
             <p className="muted small">{manualReview || providerId === "kling" ? "当前：逐步确认模式" : "当前：全自动模式"} · {processBackground ? "完整主体清理已开启" : "使用原图，未清理背景"}</p>
             {generationReadyIssue && <p role="alert">{generationReadyIssue}</p>}
@@ -381,7 +383,7 @@ export default function CustomAvatarWizard({ onExit, onOpenApiSettings }) {
             <p className="muted small">视频生成服务：{provider.label}{model.trim() ? ` · ${model}` : ""}</p>
             {submitError && <p role="alert">{submitError}</p>}
             <button type="button" className="btn-secondary" onClick={()=>setStep(1)}>高级设置 / 模型与逐步确认</button>
-            {generationReadyIssue && <button type="button" className="btn-ghost" onClick={onOpenApiSettings}>前往 API 配置</button>}
+            {generationReadyIssue && <button type="button" className="btn-ghost" onClick={onOpenApiSettings}>前往模型配置</button>}
           </AvatarWizardStep1>
         )}
 
@@ -623,11 +625,11 @@ export function AvatarWizardStep2({
           <small>
             {credentialConfigured
               ? `${provider.label} 凭据已从统一配置读取`
-              : `请先在 API 配置中补充 API Key`}
+              : `请先在模型配置中补充 API Key`}
           </small>
         </span>
         <button type="button" className="btn-secondary btn-sm" onClick={onOpenApiSettings}>
-          打开 API 配置
+          打开模型配置
         </button>
       </div>
 
@@ -672,7 +674,7 @@ export function AvatarWizardStep2({
       {isVolcengine && <FieldWithHelp label="图片处理模型" help="用于图片预览生成、背景处理和独立动作首帧，需支持图片编辑。">
         <ImageModelSelect value={imageModel || ""} onChange={onImageModel}
           apiKey={apiKey} baseUrl={baseUrl} disabled={!removeBg}
-          saveHint="开始生成时保存并同步到 API 配置。" />
+          saveHint="开始生成时保存并同步到模型配置。" />
         {!removeBg && <p className="muted small">当前使用原图，不调用图片处理模型。</p>}
       </FieldWithHelp>}
 

@@ -11,6 +11,7 @@
 #include "pet_p4_task_policy.h"
 #include "pet_p4_resources.h"
 #include <assert.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,11 +26,15 @@
 #define PET_P4_UI_WIDTH 640
 #define PET_P4_UI_HEIGHT 480
 #define ESP_TASK_MAIN_PRIO 1U
+#define PET_P4_H264_PACK_TASK_PRIORITY 8U
+#define pdMS_TO_TICKS(ms) (ms)
 #define ESP_H264_RAW_FMT_I420 0
 #define ESP_H264_ERR_OK 0
 #define MALLOC_CAP_SPIRAM 1
 #define MALLOC_CAP_8BIT 2
 #define ESP_LOGW(...) ((void)0)
+#define ESP_LOGD(...) ((void)0)
+typedef int BaseType_t;
 #define portMUX_INITIALIZER_UNLOCKED 0
 #define portMAX_DELAY 0xffffffffU
 #define pdTRUE 1
@@ -46,6 +51,9 @@ static unsigned hook;static bool fail_new,fail_decode,fail_worker_layout,playbac
 static uint64_t now_us=100000;static pet_resource_broker_t broker;
 static uint8_t decoded[16*16*3/2],packed_pixels[sizeof(decoded)];
 static uint16_t framebuffer[640*480],*g_framebuffer=framebuffer,expected_pixel;
+static uint16_t rgb_cache[640*480],*g_jpeg_output=rgb_cache;
+static size_t g_jpeg_output_capacity=sizeof(rgb_cache);
+static bool g_h264_rgb_cached;
 static pet_p4_render_trace_t g_render_trace;static uint32_t g_last_h264_pack_us;
 static int g_metrics_lock;
 static struct {struct {uint32_t jobs,completed,cancelled,decoded_frames,presented_frames,last_worker_us,max_worker_us,last_decode_us,max_decode_us,max_ready_latency_us,min_worker_free_bytes,last_offer_us,max_offer_us;}prefetch;}g_metrics;
@@ -59,10 +67,12 @@ static void leave(void){assert(critical==1);critical--;}
 static void actual_pack_rows(const pet_p4_h264_pack_job_t *job);
 static void pack_h264_i420_rows(const pet_p4_h264_pack_job_t *job);
 static void interleave(unsigned at);
+static void h264_pack_claim(void);
+static void xSemaphoreGive(SemaphoreHandle_t sem){assert(sem==g_h264_pack_done);pack_given=true;}
 /* The pack task's half runs synchronously here, through the same counted kernel. */
 static void xTaskNotifyGive(TaskHandle_t task){
  assert(task&&!critical);notifications++;
- if(task==2){assert(!pack_given);pack_h264_i420_rows(&g_h264_pack_job);pack_given=true;split_packs++;}
+ if(task==2){h264_pack_claim();split_packs++;}
 }
 static int xSemaphoreTake(SemaphoreHandle_t sem,unsigned timeout){
  assert(sem==g_h264_pack_done&&!critical);
@@ -249,6 +259,6 @@ int main(void){
  /* Full physical retirement and balanced broker occupancy after every branch. */
  fresh_source();asset_cache_release(&g_asset_cache[0]);pet_resource_usage_t usage;pet_resources_usage(&broker,&usage);
  assert(!usage.live_owners&&!usage.revoked_owners&&!usage.leases[PET_RESOURCE_ASSET_BUFFER]&&!usage.leases[PET_RESOURCE_ASSET_PREPARE]);
- assert(g_metrics.prefetch.min_worker_free_bytes==1234&&notifications&&!pack_given);
+ assert(g_metrics.prefetch.min_worker_free_bytes==1234&&notifications&&!atomic_load(&g_h264_pack_offered));
  free(g_h264_work_stream);return 0;
 }
