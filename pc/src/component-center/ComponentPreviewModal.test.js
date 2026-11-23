@@ -25,7 +25,7 @@ test("ComponentPreviewModal has a default export function named ComponentPreview
 
 test("ComponentPreviewModal renders every action through the shared Button primitive", () => {
   assert.match(source, /import Button from "\.\.\/shell\/Button"/);
-  assert.equal((source.match(/<Button\b/g) || []).length, 5);
+  assert.equal((source.match(/<Button\b/g) || []).length, 6);
   assert.doesNotMatch(source, /<button\b/);
   assert.match(source, /variant="icon"/);
   assert.match(source, /variant="ghost"/);

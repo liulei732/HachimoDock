@@ -42,7 +42,12 @@ bool pet_app_store_read(const char *id, char out[PET_APP_SAVE_BYTES]);
  * then use this to merge the latest in-memory updates at publication time. */
 bool pet_app_store_read_cached(const char *id, char out[PET_APP_SAVE_BYTES]);
 bool pet_app_store_update(const char *id, const char *json);
+/* Passive RAM observation across this ID's save namespaces. Clean means
+ * cached slots have no queued writes, not that the foreground view is durable. */
+const char *pet_app_store_cached_state(const char *id,uint64_t *oldest_edit_ms);
 void pet_app_store_forget(const char *id);
+/* Package worker only. Sync the latest cached saves of this installed ID. */
+bool pet_app_store_preserve_with_lease(const char *id,pet_resource_lease_t lease);
 /* Storage-worker only, model/render mutex released. Persist the independently
  * marked forget epoch with the caller's admitted lease before acknowledging
  * explicit clear-save deletion. Does not flush a new application snapshot. */

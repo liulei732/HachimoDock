@@ -12,7 +12,17 @@ env.Replace(COMPILATIONDB_INCLUDE_TOOLCHAIN=False,
             COMPILATIONDB_PATH=os.path.join(env.subst("$BUILD_DIR"), "platformio_compile_commands.json"))
 env["ENV"]["PET_P4_PROJECT_DIR"] = project_dir
 env["ENV"]["PET_P4_SYSTEM_WIFI"] = env.GetProjectOption("custom_p4_system_wifi", "0")
+if env["ENV"]["PET_P4_SYSTEM_WIFI"] == "1":
+    # SCons can reuse a CMake database without reconfiguration. Regenerate even
+    # with an unset input so a public incremental build drops candidate trust.
+    import subprocess
+    import sys
+    config_input = os.environ.get("PETUI_COMMUNITY_CONFIG_INPUT", "")
+    env["ENV"]["PETUI_COMMUNITY_CONFIG_INPUT"] = config_input
+    subprocess.run([sys.executable, os.path.join(project_dir, "tools/community_build_config.py"),
+                    os.path.join(env.subst("$BUILD_DIR"), "config/petui_community_public.generated.h")], check=True)
 env["ENV"]["PET_P4_CHIP_FAMILY"] = env.GetProjectOption("custom_p4_chip_family", "v1")
+env["ENV"]["PET_P4_LCD_PANEL_AUTO"] = env.GetProjectOption("custom_p4_lcd_panel_auto", "0")
 env["ENV"]["PET_P4_PROJECT_VER_OVERRIDE"] = env.GetProjectOption(
     "custom_p4_project_version", "0.7.57-p4"
 )

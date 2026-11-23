@@ -4860,6 +4860,7 @@ impl CodexComposerBridge {
             "claude-code" => macos::MacosAgent::Claude,
             "workbuddy" => macos::MacosAgent::WorkBuddy,
             "deepseek-harness" => macos::MacosAgent::DeepSeekHarness,
+            "antigravity" => macos::MacosAgent::Antigravity,
             _ => return false,
         };
         macos::agent_is_frontmost(agent)
@@ -4872,6 +4873,7 @@ impl CodexComposerBridge {
             "claude-code" => macos::MacosAgent::Claude,
             "workbuddy" => macos::MacosAgent::WorkBuddy,
             "deepseek-harness" => macos::MacosAgent::DeepSeekHarness,
+            "antigravity" => macos::MacosAgent::Antigravity,
             _ => return None,
         };
         Some(macos::AgentDiagnostics {
@@ -4891,6 +4893,7 @@ impl CodexComposerBridge {
             "claude-code" => macos::MacosAgent::Claude,
             "workbuddy" => macos::MacosAgent::WorkBuddy,
             "deepseek-harness" => macos::MacosAgent::DeepSeekHarness,
+            "antigravity" => macos::MacosAgent::Antigravity,
             _ => return false,
         };
         macos::activate_agent(agent);
@@ -4914,9 +4917,10 @@ impl CodexComposerBridge {
             "claude-code" => macos::MacosAgent::Claude,
             "workbuddy" => macos::MacosAgent::WorkBuddy,
             "deepseek-harness" => macos::MacosAgent::DeepSeekHarness,
+            "antigravity" => macos::MacosAgent::Antigravity,
             _ => {
                 return Err(
-                    "Current visible composer requires ChatGPT（Codex）, Claude, WorkBuddy or DeepSeek Harness".to_string(),
+                    "Current visible composer requires ChatGPT（Codex）, Claude, WorkBuddy, DeepSeek Harness or Antigravity".to_string(),
                 )
             }
         };
@@ -4932,6 +4936,7 @@ impl CodexComposerBridge {
             "claude-code" => macos::MacosAgent::Claude,
             "workbuddy" => macos::MacosAgent::WorkBuddy,
             "deepseek-harness" => macos::MacosAgent::DeepSeekHarness,
+            "antigravity" => macos::MacosAgent::Antigravity,
             _ => return Err("Unsupported current visible composer".into()),
         };
         Self::start_with_purpose_retained(agent, "", "", "", "", "current_voice", callback)
@@ -5075,8 +5080,8 @@ impl CodexComposerBridge {
         let session_id = session_id.trim();
         let session_title = session_title.trim();
         let current_visible = matches!(purpose, "current_voice" | "current_task");
-        if agent == macos::MacosAgent::DeepSeekHarness && !current_visible {
-            return Err("DeepSeek Harness 仅支持当前可见输入框".into());
+        if matches!(agent, macos::MacosAgent::DeepSeekHarness | macos::MacosAgent::Antigravity) && !current_visible {
+            return Err("此 Agent 仅支持当前可见输入框".into());
         }
         if !current_visible && session_id.is_empty() && session_title.is_empty() {
             return Err("Visible composer requires a bound task ID or title".into());

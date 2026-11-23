@@ -23,8 +23,24 @@ fn challenge_proof(key: &[u8], encoded: &str, boot_id: &str) -> Result<Zeroizing
     ))
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TrustTarget {
+    board_device_id: String,
+    boot_id: String,
+    connection_id: String,
+}
+
+impl TrustTarget {
+    fn matches(&self, usb_board: &str, connection_id: u64, lan_board: &str, lan_boot: &str) -> bool {
+        self.board_device_id == usb_board && usb_board == lan_board
+            && self.boot_id == lan_boot && self.connection_id == connection_id.to_string()
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn lan_trust_usb(
+    target: Option<TrustTarget>,
     usb_manager: tauri::State<'_, crate::usb_serial::UsbSerialManager>,
 ) -> Result<(), String> {
     let usb = usb_manager.inner().clone();
@@ -33,6 +49,11 @@ pub(crate) async fn lan_trust_usb(
             .approval_connection()
             .ok_or("请用 USB 连接当前 Wi-Fi 配对的设备。")?;
         let (peer, status) = read_with_recovery(query_status, "无法读取已配对的 Wi-Fi 设备。")?;
+        if board != status.board_device_id || target.as_ref().is_some_and(|t|
+            !t.matches(&board, connection_id, &status.board_device_id, &status.boot_id)
+        ) {
+            return Err("USB 连接或 Wi-Fi 配对目标已改变，请刷新后重试。".into());
+        }
         if status.control_trusted {
             return Ok(());
         }
@@ -63,6 +84,18 @@ pub(crate) async fn lan_trust_usb(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn displayed_target_must_still_match_both_transports() {
+        let target = TrustTarget {
+            board_device_id: "a".into(), boot_id: "new".into(), connection_id: u64::MAX.to_string(),
+        };
+        assert!(target.matches("a", u64::MAX, "a", "new"));
+        assert!(!target.matches("a", u64::MAX - 1, "a", "new"));
+        assert!(!target.matches("a", u64::MAX, "a", "old"));
+        assert!(!target.matches("a", u64::MAX, "b", "new"));
+        assert!(!target.matches("b", u64::MAX, "b", "new"));
+    }
 
     #[test]
     fn proof_binds_nonce_boot_generation_and_key() {

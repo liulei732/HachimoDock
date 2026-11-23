@@ -2,7 +2,7 @@
 from pathlib import Path
 import subprocess
 from p4_render_trace_test import function
-from p4_main_frame_test import CHAIN
+from p4_main_frame_test import CHAIN, pack_handoff
 ROOT=Path(__file__).resolve().parents[1]
 
 def test_cached_video_keeps_worker_lifetime_and_audio_startup_protection(tmp_path):
@@ -15,6 +15,7 @@ def test_cached_video_keeps_worker_lifetime_and_audio_startup_protection(tmp_pat
         'pet_p4_renderer_set_asset_preparation_suspended','reset_h264_decoder','reset_h264_decoder_traced',
         'start_h264_decoder_role','decode_next_h264_frame_role'))
     functions+='\n'+function(source,'pack_h264_i420_rows').replace('pack_h264_i420_rows(','actual_pack_rows(',1)
+    functions+='\n'+pack_handoff(source)
     harness=(ROOT/'tests/p4_main_frame_adapter_test.c').read_text()
     harness=harness.replace('static bool pet_p4_audio_conversation_active(void){return false;}',
        'static bool conversation_ready;\nstatic bool pet_p4_audio_conversation_active(void){return conversation_ready;}\n'

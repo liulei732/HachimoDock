@@ -22,9 +22,10 @@ def test_physical_hold_owns_depression_without_legacy_ptt_or_release_replay(tmp_
 #include <stdio.h>
 #include <string.h>
 #include "pet_p4_input_core.h"
+#include "pet_p4_voice_feedback.h"
 #define PET_P4_INPUT_EVENT_MAX 64
 #define PET_P4_PAGE_MAX 24
-typedef struct { char screen_page[24]; unsigned long long last_update_ms; bool approval_active, session_voice_active; } pet_p4_runtime_state_t;
+typedef struct { char screen_page[24]; unsigned long long last_update_ms; bool approval_active, session_voice_active; pet_voice_feedback_t voice_feedback; } pet_p4_runtime_state_t;
 #include "pet_p4_center_layout.h"
 static pet_center_filter_t pet_p4_miniapp_center_filter(void) {return PET_CENTER_ALL;}
 static bool pet_p4_miniapp_center_set_filter(pet_center_filter_t f) {(void)f;return true;}

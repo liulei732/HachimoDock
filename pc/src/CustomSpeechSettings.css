@@ -1,0 +1,10 @@
+.custom-speech__stage {
+  min-width: 0;
+  margin: var(--space-3) 0;
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md, 8px);
+}
+.custom-speech__stage legend { padding: 0 .35em; font-weight: 650; }
+.custom-speech__stage .api-settings__speech-actions { margin-top: var(--space-3); }
+.custom-speech__stage .api-settings__result { flex-wrap: wrap; overflow-wrap: anywhere; }

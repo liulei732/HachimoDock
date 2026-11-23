@@ -1,3 +1,4 @@
+import { secretInputProps } from "../lib/secret-input.js";
 /**
  * [Input] Existing Devin cloud configuration commands and local Agent detection.
  * [Output] A Devin configuration entry and dialog for credentials and cloud session sync.
@@ -7,7 +8,7 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { AlertCircle, CheckCircle2, ExternalLink, Eye, EyeOff, Loader2, Settings2, X } from "lucide-react";
+import { AlertCircle, CheckCircle2, ExternalLink, Loader2, Settings2, X } from "lucide-react";
 import { useExitProtection } from "../lib/exit-protection.js";
 import { useDeviceContext } from "../shell/DeviceContext.jsx";
 
@@ -40,7 +41,6 @@ export default function DevinConfigurationButton({ disabled }) {
 function DevinConfigurationDialog({ onClose }) {
   const { refreshAgents } = useDeviceContext();
   const dialogRef = useRef(null);
-  const [showSecret, setShowSecret] = useState(false);
   const [devin, setDevin] = useState({
     loading: true,
     pending: false,
@@ -179,8 +179,7 @@ function DevinConfigurationDialog({ onClose }) {
             <input
               id="devin-config-token"
               className="ui-control api-settings__secret-input"
-              type={showSecret ? "text" : "password"}
-              autoComplete="new-password"
+              {...secretInputProps}
               value={devin.token}
               onChange={(event) => setDevin((current) => ({ ...current, token: event.target.value }))}
               placeholder={devin.hasToken ? "PAT 已保存，留空可保留" : "粘贴 Devin PAT"}
@@ -214,12 +213,6 @@ function DevinConfigurationDialog({ onClose }) {
               target="_blank" rel="noreferrer">
               PAT 创建说明 <ExternalLink size={11} aria-hidden="true" />
             </a>
-            {devin.token && (
-              <button type="button" className="btn-ghost btn-sm" onClick={() => setShowSecret((value) => !value)}>
-                {showSecret ? <EyeOff size={14} /> : <Eye size={14} />}
-                {showSecret ? "隐藏 PAT" : "显示 PAT"}
-              </button>
-            )}
           </div>
         </div>
         <div className={`api-settings__result${devin.tone ? ` is-${devin.tone}` : ""}`} role="status">

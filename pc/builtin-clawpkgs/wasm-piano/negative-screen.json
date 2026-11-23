@@ -1,1 +1,1 @@
-{"dashboard":{"title":"模拟琴键","visualStyle":"clean","visualPalette":"ember","visualLayout":"tool","note":"点按或滑过琴键，弹奏 C 大调音阶。也可以用摇杆选音并切换高低八度。","visualSprite":"music"}}
+{"dashboard":{"title":"模拟琴键","visualStyle":"clean","visualPalette":"ember","visualLayout":"tool","note":"点按、滑奏或反复敲同一琴键，弹奏 C 大调音阶。可用摇杆选音，切换的八度会保留。","visualSprite":"music"}}

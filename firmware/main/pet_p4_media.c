@@ -9,7 +9,7 @@
 #include "pet_p4_radio_audio.h"
 #endif
 #include "pet_p4_service_bridge.h"
-#if PET_SERVICE_BRIDGE_ENABLED
+#if PET_SERVICE_BRIDGE_ENABLED || PET_P4_SYSTEM_WIFI
 #include "pet_p4_app_host.h"
 #endif
 #include "esp_heap_caps.h"
@@ -31,6 +31,7 @@ static SemaphoreHandle_t lock;
  * taking the internal RAM needed by codecs, USB and task stacks. */
 static EXT_RAM_BSS_ATTR pet_p4_media_view_t view;
 static char session[64];
+static char visible_source[PET_P4_MEDIA_SOURCE_MAX];
 static uint32_t next_seq,offset_ms;
 static uint64_t last_request;
 static uint8_t *cover;
@@ -55,7 +56,15 @@ static void copy(char *out,size_t size,const char *s) {
   while(n && ((unsigned char)s[n]&0xc0)==0x80)n--;
   memcpy(out,s,n);out[n]=0;
 }
+#if PET_P4_SYSTEM_WIFI
+#include "pet_p4_media_av_events.inc"
+#else
+static uint32_t media_view_epoch, media_view_boot;
+#endif
 static void emit(const char *topic,cJSON *payload) {
+#if PET_P4_SYSTEM_WIFI
+  media_record_key(topic,payload);
+#endif
   cJSON *root=cJSON_CreateObject();cJSON_AddStringToObject(root,"topic",topic);cJSON_AddItemToObject(root,"payload",payload);
   char *line=cJSON_PrintUnformatted(root);if(line&&send_line)send_line(line,send_ctx);cJSON_free(line);cJSON_Delete(root);
 }
@@ -323,7 +332,7 @@ done:
 }
 
 static bool radio_prepare_pc_fallback_locked(const char *key) {
-  if (live_provider == &wifi_audio_provider || !radio_pc_connected || !send_line ||
+  if (live_provider == &wifi_audio_provider || !radio_pc_connected || (!send_line && !media_listener()) ||
       !key || !key[0] || pet_p4_audio_music_active() || pet_p4_audio_active() ||
       pet_p4_audio_conversation_active()) return false;
   copy(radio_fallback_key, sizeof(radio_fallback_key), key);
@@ -421,8 +430,8 @@ void pet_p4_media_authorize_live_playlist_revision(const char *widget_id, const 
   const bool wifi_audio = provider == &wifi_audio_provider;
   const bool changed = provider != live_provider || (wifi_audio && !same_playlist);
   const bool entering = provider && changed;
-  radio_pc_connected = pc_connected;
-  if (!pc_connected) {
+  radio_pc_connected = pc_connected || media_listener();
+  if (!radio_pc_connected) {
     radio_fallback_pending = false;
     radio_fallback_key[0] = 0;
   }
@@ -497,7 +506,7 @@ static bool radio_action_locked(const char *source, const char *operation, int v
   if (!strcmp(operation, "toggle")) {
     if (radio_generation) radio_cancel_locked("paused", "已暂停");
     else if (local_item.id) {
-      if (live_provider != &wifi_audio_provider && radio_pc_connected && send_line &&
+      if (live_provider != &wifi_audio_provider && radio_pc_connected && (send_line || media_listener()) &&
           (radio_format_rejected || !pet_device_wifi_online())) {
         for (unsigned i = 0; i < view.count; ++i) {
           if (!strcmp(queue_keys[i], local_item.id)) {
@@ -513,7 +522,7 @@ static bool radio_action_locked(const char *source, const char *operation, int v
       /* A selected HLS/PC-only row has no local_item. A later explicit
        * play must still reach the PC after it reconnects. Do not hand off
        * merely on reconnect, or submit this row to the local MP3 decoder. */
-      if (live_provider != &wifi_audio_provider && radio_pc_connected && send_line &&
+      if (live_provider != &wifi_audio_provider && radio_pc_connected && (send_line || media_listener()) &&
           view.selected < view.count) {
         radio_remote = true;
         return false;
@@ -541,43 +550,77 @@ static bool radio_action_locked(const char *source, const char *operation, int v
   }
   local_item = station;
   radio_cancel_locked("idle", supported ? "Wi-Fi 未连接，请连接后继续收听" : "此电台需要 PC 播放");
-  if (live_provider == &wifi_audio_provider || !radio_pc_connected || !send_line) return true;
+  if (live_provider == &wifi_audio_provider || !radio_pc_connected || (!send_line && !media_listener())) return true;
   radio_remote = true;
   return false;
 }
 #endif
 
+static bool reports_media_visibility(const char *source) {
+#if PET_P4_SYSTEM_WIFI
+  if (!strcmp(source, PET_P4_MEDIA_WIFI_SOURCE)) return false;
+#endif
+  return strncmp(source, "app.", 4) != 0;
+}
+
+static void stop_visible_media_locked(void) {
+  const char *owner = view.source[0] ? view.source : "audio.player";
+  if (session[0] && !strcmp(visible_source, owner)) {
+    pet_p4_audio_music_flush_if_owner(session);
+    session[0] = 0;
+    offset_ms = view.position_ms = 0;
+    view.level = 0;
+    view.seeking = false;
+    copy(view.status, sizeof(view.status), "idle");
+    copy(view.message, sizeof(view.message), "已停止播放");
+  }
+}
+
 void pet_p4_media_visibility(const char *source,bool visible,uint64_t now_ms) {
-  static char prior[48];static bool was_visible;static uint32_t epoch,boot;static uint64_t last;
+
+  static uint64_t last;
   if(!lock)return;
   xSemaphoreTake(lock,portMAX_DELAY);
-  if(!boot)boot=esp_random()|1;
-  if(was_visible&&(!visible||strcmp(prior,source))){
-    cJSON *p=cJSON_CreateObject();cJSON_AddStringToObject(p,"source",prior);cJSON_AddStringToObject(p,"operation","visibility");
-    cJSON_AddNumberToObject(p,"boot",boot);cJSON_AddNumberToObject(p,"epoch",++epoch);cJSON_AddBoolToObject(p,"visible",false);emit("media/event",p);was_visible=false;
-  }
+  if(!media_view_boot)media_view_boot=esp_random()|1;
+  if (visible_source[0] && (!visible || strcmp(visible_source, source))) {
+    stop_visible_media_locked();
+    if (reports_media_visibility(visible_source)) {
+      // The scoped stop also cancels preparation on desktop clients that
+      // interpret visibility loss as permission to keep an active stream.
+      cJSON *stop = cJSON_CreateObject();
+      cJSON_AddStringToObject(stop, "source", visible_source);
+      cJSON_AddStringToObject(stop, "operation", "stop");
+      emit("media/event", stop);
+      cJSON *p=cJSON_CreateObject();cJSON_AddStringToObject(p,"source",visible_source);cJSON_AddStringToObject(p,"operation","visibility");
+      cJSON_AddNumberToObject(p,"boot",media_view_boot);cJSON_AddNumberToObject(p,"epoch",++media_view_epoch);cJSON_AddBoolToObject(p,"visible",false);emit("media/event",p);
+    }
 #if PET_P4_SYSTEM_WIFI
-  if (!strcmp(source, PET_P4_MEDIA_WIFI_SOURCE)) visible = false;
+    media_drop_keys();
 #endif
-  if(visible&&source[0]){
-    if(!was_visible||strcmp(prior,source)){copy(prior,sizeof(prior),source);++epoch;last=0;}
-    was_visible=true;
+    visible_source[0] = 0;
+  }
+  if (visible && source[0] && !visible_source[0]) {
+    copy(visible_source, sizeof(visible_source), source);
+    ++media_view_epoch;
+    last = 0;
+  }
+  if(visible&&source[0]&&reports_media_visibility(source)){
 #if PET_P4_SYSTEM_WIFI
     if (radio_fallback_pending && live_source(source)) {
       radio_fallback_pending = false;
-      if (radio_pc_connected && send_line && !pet_p4_audio_music_active() &&
+      if (radio_pc_connected && (send_line || media_listener()) && !pet_p4_audio_music_active() &&
           !pet_p4_audio_active() && !pet_p4_audio_conversation_active()) {
         /* A distinct visibility epoch makes this one handoff an entry, even
          * if the PC already saw deviceDirect in the current component. */
         /* Keep deviceDirect until PC begin succeeds. Legacy PCs ignore the
          * fallback metadata and must not autoplay their stale current row. */
-        ++epoch;last=0;
+        ++media_view_epoch;last=0;
       } else radio_fallback_key[0] = 0;
     }
 #endif
     if(send_line&&(!last||now_ms-last>=2000)){
       cJSON *p=cJSON_CreateObject();cJSON_AddStringToObject(p,"source",source);cJSON_AddStringToObject(p,"operation","visibility");
-      cJSON_AddNumberToObject(p,"boot",boot);cJSON_AddNumberToObject(p,"epoch",epoch);cJSON_AddBoolToObject(p,"visible",true);
+      cJSON_AddNumberToObject(p,"boot",media_view_boot);cJSON_AddNumberToObject(p,"epoch",media_view_epoch);cJSON_AddBoolToObject(p,"visible",true);
 #if PET_P4_SYSTEM_WIFI
       if(radio_owns_controls(source))cJSON_AddBoolToObject(p,"deviceDirect",true);
       if(live_source(source) && radio_fallback_key[0]) {
@@ -590,6 +633,38 @@ void pet_p4_media_visibility(const char *source,bool visible,uint64_t now_ms) {
   }
   xSemaphoreGive(lock);
 }
+#if PET_P4_SYSTEM_WIFI
+cJSON *pet_p4_media_radio_poll(uint32_t gen,uint32_t assoc) {
+  if (!lock) return NULL;
+  xSemaphoreTake(lock,portMAX_DELAY);
+  if (!media_listener() || gen!=media_poll_generation || assoc!=media_poll_assoc) media_drop_keys();
+  media_poll_us=esp_timer_get_time(); media_poll_generation=gen; media_poll_assoc=assoc;
+  cJSON *r=cJSON_CreateObject();
+  if (r) cJSON_AddBoolToObject(r,"ok",true);
+  if (r && !strncmp(visible_source,"pc.",3)) {
+    char token[24];snprintf(token,sizeof(token),"%08lx-%08lx",(unsigned long)media_view_boot,(unsigned long)media_view_epoch);
+    cJSON_AddStringToObject(r,"source",visible_source);
+    cJSON_AddStringToObject(r,"instance",token);
+    cJSON *event;
+    if(media_key_count) {
+      event=media_keys[media_key_head];media_key_head=(media_key_head+1)%8;--media_key_count;
+    } else {
+      event=cJSON_CreateObject();
+      cJSON_AddStringToObject(event,"source",visible_source);
+      cJSON_AddStringToObject(event,"operation","visibility");
+      cJSON_AddBoolToObject(event,"visible",true);
+      cJSON_AddNumberToObject(event,"boot",media_view_boot);cJSON_AddNumberToObject(event,"epoch",media_view_epoch);
+      if(radio_owns_controls(visible_source))cJSON_AddBoolToObject(event,"deviceDirect",true);
+      if(live_source(visible_source) && radio_fallback_key[0]) {
+        cJSON_AddStringToObject(event,"fallback","format_unsupported");cJSON_AddStringToObject(event,"key",radio_fallback_key);
+      }
+    }
+    cJSON_AddItemToObject(r,"event",event);
+  }
+  xSemaphoreGive(lock);
+  return r;
+}
+#endif
 void pet_p4_media_init(void) {
   if(lock)return;lock=xSemaphoreCreateMutex();view.volume=65;
   view.lyric_index=-1;
@@ -624,15 +699,32 @@ static void refresh(void) {
 bool pet_p4_media_handle(const char *topic,const cJSON *p,pet_p4_send_line_fn send,void *ctx) {
   return pet_p4_media_handle_with_reply(topic,p,send,ctx,NULL);
 }
-bool pet_p4_media_handle_with_reply(const char *topic,const cJSON *p,
-    pet_p4_send_line_fn send,void *ctx,pet_p4_query_reply_t *deferred) {
+static bool media_execute(const char *topic,const cJSON *p,
+    pet_p4_send_line_fn send,void *ctx,pet_p4_query_reply_t *deferred,
+    cJSON **result,const char *source,const char *instance,bool cleanup) {
   /* Reject a used slot before any state mutation; never overwrite/replay it. */
   if(deferred && deferred->line)return false;
   if(strncmp(topic,"media/",6))return false;
   pet_p4_media_init();if(!lock)return false;
-  xSemaphoreTake(lock,portMAX_DELAY);send_line=send;send_ctx=ctx;
+  xSemaphoreTake(lock,portMAX_DELAY);if (!result) { send_line=send;send_ctx=ctx; }
   bool ok=true;const char *message="";const char *id=str(p,"sessionId");
   uint32_t n=0;bool exact=id[0]&&!strcmp(id,session);
+#if PET_P4_SYSTEM_WIFI
+  if(result) {
+    bool begin=!strcmp(topic,"media/begin");
+    bool presentation=!strcmp(topic,"media/library") || !strcmp(topic,"media/notice");
+    bool radio=source && !strncmp(source,"pc.",3);
+    bool valid_view = cleanup || (radio ? media_radio_matches_locked(source,instance) :
+      (source && !strcmp(visible_source,source) && !strncmp(source,"app.",4) &&
+       pet_app_host_instance_matches(source+4,instance)));
+    bool idle_query=radio && !strcmp(topic,"media/query") && !session[0] && !pet_p4_audio_music_active();
+    if(!valid_view || (!begin && !presentation && !idle_query && (!exact || strcmp(view.source,source))) ||
+       (begin && session[0] && pet_p4_audio_music_active() && !pet_p4_audio_music_ended()) ||
+       ((begin || presentation) && strcmp(str(p,"source"),source))) {
+      xSemaphoreGive(lock); return false;
+    }
+  }
+#endif
 #if PET_SERVICE_BRIDGE_ENABLED
   const char*host_instance=str(p,"hostInstance"),*scoped_source=str(p,"source");
   bool scoped=host_instance[0];
@@ -649,7 +741,10 @@ bool pet_p4_media_handle_with_reply(const char *topic,const cJSON *p,
 #if PET_P4_SYSTEM_WIFI
     else if(!strcmp(str(p,"source"), PET_P4_MEDIA_WIFI_SOURCE)) {ok=false;message="Wi-Fi 音频由设备播放";}
 #endif
-    else if(!strncmp(str(p,"source"),"app.",4)&&!pet_p4_miniapp_host_source(str(p,"source"))) {ok=false;message="请先打开对应组件";}
+    else if (!strncmp(str(p,"source"), "app.", 4) &&
+        (strcmp(str(p,"source"), visible_source) || !pet_p4_miniapp_host_source(str(p,"source")))) {
+      ok=false;message="请先打开对应组件";
+    }
     else if(pet_p4_audio_music_begin(id)!=ESP_OK) {ok=false;message="麦克风或语音正在使用，音乐未启动";}
     else {
 #if PET_P4_SYSTEM_WIFI
@@ -676,10 +771,20 @@ bool pet_p4_media_handle_with_reply(const char *topic,const cJSON *p,
     else if(!number(p,"seq",UINT32_MAX,&n)||n!=next_seq||strlen(data)>2568
       ||mbedtls_base64_decode(encoded,sizeof(encoded),&bytes,(const unsigned char*)data,strlen(data))
       ||!pet_p4_media_decode(encoded,bytes,pcm,sizeof(pcm),&written)) {ok=false;message="音乐数据顺序或格式无效";}
-    else if(pet_p4_audio_stream_push(pcm,written)!=ESP_OK) {ok=false;message="音乐缓冲区已满";}
+    else if(
+#if PET_P4_SYSTEM_WIFI
+      (result ? pet_p4_audio_music_push_if_owner(id,pcm,written) : pet_p4_audio_stream_push(pcm,written))
+#else
+      pet_p4_audio_stream_push(pcm,written)
+#endif
+      !=ESP_OK) {ok=false;message="音乐缓冲区已满";}
     else {next_seq++;unsigned peak=0;for(size_t i=0;i+1<written;i+=2){int sample=(int16_t)(pcm[i]|pcm[i+1]<<8);unsigned a=sample<0?-sample:sample;if(a>peak)peak=a;}view.level=(uint8_t)(peak*100/32768);}
   } else if(!strcmp(topic,"media/end")) {
-    if(!exact) {ok=false;message="音乐会话不匹配";} else pet_p4_audio_stream_end();
+    if(!exact) {ok=false;message="音乐会话不匹配";}
+#if PET_P4_SYSTEM_WIFI
+    else if(result) {ok=pet_p4_audio_music_end_if_owner(id);if(!ok)message="音乐会话已结束";}
+#endif
+    else pet_p4_audio_stream_end();
   } else if(!strcmp(topic,"media/stop")) {
 #if PET_P4_SYSTEM_WIFI
     if(!id[0]||exact) {
@@ -688,7 +793,7 @@ bool pet_p4_media_handle_with_reply(const char *topic,const cJSON *p,
     }
     if(!id[0]&&radio_generation)radio_cancel_locked("idle","已停止播放");
 #endif
-    if(!id[0]||exact) {if(pet_p4_audio_music_active())pet_p4_audio_stream_flush();session[0]=0;copy(view.status,sizeof(view.status),!strcmp(str(p,"state"),"error")?"error":"idle");copy(view.message,sizeof(view.message),str(p,"message"));view.position_ms=0;view.level=0;}
+    if(!id[0]||exact) {if(result)pet_p4_audio_music_flush_if_owner(id);else if(pet_p4_audio_music_active())pet_p4_audio_stream_flush();session[0]=0;copy(view.status,sizeof(view.status),!strcmp(str(p,"state"),"error")?"error":"idle");copy(view.message,sizeof(view.message),str(p,"message"));view.position_ms=0;view.level=0;}
   } else if(!strcmp(topic,"media/control")) {
     const char *op=str(p,"operation");
     if(!strcmp(op,"volume")&&number(p,"volume",100,&n)) {view.volume=n;pet_p4_audio_music_volume(n);}
@@ -787,6 +892,7 @@ bool pet_p4_media_handle_with_reply(const char *topic,const cJSON *p,
   cJSON_AddNumberToObject(reply,"positionMs",view.position_ms);
   cJSON_AddNumberToObject(reply,"bufferedMs",pet_p4_audio_music_buffered_ms());
   cJSON_AddNumberToObject(reply,"volume",view.volume);
+  if(result) { cJSON_AddNumberToObject(reply,"nextSeq",next_seq); *result=reply; xSemaphoreGive(lock);return true; }
   if(deferred && send && !strcmp(topic,"media/chunk")) {
     /* Snapshot the complete status under media lock, without registering a
      * temporary callback as the persistent event transport. The worker owns
@@ -802,6 +908,19 @@ bool pet_p4_media_handle_with_reply(const char *topic,const cJSON *p,
   }
   emit("media/status",reply);xSemaphoreGive(lock);return true;
 }
+bool pet_p4_media_handle_with_reply(const char *topic,const cJSON *p,
+    pet_p4_send_line_fn send,void *ctx,pet_p4_query_reply_t *deferred) {
+  return media_execute(topic,p,send,ctx,deferred,NULL,NULL,NULL,false);
+}
+#if PET_P4_SYSTEM_WIFI
+cJSON *pet_p4_media_lan(const char *topic,const cJSON *payload,const char *source,
+                        const char *instance,bool cleanup) {
+  cJSON *reply=NULL;
+  media_execute(topic,payload,NULL,NULL,NULL,&reply,source,instance,cleanup);
+  return reply;
+}
+#endif
+
 void pet_p4_media_tick(uint64_t now) {
   if(!lock)return;xSemaphoreTake(lock,portMAX_DELAY);
 #if PET_P4_SYSTEM_WIFI

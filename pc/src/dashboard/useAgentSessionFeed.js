@@ -6,7 +6,7 @@
  */
 
 import { useEffect, useReducer, useRef } from "react";
-import { isTerminalDeviceSession } from "../lib/session-display.js";
+import { isActiveDeviceSession, isImplicitTerminalDeviceSession, isTerminalDeviceSession } from "../lib/session-display.js";
 import {
   fetchAgentSessionEvents,
   fetchAgentSessions,
@@ -21,11 +21,12 @@ import {
 export const P4_SESSION_EVENT_POLL_MS = 750;
 export const P4_SESSION_SNAPSHOT_POLL_MS = 5000;
 export const P4_SESSION_EVENT_DISPATCH_GAP_MS = 25;
+export const P4_PENDING_EVENT_LIMIT = 100;
 
 let lastFeedContact = { agentId: "", at: -Infinity };
 
-export function agentSessionFeedFresh(agentId) {
-  return lastFeedContact.agentId === agentId && performance.now() - lastFeedContact.at < 9000;
+export function agentSessionFeedFresh(agentId, maxAgeMs = 9000) {
+  return lastFeedContact.agentId === agentId && performance.now() - lastFeedContact.at < maxAgeMs;
 }
 
 const EMPTY_SESSIONS = Object.freeze([]);
@@ -40,6 +41,62 @@ export const AGENT_SESSION_FEED_INITIAL_STATE = Object.freeze({
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function needsPromptDispatch(session) {
+  return isTerminalDeviceSession(session) || isImplicitTerminalDeviceSession(session)
+    || session.state === "waiting_user";
+}
+
+export function queueSessionEvents(pendingEvents, events, apply) {
+  for (const event of events) {
+    const session = event?.session;
+    const id = normalizeText(session?.id);
+    if (!id) continue;
+    let priorIndex = pendingEvents.length - 1;
+    while (priorIndex >= 0 && pendingEvents[priorIndex].session.id !== id) priorIndex--;
+    const prior = pendingEvents[priorIndex]?.session;
+    // Fold repeated progress reports only. Preserve state changes, chronology,
+    // and sparse metadata (for example, a title present in just one event).
+    if (!needsPromptDispatch(session) && isActiveDeviceSession(session)
+      && prior?.state === session.state && prior.epoch === session.epoch
+      && session.statusUpdatedAt >= prior.statusUpdatedAt) {
+      pendingEvents[priorIndex] = { ...event, session: { ...prior, ...session } };
+    } else {
+      // The bridge respects the requested capacity for cursor pages. Its
+      // cold/reset bootstrap returns all active rows even above the limit.
+      if (pendingEvents.length >= P4_PENDING_EVENT_LIMIT) apply(pendingEvents.shift());
+      pendingEvents.push(event);
+    }
+  }
+}
+
+export function dispatchSessionTurn(pendingEvents, apply) {
+  const selected = new Set();
+  const batchSize = 8;
+  for (const { session } of pendingEvents) {
+    if (needsPromptDispatch(session)) selected.add(session.id);
+    if (selected.size === batchSize) break;
+  }
+  const urgent = selected.size > 0;
+  if (!urgent) {
+    for (const { session } of pendingEvents) {
+      selected.add(session.id);
+      if (selected.size === batchSize) break;
+    }
+  }
+  for (let i = 0; i < pendingEvents.length && selected.size;) {
+    const event = pendingEvents[i];
+    if (!selected.has(event.session.id)) {
+      i++;
+      continue;
+    }
+    pendingEvents.splice(i, 1);
+    apply(event);
+    // Advance through ordinary prerequisites up to the first urgent transition.
+    // A subsequent turn for the same card gets its own render.
+    if (!urgent || needsPromptDispatch(event.session)) selected.delete(event.session.id);
+  }
 }
 
 function nextSessionFeedState(state, action, routingSessions, authoritativeSnapshot) {
@@ -78,10 +135,8 @@ export function agentSessionFeedReducer(state, action) {
     case "replace_snapshot": {
       const agentId = action.agentId || "";
       const sameAgent = state.loaded && state.agentId === agentId;
-      const routingSessions = mergeP4SessionSnapshot(
-        sameAgent ? state.routingSessions : [],
-        action.value,
-      );
+      const previous = sameAgent ? state.routingSessions : [];
+      const routingSessions = mergeP4SessionSnapshot(previous, action.value, action.concurrentIds);
       return nextSessionFeedState(state, action, routingSessions, true);
     }
     case "apply_event": {
@@ -142,6 +197,7 @@ export function useAgentSessionFeed({ agentId, displayEnabled, dismissedSessions
     let eventStreamId = "";
     let eventsInFlight = false;
     let snapshotInFlight = false;
+    let snapshotEvents = null;
     let eventTimer = null;
     let snapshotTimer = null;
     let drainTimer = null;
@@ -149,26 +205,23 @@ export function useAgentSessionFeed({ agentId, displayEnabled, dismissedSessions
     const pendingEvents = [];
     const ctl = new AbortController();
 
+    const applyEvent = event => {
+      snapshotEvents?.add(event.session.id);
+      dispatch({
+        type: "apply_event",
+        agentId,
+        value: event.session,
+        nowMs: Number(event.updatedAt || event.session.statusUpdatedAt || Date.now()),
+        displayEnabled,
+        dismissedSessions,
+      });
+    };
     const drainEventQueue = () => {
-      if (cancelled) {
+      if (cancelled || !pendingEvents.length) {
         draining = false;
         return;
       }
-      const event = pendingEvents.shift();
-      if (!event) {
-        draining = false;
-        return;
-      }
-      if (event.session && normalizeText(event.session.id)) {
-        dispatch({
-          type: "apply_event",
-          agentId,
-          value: event.session,
-          nowMs: Number(event.updatedAt || event.session.statusUpdatedAt || Date.now()),
-          displayEnabled,
-          dismissedSessions,
-        });
-      }
+      dispatchSessionTurn(pendingEvents, applyEvent);
       drainTimer = setTimeout(() => {
         drainTimer = null;
         drainEventQueue();
@@ -176,7 +229,7 @@ export function useAgentSessionFeed({ agentId, displayEnabled, dismissedSessions
     };
 
     const enqueueEvents = (events) => {
-      pendingEvents.push(...(Array.isArray(events) ? events : []));
+      queueSessionEvents(pendingEvents, events, applyEvent);
       if (draining || pendingEvents.length === 0) return;
       draining = true;
       drainEventQueue();
@@ -184,6 +237,8 @@ export function useAgentSessionFeed({ agentId, displayEnabled, dismissedSessions
 
     const pollEvents = async () => {
       if (cancelled || eventsInFlight) return;
+      const available = P4_PENDING_EVENT_LIMIT - pendingEvents.length;
+      if (!available) return;
       eventsInFlight = true;
       try {
         const result = await fetchAgentSessionEvents(
@@ -191,6 +246,7 @@ export function useAgentSessionFeed({ agentId, displayEnabled, dismissedSessions
           eventCursor,
           eventStreamId,
           ctl.signal,
+          available,
         );
         if (cancelled) return;
         lastFeedContact = { agentId, at: performance.now() };
@@ -199,6 +255,7 @@ export function useAgentSessionFeed({ agentId, displayEnabled, dismissedSessions
         );
         if (result.reset || streamChanged) {
           pendingEvents.length = 0;
+          if (eventStreamId) snapshotEvents = null;
           // The replacement stream bootstraps active Sessions immediately.
           // Keep the last rendered queue until those events arrive so a
           // bridge restart cannot flash every device card off and back on.
@@ -225,14 +282,17 @@ export function useAgentSessionFeed({ agentId, displayEnabled, dismissedSessions
     const refreshSnapshot = async () => {
       if (cancelled || snapshotInFlight) return;
       snapshotInFlight = true;
+      const concurrentIds = new Set();
+      snapshotEvents = concurrentIds;
       try {
         const nextSessions = await fetchAgentSessions(agentId, ctl.signal);
-        if (!cancelled) {
+        if (!cancelled && snapshotEvents === concurrentIds) {
           lastFeedContact = { agentId, at: performance.now() };
           dispatch({
             type: "replace_snapshot",
             agentId,
             value: nextSessions,
+            concurrentIds,
             nowMs: Date.now(),
             displayEnabled,
             dismissedSessions,
@@ -241,6 +301,7 @@ export function useAgentSessionFeed({ agentId, displayEnabled, dismissedSessions
       } catch {
         // Keep the last confirmed list while event delivery continues.
       } finally {
+        snapshotEvents = null;
         snapshotInFlight = false;
       }
     };
@@ -258,15 +319,14 @@ export function useAgentSessionFeed({ agentId, displayEnabled, dismissedSessions
       }, P4_SESSION_SNAPSHOT_POLL_MS);
     };
 
-    const bootstrap = async () => {
+    void refreshSnapshot().then(() => {
+      if (!cancelled) scheduleSnapshotRefresh();
+    });
+    void pollEvents().then(async () => {
+      // Catch up from the initial cursor, independently of metadata scan time.
       await pollEvents();
-      await refreshSnapshot();
-      await pollEvents();
-      if (cancelled) return;
-      scheduleEventPoll();
-      scheduleSnapshotRefresh();
-    };
-    bootstrap();
+      if (!cancelled) scheduleEventPoll();
+    });
 
     return () => {
       cancelled = true;

@@ -1,5 +1,5 @@
 /** Display-only helpers. Authority and MIOT validation live in the native runtime. */
-export const HOME_STATUSES = { verified: "已核验", accepted: "已受理，状态待确认", completed: "步骤已结束", stopped: "已停止", cancelled: "已取消", interrupted: "应用中断，请确认设备现状；不会自动重放", unconfirmed: "请求结果未确认，请先检查设备现状", running: "执行中" };
+export const HOME_STATUSES = { queued: "等待执行", not_sent: "未发送", verified: "已核验", accepted: "已受理，状态待确认", completed: "步骤已结束", stopped: "已停止", cancelled: "已取消", interrupted: "应用中断，请确认设备现状；不会自动重放", unconfirmed: "请求结果未确认，请先检查设备现状", running: "执行中" };
 export function visibleDevices(devices, home, room, query) {
   const q = query.trim().toLocaleLowerCase();
   return devices.filter(d => (!home || String(d.homeId) === home) && (!room || d.room === room)
@@ -15,8 +15,22 @@ export function stepLabel(step, devices = [], scenes = []) {
   return step.kind === "set" ? `${name} · ${capability} → ${JSON.stringify(step.value)}` : `${name} · ${capability}（${(step.args || []).map(v => JSON.stringify(v)).join("，")}）`;
 }
 export function parsePropertyValue(property, value) {
-  if (property.format === "bool") return value === "true";
+  if (property.format === "bool") {
+    if (["true", "1", true, 1].includes(value)) return true;
+    if (["false", "0", false, 0].includes(value)) return false;
+    throw new Error("请选择开启或关闭");
+  }
   if (property.format === "string") return value;
   if (String(value).trim() === "" || !Number.isFinite(Number(value))) throw new Error("请填写有效数字");
   return Number(value);
+}
+
+// Reconstruct unsent steps after an interruption. Legacy records only have results/inFlight.
+export function executionRows(record) {
+  const rows = [...(record.results || [])];
+  if (record.inFlight) rows.push({ step: record.inFlight, result: { status: "unconfirmed" } });
+  for (const step of (record.steps || []).slice(rows.length)) {
+    rows.push({ step, result: { status: record.status === "running" ? "queued" : "not_sent" } });
+  }
+  return rows;
 }

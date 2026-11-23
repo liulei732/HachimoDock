@@ -7,6 +7,7 @@
 
 import React, { useEffect, useState } from "react";
 import { Monitor, RefreshCw, Usb, Wifi, WifiOff } from "lucide-react";
+import { deviceDisplayId } from "../shell/DeviceContext.pure.js";
 import { useDeviceContext } from "../shell/DeviceContext.jsx";
 import { useToast } from "../shell/ToastStack.jsx";
 
@@ -76,7 +77,7 @@ export default function DeviceStatusBar({ onOpenDeviceSettings }) {
         push({
           tone: "warning",
           title: "未检测到 USB 串口设备",
-          message: "请确认设备端 USB gadget 已启动，或重新插拔线缆后再扫描。",
+          message: "请确认桌宠已开机，使用支持数据传输的 USB 线重新连接后再扫描。",
         });
       }
     } catch (err) {
@@ -97,7 +98,7 @@ export default function DeviceStatusBar({ onOpenDeviceSettings }) {
   const usbOnlyBindingMatch = legacyTransportLabel.match(/^USB\((.+)\)$/);
   const savedUsbPortName = usbOnlyBindingMatch?.[1] || "";
   const usbPortLabel = usb.connected ? usb.portName || savedUsbPortName || "已连接" : "未连接";
-  const connectionLabel = usb.connected ? "已USB连接" : wifi ? "已WIFI连接" : "未连接客户端";
+  const connectionLabel = usb.connected ? "USB 已连接" : wifi ? "Wi-Fi 已连接" : "设备离线";
   const ConnectionIcon = usb.connected ? Usb : wifi ? Wifi : WifiOff;
   return (
     <>
@@ -106,7 +107,7 @@ export default function DeviceStatusBar({ onOpenDeviceSettings }) {
           <Monitor size={18} />
         </span>
         <div className="dashboard-status-bar__copy">
-          <strong className="dashboard-status-bar__board-id">{activeBoardDeviceId}</strong>
+          <strong className="dashboard-status-bar__board-id" title={activeBoardDeviceId}>{deviceDisplayId(activeBoardDeviceId)}</strong>
           <span className="dashboard-status-bar__sub">
             {usb.connected ? `USB: ${usbPortLabel}` : wifi ? "当前 Wi-Fi 配对设备" : "USB: 未连接"}
           </span>

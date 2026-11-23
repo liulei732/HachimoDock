@@ -182,6 +182,22 @@ pub(crate) fn parse_p4_appearance_slot_state(
         .get("activeSlot")
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok());
+    // A partial snapshot cannot authorize erasing the custom slot on a two-slot P4.
+    if payload["builtinProtected"] == true || payload["observationSchema"] == "p4-appearance-quiescent-v1" {
+        let rows = payload["slots"].as_array().ok_or("设备形象槽位回读不完整")?;
+        for index in [P4_BUILTIN_APPEARANCE_SLOT, P4_RAW_APPEARANCE_SLOT] {
+            let mut entries = rows.iter().filter(|row| row["slot"].as_u64() == Some(index.into()));
+            let row = entries.next().ok_or("设备形象槽位回读不完整")?;
+            let explicit_state = match row["valid"].as_bool() {
+                Some(true) => row["packId"].as_str().is_some_and(|id| !id.is_empty()),
+                Some(false) => row["packId"].is_null(),
+                None => false,
+            };
+            if !explicit_state || entries.next().is_some() {
+                return Err("设备形象槽位信息不一致，请重新核对".into());
+            }
+        }
+    }
     let slots = payload
         .get("slots")
         .and_then(Value::as_array)

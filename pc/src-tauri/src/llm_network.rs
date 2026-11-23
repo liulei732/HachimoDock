@@ -193,13 +193,16 @@ pub type CloudSocket = tokio_tungstenite::WebSocketStream<reqwest::Upgraded>;
 /// Callers bound the handshake with their existing timeout; upgraded audio streams
 /// have no whole-response timeout. Validate the RFC 6455 handshake before framing.
 pub async fn connect_websocket(
+    source: &str,
     request: tokio_tungstenite::tungstenite::http::Request<()>,
 ) -> Result<(CloudSocket, reqwest::header::HeaderMap), String> {
-    let client = build_cloud_client(&load()?, None, CloudTransport::WebSocket)?;
-    upgrade_websocket(&client, request).await
+    let client = load().and_then(|s| build_cloud_client(&s,None,CloudTransport::WebSocket))
+        .map_err(|e| format!("{source} [NETWORK] {e}"))?;
+    upgrade_websocket(source, &client, request).await
 }
 
 async fn upgrade_websocket(
+    source: &str,
     client: &reqwest::Client,
     request: tokio_tungstenite::tungstenite::http::Request<()>,
 ) -> Result<(CloudSocket, reqwest::header::HeaderMap), String> {
@@ -210,8 +213,8 @@ async fn upgrade_websocket(
     url.set_scheme(scheme).map_err(|_| "语音服务地址无效")?;
     let key = request.headers().get("sec-websocket-key").ok_or("语音握手缺少校验信息")?;
     let expected = derive_accept_key(key.as_bytes());
-    let response = client.get(url).headers(request.headers().clone()).send().await.map_err(|e| connection_error(&e))?;
-    if response.status().as_u16() != 101 { return Err(format!("语音服务握手失败（HTTP {}）", response.status().as_u16())); }
+    let response = client.get(url).headers(request.headers().clone()).send().await.map_err(|e| crate::model_issue::network(source,&e))?;
+    if response.status().as_u16() != 101 { return Err(crate::model_issue::http(source,response.status().as_u16(),true)); }
     let headers = response.headers().clone();
     let has_token = |name: &str, expected: &str| headers.get_all(name).iter().any(|v| v.to_str().unwrap_or("").split(',').any(|s| s.trim().eq_ignore_ascii_case(expected)));
     if !has_token("connection", "upgrade") || !has_token("upgrade", "websocket")
@@ -219,7 +222,7 @@ async fn upgrade_websocket(
         || headers.contains_key("sec-websocket-extensions") || headers.contains_key("sec-websocket-protocol") {
         return Err("语音服务 WebSocket 握手校验失败".into());
     }
-    let stream = response.upgrade().await.map_err(|e| connection_error(&e))?;
+    let stream = response.upgrade().await.map_err(|e| crate::model_issue::network(source,&e))?;
     Ok((tokio_tungstenite::WebSocketStream::from_raw_socket(stream, Role::Client, None).await, headers))
 }
 
@@ -244,7 +247,8 @@ pub fn client(timeout: Duration) -> Result<reqwest::Client, String> {
 
 pub fn connection_error(error: &reqwest::Error) -> String {
     use std::error::Error;
-    let mut chain = error.to_string();
+    // The top-level Display contains the request URL; it is not a failure cause.
+    let mut chain = String::new();
     let mut cause = error.source();
     while let Some(e) = cause { chain.push_str(&e.to_string()); cause = e.source(); }
     let chain = chain.to_lowercase();
@@ -255,7 +259,7 @@ pub fn connection_error(error: &reqwest::Error) -> String {
     } else if error.is_timeout() {
         "网络连接超时：请确认公司网络允许访问该服务，并检查代理设置"
     } else {
-        "网络连接失败：请在 API 配置 → 云服务网络中测试火山与 DeepSeek 的连接"
+        "网络连接失败，请在模型配置的云服务网络设置中检测对应服务。"
     };
     // Do not expose proxy credentials, internal addresses or certificate details in logs/UI.
     hint.into()
@@ -284,10 +288,13 @@ async fn probe(client: &reqwest::Client, provider: &str, url: &str) -> ProbeResu
 
 async fn probe_services(settings: &Settings) -> Result<Vec<ProbeResult>, String> {
     let client = build_client(settings, Duration::from_secs(15))?;
-    let (ark, deepseek) = tokio::join!(
+    let (ark, deepseek, mimo, speech) = tokio::join!(
         probe(&client, "火山方舟（豆包）", "https://ark.cn-beijing.volces.com/api/v3/models"),
-        probe(&client, "DeepSeek", "https://api.deepseek.com/models"));
-    Ok(vec![ark, deepseek])
+        probe(&client, "DeepSeek", "https://api.deepseek.com/models"),
+        probe(&client, "MiMo", "https://api.xiaomimimo.com/v1/models"),
+        probe(&client, "豆包语音", "https://openspeech.bytedance.com/api/v3/tts/unidirectional"),
+    );
+    Ok(vec![ark, deepseek, mimo, speech])
 }
 
 #[tauri::command]

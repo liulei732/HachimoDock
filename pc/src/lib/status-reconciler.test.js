@@ -8,7 +8,8 @@ test("slow polling is single-flight and cannot replace a newer push", async () =
   const applied = [];
   const read = () => { reads++; return new Promise(done => { resolve = done; }); };
   const pending = gate.poll(read, x => applied.push(x));
-  await gate.poll(read, x => applied.push(x));
+  const concurrent = gate.poll(read, x => applied.push(x));
+  assert.equal(concurrent, pending);
   assert.equal(reads, 1);
   gate.invalidate();
   resolve({ sessionId: "old", active: true });
@@ -33,4 +34,17 @@ test("identical snapshots retain reference; empty final sessions can clear old s
   assert.equal(mergeStatus(current, { active: true, details: { count: 1 } }), current);
   assert.deepEqual(mergeStatus(current, { sessionId: "", active: false }),
     { ...current, sessionId: "", active: false });
+});
+
+test("a replacement pairing can finish before the stale read without losing its result", async () => {
+  const gate = createStatusReconciler();
+  const applied = [];
+  let finishOld;
+  const old = gate.poll(() => new Promise(resolve => { finishOld = resolve; }), x => applied.push(x));
+  gate.invalidate({ replaceTarget: true });
+  const current = gate.poll(async () => "new", x => applied.push(x));
+  finishOld("old");
+  assert.equal(await old, null);
+  assert.equal(await current, "new");
+  assert.deepEqual(applied, ["new"]);
 });

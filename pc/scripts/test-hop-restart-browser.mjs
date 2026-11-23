@@ -1,6 +1,6 @@
 import {chromium} from 'playwright';
 import assert from 'node:assert/strict';
-const browser=await chromium.launch({executablePath:'/Applications/360Chrome.app/Contents/MacOS/360Chrome',headless:true});
+const browser=await chromium.launch({executablePath:process.env.PET_TEST_BROWSER,headless:true});
 try{
   const page=await browser.newPage({viewport:{width:960,height:880}}),errors=[];
   page.on('pageerror',e=>errors.push(e.message));
@@ -20,13 +20,17 @@ try{
   assert.deepEqual(await entities(),frozen,'airborne confirmation freezes motion');
   await screen.getByRole('dialog').getByRole('button',{name:'取消',exact:true}).click();
   await page.waitForTimeout(1500);assert.equal(Number(await screen.locator('[data-entity="puppy"]').getAttribute('data-y')),4);
-  const ones=()=>screen.locator('[data-label="1"]').count();assert.equal(await ones(),2,'score and best both one');
+  const metric = (size, upperBound = Infinity) => screen.locator(`[data-label]:has(> rect[data-text-box][height="${size}"])`).evaluateAll(
+    (labels, maxY) => labels.filter(label => Number(label.querySelector('rect[data-text-box]').getAttribute('y')) < maxY)
+      .map(label => label.getAttribute('data-label')).filter(value => /^\d+$/.test(value)), upperBound);
+  assert.deepEqual(await metric(44), ['1'], 'current score after landing');
+  assert((await metric(24, 60)).includes('1'), 'best score after landing');
   await screen.getByRole('button',{name:'暂停',exact:true}).click();
   await screen.getByRole('button',{name:'重开',exact:true}).click();
   await screen.getByRole('dialog').getByRole('button',{name:'确认',exact:true}).click();
   assert.equal(Number(await screen.locator('[data-entity="puppy"]').getAttribute('data-x')),2);
-  assert.equal(await ones(),1,'restart keeps best, resets current score');
-  assert.equal(await screen.locator('[data-label="0"]').count(),1);
+  assert.deepEqual(await metric(44), ['0'], 'restart resets the current score');
+  assert.deepEqual(await metric(24, 60), ['1'], 'restart retains the best score');
   await screen.screenshot({path:'new-components/qa/hop-restart-ready.png'});
   assert.deepEqual(errors,[]);console.log('PASS first-press board stability; restart button, cancel, airborne modal freeze/resume, paused restart, best retention, no page errors.');
 }finally{await browser.close();}

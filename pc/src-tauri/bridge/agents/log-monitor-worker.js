@@ -9,6 +9,7 @@ if (isMainThread || !parentPort) {
 const definitions = {
   codex: "./codex-log-monitor",
   claude: "./claude-log-monitor",
+  antigravity: "./antigravity-log-monitor",
 };
 const kind = String(workerData?.kind || "");
 const modulePath = definitions[kind];
@@ -17,7 +18,7 @@ if (!modulePath) {
 }
 
 const LogMonitor = require(modulePath);
-const monitor = new LogMonitor({}, (sessionId, state, event, extra) => {
+const monitor = new LogMonitor(workerData?.config ?? {}, (sessionId, state, event, extra) => {
   parentPort.postMessage({
     type: "state",
     sessionId,

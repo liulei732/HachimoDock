@@ -1,6 +1,7 @@
 """Shared bridge admission and real bounded C presentation core; no device/IO."""
 from pathlib import Path
 import json
+import pytest
 import subprocess
 import sys
 
@@ -59,7 +60,8 @@ int main(int argc,char**argv){
     subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-Wno-error=deprecated-declarations','-fsanitize=address,undefined','-I',str(ROOT/'firmware/main'),'-I',str(vendor),str(source),str(vendor/'cJSON.c'),'-lm','-o',str(exe)],check=True)
     subprocess.run([str(exe),str(CONTRACT)],check=True)
 
-def test_real_host_entry_scopes_images_and_parameter_commands_to_one_observation(tmp_path):
+@pytest.mark.parametrize("wifi", [False, True], ids=["usb", "paired-lan"])
+def test_real_host_entry_scopes_images_and_parameter_commands_to_one_observation(tmp_path,wifi):
     (tmp_path/'freertos').mkdir()
     (tmp_path/'mbedtls').mkdir()
     (tmp_path/'freertos/FreeRTOS.h').write_text('typedef int portMUX_TYPE;\n#define portMUX_INITIALIZER_UNLOCKED 0\n#define portENTER_CRITICAL(x) ((void)(x))\n#define portEXIT_CRITICAL(x) ((void)(x))\n')
@@ -101,7 +103,10 @@ int main(void){
  cJSON_Delete(packet);cJSON_Delete(snapshot);return 0;
 }
 '''
+    if wifi:
+        (tmp_path/'pet_p4_lan.h').write_text('bool pet_p4_lan_app_event(uint32_t,const cJSON *);\n')
+        code=code[:code.index('static char emitted[2048]')] + (ROOT/'firmware/tests/p4_lan_app_host_driver.c').read_text()
     source=tmp_path/'host.c';source.write_text(code);exe=tmp_path/'host'
     vendor=ROOT/'firmware/tests/vendor/cjson'
-    subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-Wno-error=deprecated-declarations','-DPET_SERVICE_BRIDGE_ENABLED=1','-fsanitize=address,undefined','-I',str(tmp_path),'-I',str(vendor),'-I',str(ROOT/'firmware/main'),str(source),str(ROOT/'firmware/main/pet_p4_resources.c'),str(ROOT/'firmware/main/pet_p4_resources_device.c'),str(vendor/'cJSON.c'),'-lm','-o',str(exe)],check=True)
+    subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-Wno-error=deprecated-declarations','-DPET_SERVICE_BRIDGE_ENABLED=1',f'-DPET_P4_SYSTEM_WIFI={int(wifi)}','-fsanitize=address,undefined','-I',str(tmp_path),'-I',str(vendor),'-I',str(ROOT/'firmware/main'),str(source),str(ROOT/'firmware/main/pet_p4_resources.c'),str(ROOT/'firmware/main/pet_p4_resources_device.c'),str(vendor/'cJSON.c'),'-lm','-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)

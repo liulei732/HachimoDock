@@ -30,7 +30,7 @@ test("page onboarding is an accessible, dismissible modal with direct actions", 
   assert.match(source, /role="dialog"/);
   assert.match(source, /aria-modal="true"/);
   assert.match(source, /aria-labelledby=\{titleId\}/);
-  assert.match(source, /event\.key === "Escape"/);
+  assert.match(source, /useDialogFocus\(/);
   assert.match(source, /className="page-onboarding-modal__steps"/);
   assert.match(source, /action\.onClick\?\.\(\)/);
   assert.match(source, />\s*知道了\s*</);

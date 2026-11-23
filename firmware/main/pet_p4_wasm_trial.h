@@ -11,6 +11,7 @@ unsigned pet_p4_wasm_package(void *bytes, size_t capacity, size_t *size,
                             unsigned expected, char id[48], bool *radio);
 /* A nonzero result belongs to this exact active component runtime revision. */
 uint32_t pet_p4_wasm_speech_generation(unsigned revision);
+bool pet_p4_wasm_network_policy(unsigned revision, cJSON **policy);
 
 bool pet_p4_wasm_validate_install(const char *id, const uint8_t *module, size_t size,
                                   bool radio, char *error, size_t error_size);

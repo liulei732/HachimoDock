@@ -60,6 +60,15 @@ impl Default for Snapshot {
     }
 }
 impl Snapshot {
+    fn record_playing(&mut self, station: &Station, state: &str, heard: &mut bool) -> bool {
+        if state != "playing" || *heard { return false; }
+        *heard = true;
+        self.history.retain(|entry| entry.id != station.id);
+        self.history.insert(0, station.clone());
+        self.history.truncate(10);
+        true
+    }
+
     /// Favorites first; discovery never silently turns entries into favorites.
     fn queue(&self) -> Vec<Station> {
         let mut queue = Vec::new();
@@ -158,6 +167,15 @@ fn radio_connection_binding(status: &UsbConnectionStatus) -> Result<RadioConnect
         connection: status.connection_id.clone(),
     })
 }
+fn current_radio(usb:&UsbSerialManager,id:&str)->Result<RadioConnectionBinding,String>{
+    if let Some(b)=crate::lan_agent::component_av::radio(id,usb){
+        return Ok(RadioConnectionBinding{scope:owner::Scope::new(b.board(),&b.boot)?,connection:b.radio_key()});
+    }
+    radio_connection_binding(&usb.status())
+}
+fn radio_board(usb:&UsbSerialManager,id:&str)->crate::lan_agent::component_av::Board{
+    crate::lan_agent::component_av::board_status(usb,crate::lan_agent::component_av::radio(id,usb).as_ref())
+}
 fn radio_device_state_for_binding(owner: &owner::Guard, binding: Option<&RadioConnectionBinding>) -> RadioDeviceState {
     let state = RadioDeviceState::default();
     if binding.is_some_and(|binding| owner.ensure_known(&binding.scope).is_err()) {
@@ -178,6 +196,7 @@ struct Service {
     generation: AtomicU64,
     operation: Mutex<()>,
     transport: Mutex<()>,
+    library_writer: Mutex<()>,
     session: Mutex<String>,
     device_state: RadioDeviceState,
     binding: Mutex<Option<RadioConnectionBinding>>,
@@ -268,8 +287,18 @@ impl owner::Storage for OwnerJournal {
     }
 }
 impl Service {
+    fn status_on(&self,board:&str,connection:&str,topic:&str,p:Value)->Result<Value,String>{
+        if connection.starts_with("wifi-") {
+            let b=crate::lan_agent::component_av::radio(&self.id,&self.usb).ok_or("无线电台视图已退出")?;
+            if b.board()!=board || b.radio_key()!=connection {return Err("电台视图已更换".into());}
+            return b.status(&self.usb,topic,p);
+        }
+        let generation=connection.parse::<u64>().map_err(|_|"电台连接代次无效")?;
+        self.usb.media_status_for_connection(board,generation,topic,p)
+    }
+
     fn owner_scope(&self) -> Result<(owner::Scope,String),String> {
-        let current = radio_connection_binding(&self.usb.status())?;
+        let current = current_radio(&self.usb,&self.id)?;
         let mut binding = self.binding.lock().map_err(|_| "电台连接状态不可用")?;
         if binding.as_ref().is_some_and(|prior| prior != &current) {
             return Err("电台连接已变化，未发送旧播放操作".into());
@@ -278,7 +307,7 @@ impl Service {
         Ok((current.scope, current.connection))
     }
     fn binding_changed(&self) -> bool {
-        let Ok(current) = radio_connection_binding(&self.usb.status()) else { return false; };
+        let Ok(current) = current_radio(&self.usb,&self.id) else { return false; };
         self.binding.lock().ok().and_then(|binding| binding.clone())
             .is_some_and(|prior| prior != current)
     }
@@ -306,8 +335,7 @@ impl Service {
         let session=payload["sessionId"].as_str().unwrap_or("");
         self.owner.request_observed(&scope,&self.id,session,operation,|| {
             if self.owner_scope()? != (scope.clone(),connection.clone()) {return Err("电台连接已变化".into());}
-            let generation=connection.parse::<u64>().ok().filter(|v|*v>0).ok_or("电台连接代次无效")?;
-            let ack=self.usb.media_status_for_connection(board,generation,topic,payload.clone())?;
+            let ack=self.status_on(board,&connection,topic,payload.clone())?;
             if self.owner_scope()? != (scope.clone(),connection.clone()) {return Err("电台连接已变化".into());}
             if owner::stopped_rejection(operation,ack["ok"].as_bool(),ack["bufferedMs"].as_u64(),ack["state"].as_str(),ack["sessionId"].as_str()) {
                 crate::realtime_chat_log::record("", "radio_device_stopped", json!({"stage":"correlated_terminal_rejection",
@@ -358,8 +386,7 @@ impl Service {
         if scope.board!=board {return Err("电台连接主体已变化，未核对旧播放".into());}
         let active=self.owner.reconcile_unknown(&scope,&self.id,|old_session| {
             if self.owner_scope()? != (scope.clone(),connection.clone()) {return Err("电台连接已变化".into());}
-            let generation=connection.parse::<u64>().ok().filter(|v|*v>0).ok_or("电台连接代次无效")?;
-            let ack=self.usb.media_status_for_connection(board,generation,"media/query",json!({"sessionId":old_session}))?;
+            let ack=self.status_on(board,&connection,"media/query",json!({"sessionId":old_session}))?;
             if self.owner_scope()? != (scope.clone(),connection.clone()) {return Err("电台连接已变化".into());}
             Ok(owner::RecoveryProof {
                 ok:ack["ok"].as_bool(),buffered_ms:ack["bufferedMs"].as_u64(),
@@ -381,8 +408,7 @@ impl Service {
         let (scope, connection) = self.owner_scope()?;
         if scope.board != board { return Err("电台连接主体已变化，未自动换台".into()); }
         self.owner.observe_idle(&scope, || {
-            let generation = connection.parse::<u64>().map_err(|_| "电台连接代次无效")?;
-            let ack = self.usb.media_request_for_connection(board, generation, "media/query", json!({}))?;
+            let ack = self.status_on(board, &connection, "media/query", json!({}))?;
             if self.owner_scope()? != (scope.clone(), connection.clone()) {
                 return Err("电台连接已变化，未自动换台".into());
             }
@@ -395,7 +421,7 @@ impl Service {
     }
     fn snapshot(&self) -> Value {
         let mut s = self.data.lock().unwrap().clone();
-        let board = self.usb.status();
+        let board = radio_board(&self.usb,&self.id);
         s.connected = board.connected;
         let mut value = json!(s);
         value["queue"] = json!(s.queue());
@@ -406,6 +432,7 @@ impl Service {
         value
     }
     fn save(&self) -> Result<(), String> {
+        let _writer = self.library_writer.lock().unwrap();
         let s = self.data.lock().unwrap().clone();
         std::fs::create_dir_all(&self.dir).map_err(|_| "无法保存电台设置")?;
         let mut file =
@@ -417,7 +444,7 @@ impl Service {
     }
     fn library(&self) -> Result<(), String> {
         self.device_state.ensure_known().map_err(|e|e.to_string())?;
-        let board = self.usb.status();
+        let board = radio_board(&self.usb,&self.id);
         if !board.connected || board.capabilities["widgetMediaSurface"] != "p4-media-surface-v1" {
             return Ok(());
         }
@@ -507,9 +534,9 @@ impl Service {
         let _wire = self.transport.lock().unwrap();
         let id = self.session.lock().unwrap().clone();
         if !id.is_empty() {
-            if self.usb.status().connected {
+            if radio_board(&self.usb,&self.id).connected {
                 let _ = self.device_state.request(|| self.media_stop(
-                    &self.usb.status().board_device_id, json!({"sessionId":id}),
+                    &radio_board(&self.usb,&self.id).board_device_id, json!({"sessionId":id}),
                 ));
             } else {
                 // Disconnect proves no stop receipt, not that this session ended.
@@ -532,7 +559,7 @@ impl Service {
             return;
         }
         let visible=self.visibility.lock().unwrap();
-        if !visible.2 || visible.3.elapsed()>Duration::from_secs(6) || !self.usb.status().connected {return;}
+        if !visible.2 || visible.3.elapsed()>Duration::from_secs(6) || !radio_board(&self.usb,&self.id).connected {return;}
         drop(visible);
         let data=self.data.lock().unwrap().clone();
         if matches!(data.state.as_str(),"playing"|"buffering") {self.pending_auto.store(false,Ordering::SeqCst);return;}
@@ -565,7 +592,7 @@ impl Service {
         if !self.extension.allows_station(&station) {
             return Err("该电台已不在当前组件目录中，请从当前列表重新选择；原收藏和历史仍保留".into());
         }
-        let board = self.usb.status();
+        let board = radio_board(&self.usb,&self.id);
         if !board.connected {
             return Err("请先连接设备".into());
         }
@@ -587,9 +614,6 @@ impl Service {
         {
             let mut s = self.data.lock().unwrap();
             s.current = Some(station.clone());
-            s.history.retain(|t| t.id != station.id);
-            s.history.insert(0, station.clone());
-            s.history.truncate(10);
         }
         if let Err(e) = self.save() {
             self.stop("error", &e);
@@ -607,7 +631,7 @@ impl Service {
             let mut tried=std::collections::HashSet::from([station.id.clone()]);
             let mut ever_played=false;
             let result=run_radio_attempts(|attempt| {
-                if !s.alive(g) || crate::realtime_chat::status().active || !s.usb.status().connected {
+                if !s.alive(g) || crate::realtime_chat::status().active || !radio_board(&s.usb,&s.id).connected {
                     return Err(RadioPlaybackError::Stopped("电台播放已取消或连接已变化".into()));
                 }
                 if attempt > 0 {
@@ -617,7 +641,11 @@ impl Service {
                     if auto_fallback && !ever_played {
                         if let Some(next)=candidates.iter().find(|t|!tried.contains(&t.id)) {
                             station=next.clone();tried.insert(station.id.clone());
-                            s.data.lock().unwrap().current=Some(station.clone());
+                            {
+                                let mut data = s.data.lock().unwrap();
+                                if !s.alive(g) { return Err(RadioPlaybackError::Stopped("播放已取消".into())); }
+                                data.current = Some(station.clone());
+                            }
                             let _=s.save();
                         }
                     }
@@ -631,8 +659,7 @@ impl Service {
                         std::thread::sleep(Duration::from_millis(100));
                     }
                 }
-                let result=s.play(&station,g,&board.board_device_id);
-                ever_played|=s.data.lock().unwrap().state=="playing";
+                let result=s.play(&station,g,&board.board_device_id, &mut ever_played);
                 if let Err(error)=&result {
                     crate::realtime_chat_log::record("", "component_media_retry", json!({
                         "retries":attempt,"errorKind":crate::realtime_chat_log::error_kind(error.message()),
@@ -657,7 +684,7 @@ impl Service {
         });
         Ok(())
     }
-    fn play(self: &Arc<Self>, station: &Station, g: u64, board: &str) -> Result<(), RadioPlaybackError> {
+    fn play(self: &Arc<Self>, station: &Station, g: u64, board: &str, heard: &mut bool) -> Result<(), RadioPlaybackError> {
         self.device_state.ensure_known()?;
         if !self.extension.allows_station(station) {
             return Err("该电台已不在当前组件目录中".into());
@@ -695,10 +722,10 @@ impl Service {
         // Bounded 2.56 s PCM reservoir on both platforms; Mac uses shorter wire frames.
         let (tx, rx) = mpsc::sync_channel::<Result<Vec<u8>, String>>(RADIO_QUEUE_FRAMES);
         let net = self.clone();
-        let station = station.clone();
+        let network_station = station.clone();
         let errors = tx.clone();
         std::thread::spawn(move || {
-            let r = network::feed(&station, input, || net.alive(g));
+            let r = network::feed(&network_station, input, || net.alive(g));
             if let Err(e) = r {
                 let _ = errors.send(Err(e));
             }
@@ -814,7 +841,7 @@ impl Service {
                 if !matches!(state, "playing" | "buffering") {
                     return Err(RadioPlaybackError::Stopped("设备已停止电台播放".into()));
                 }
-                {
+                let history_changed = {
                     let mut s = self.data.lock().unwrap();
                     if !self.alive(g) {
                         break;
@@ -826,6 +853,11 @@ impl Service {
                         "正在缓冲直播"
                     }
                     .into();
+                    s.record_playing(station, state, heard)
+                };
+                drop(_wire);
+                if history_changed && self.save().is_err() {
+                    crate::realtime_chat_log::record("", "component_media_history", json!({"ok":false}));
                 }
                 if last.elapsed() > Duration::from_secs(15) {
                     return Err(RadioPlaybackError::Source("直播缓冲超时，请换台或重试".into()));
@@ -889,7 +921,7 @@ fn create_service_with_owner(
     snapshot.state = "idle".into();
     snapshot.message = if snapshot.automatic {"正在自动准备电台，无需选城"}else{"选择电台后开始收听"}.into();
     snapshot.sleep_minutes = 0;
-    let binding = radio_connection_binding(&usb.status()).ok();
+    let binding = current_radio(&usb,&id).ok();
     let device_state = radio_device_state_for_binding(&owner, binding.as_ref());
     let s = Arc::new(Service {
         source: format!("pc.{id}"),
@@ -903,6 +935,7 @@ fn create_service_with_owner(
         generation: AtomicU64::new(0),
         operation: Mutex::new(()),
         transport: Mutex::new(()),
+        library_writer: Mutex::new(()),
         session: Mutex::new(String::new()),
         device_state,
         binding: Mutex::new(binding),
@@ -936,6 +969,7 @@ pub fn configure(dir: PathBuf, usb: UsbSerialManager) {
     {
         return;
     }
+    crate::lan_agent::component_av::radio_worker(HOST.get().unwrap().usb.clone());
     std::thread::spawn(|| {
         let mut tick = 0u64;
         loop {
@@ -966,7 +1000,7 @@ pub fn configure(dir: PathBuf, usb: UsbSerialManager) {
                     *s.sleep_until.lock().unwrap() = None;
                     s.data.lock().unwrap().sleep_minutes = 0;
                 }
-                if !s.usb.status().connected
+                if !radio_board(&s.usb,&s.id).connected
                     && matches!(
                         s.data.lock().unwrap().state.as_str(),
                         "playing" | "buffering"
@@ -1015,7 +1049,16 @@ pub fn stop_all() {
         }
     });
 }
-pub fn device_event(p: &Value) {
+pub(crate) fn radio_event(b:&crate::lan_agent::component_av::Binding,p:Value){
+    if let Ok(scope)=owner::Scope::new(b.board(),&b.boot){
+        queue_event(&p,Some(RadioConnectionBinding{scope,connection:b.radio_key()}));
+    }
+}
+pub fn device_event(p:&Value){
+    let binding=HOST.get().and_then(|h|radio_connection_binding(&h.usb.status()).ok());
+    queue_event(p,binding)
+}
+fn queue_event(p:&Value,binding:Option<RadioConnectionBinding>) {
     let Some(id) = p["source"].as_str().and_then(|s| s.strip_prefix("pc.")) else {
         return;
     };
@@ -1042,7 +1085,7 @@ pub fn device_event(p: &Value) {
         return;
     }
     // Preserve wire order: an old enter must not overtake a newer physical stop.
-    let Some(event_binding) = HOST.get().and_then(|host| radio_connection_binding(&host.usb.status()).ok()) else {
+    let Some(event_binding) = binding else {
         // Bounded evidence even if visibility heartbeats keep arriving before
         // boot identity is available. Never log device IDs or payload text.
         static LAST:AtomicU64=AtomicU64::new(0);
@@ -1059,10 +1102,10 @@ pub fn device_event(p: &Value) {
     let sender=EVENTS.get_or_init(|| {
         let (tx,rx)=mpsc::sync_channel::<(String,Value,RadioConnectionBinding)>(128);
         std::thread::spawn(move || {for (id,p,event_binding) in rx {
-        if HOST.get().and_then(|host| radio_connection_binding(&host.usb.status()).ok()).as_ref() != Some(&event_binding) { continue; }
+        if HOST.get().and_then(|host| current_radio(&host.usb,&id).ok()).as_ref() != Some(&event_binding) { continue; }
         let current_service = service(&id).ok().filter(|s| !s.binding_changed());
         let result=if p["operation"]=="visibility" && current_service.is_some(){execute_for_binding(&id,p,Some(&event_binding))}else{request_for_binding(id.clone(),p,Some(&event_binding))};
-        if HOST.get().and_then(|host| radio_connection_binding(&host.usb.status()).ok()).as_ref() != Some(&event_binding) { continue; }
+        if HOST.get().and_then(|host| current_radio(&host.usb,&id).ok()).as_ref() != Some(&event_binding) { continue; }
         match result {
             Ok(value) if value["queue"].as_array().is_some_and(|a| a.is_empty()) => device_notice(
                 &id,
@@ -1094,6 +1137,10 @@ pub fn device_event(p: &Value) {
 }
 fn device_notice(id: &str, state: &str, message: &str) {
     let Some(host) = HOST.get() else { return };
+    if let Some(b)=crate::lan_agent::component_av::radio(id,&host.usb){
+        let _=b.request(&host.usb,"media/notice",json!({"source":b.source,"state":state,"message":crate::widget_data::bounded_text(message,120)}));
+        return;
+    }
     let board = host.usb.status();
     if !board.connected || board.capabilities["widgetMediaNotice"] != true {
         return;
@@ -1337,7 +1384,7 @@ fn request_for_binding(id: String, input: Value, expected: Option<&RadioConnecti
     let (version, extension) = resolve(&id)?;
     let host = HOST.get().ok_or("组件服务尚未初始化")?;
     if let Some(expected) = expected {
-        if radio_connection_binding(&host.usb.status())? != *expected {
+        if current_radio(&host.usb,&id)? != *expected {
             return Err("电台连接已变化，未处理旧设备事件".into());
         }
     }
@@ -1485,6 +1532,20 @@ mod tests {
         let after_inventory=usb.query_widget_inventory(&board).unwrap();assert_eq!(inventory["items"].as_array().unwrap().len(),after_inventory["items"].as_array().unwrap().len());
         eprintln!("PASS: production lifecycle, automatic catalogue, auto playback, next, refresh continuity, stopped heartbeat, unchanged component count");
     }
+    #[test]
+    fn history_requires_first_playing_ack_for_the_actual_station() {
+        let mut library = Snapshot::default();
+        library.history = (0..10).map(|n| station(&n.to_string())).collect();
+        let mut heard = false;
+        assert!(!library.record_playing(&station("failed"), "buffering", &mut heard));
+        assert_eq!(library.history[9].id, "9");
+        assert!(library.record_playing(&station("fallback"), "playing", &mut heard));
+        assert!(!library.record_playing(&station("fallback"), "playing", &mut heard));
+        assert_eq!(library.history.len(), 10);
+        assert_eq!(library.history[0].id, "fallback");
+        assert_eq!(library.history[9].id, "8");
+    }
+
     fn station(id: &str) -> Station {
         Station {
             id: id.into(),

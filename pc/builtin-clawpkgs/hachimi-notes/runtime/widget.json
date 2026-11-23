@@ -22,6 +22,10 @@
     },
     {
       "from": "*",
+      "on": "host.delete"
+    },
+    {
+      "from": "*",
       "on": "host.tasks"
     },
     {
@@ -504,6 +508,21 @@
         "icon": "arrow",
         "icon_size": 20,
         "gap": 10
+      },
+      {
+        "type": "button",
+        "x": 252,
+        "y": 392,
+        "w": 122,
+        "h": 48,
+        "color": 65535,
+        "foreground": 8681,
+        "radius": 12,
+        "font_size": 18,
+        "padding": 8,
+        "action": "host.delete",
+        "text": "删除想法",
+        "host_mask": 32
       },
       {
         "type": "button",
@@ -1004,6 +1023,7 @@
     "engine": "p4-input-v1",
     "confirm": {
       "host.todo": "将当前想法加入待办？重复操作不会重复创建。",
+      "host.delete": "删除当前这条已保存的想法？已关联的待办会保留。",
       "host.toggle": "确认切换这条事项的完成状态？可以撤销。"
     }
   },

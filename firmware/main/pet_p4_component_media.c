@@ -321,13 +321,18 @@ static bool budget_scan_current(uint64_t epoch, int64_t deadline, unsigned step)
 #endif
 }
 
-static bool media_budget_name(const char *name) {
-  // p4m00-0-s0.bin; count both published and spare/temporary generations.
+static bool media_name_shape(const char *name) {
+  // p4m00-0-s0.bin, including the legacy higher clip and big-image indices.
   if (strlen(name) != 14 || memcmp(name, "p4m", 3)
       || name[3] < '0' || name[3] > '9' || name[4] < '0' || name[4] > '9'
       || name[5] != '-' || (name[6] != '0' && name[6] != '1') || name[7] != '-'
       || name[9] < '0' || name[9] > '9'
       || (strcmp(name + 10, ".bin") && strcmp(name + 10, ".tmp"))) return false;
+  return true;
+}
+
+static bool media_budget_name(const char *name) {
+  if (!media_name_shape(name)) return false;
   const unsigned slot = (unsigned)(name[3] - '0') * 10 + (unsigned)(name[4] - '0');
   const unsigned index = (unsigned)(name[9] - '0');
   return slot < PET_CEV_COMPONENTS && ((name[8] == 's' && index < PET_SAMPLE_MAX_SLOTS)
@@ -458,23 +463,85 @@ static bool persist_locked(size_t slot, uint8_t generation, const pet_cext_runti
 #endif
   return true;
 }
+/* Two generations, three kinds with the historical four indices, and one
+ * speech bank. Exact names only. Keep the mask local to the storage transaction
+ * and media lock. No absence survives publish, reinstall or reboot. */
+static uint64_t media_remove_bit(const char *name, size_t slot) {
+  if (!media_name_shape(name)) return 0;
+  size_t file_slot = (unsigned)(name[3] - '0') * 10 + (unsigned)(name[4] - '0');
+  if (file_slot != slot) return 0;
+  const char *kinds = "scba";
+  const char *kind = strchr(kinds, name[8]);
+  unsigned index = (unsigned)(name[9] - '0');
+  if (!kind || index >= PET_SAMPLE_MAX_SLOTS || (*kind == 'a' && index != 0)) return 0;
+  enum { per_generation = 2 * (3 * PET_SAMPLE_MAX_SLOTS + 1) };
+  _Static_assert(2 * per_generation <= 64, "media removal bitmap");
+  unsigned item = (unsigned)(kind - kinds) * PET_SAMPLE_MAX_SLOTS + index;
+  unsigned bit = (unsigned)(name[6] - '0') * per_generation + 2 * item + (name[11] == 't');
+  return UINT64_C(1) << bit;
+}
+
+static uint64_t media_remove_snapshot(size_t slot) {
+  uint64_t epoch = 0;
+  int64_t deadline = 0;
+#ifdef ESP_PLATFORM
+  deadline = esp_timer_get_time() + CMEDIA_BUDGET_SCAN_US;
+  if (!pet_fs_activity_idle_epoch(&epoch)) return UINT64_MAX;
+#endif
+  /* Shared SPIFFS errno can report a stale error at EOF. Allow one fresh
+   * read after an error, under the same epoch and deadline as the first. */
+  for (unsigned attempt = 0; attempt < 2; ++attempt) {
+    if (!budget_scan_current(epoch, deadline, 0)) break;
+    DIR *dir = opendir("/spiffs");
+    if (!dir) break;
+    uint64_t present = 0;
+    bool complete = false, read_error = false;
+    for (unsigned i = 0; i <= PET_FILE_CLEANUP_MAX_ENTRIES && budget_scan_current(epoch, deadline, i); ++i) {
+      errno = 0;
+      const struct dirent *entry = readdir(dir);
+      if (!entry) {
+        read_error = errno != 0;
+        complete = !read_error;
+        break;
+      }
+      if (i == PET_FILE_CLEANUP_MAX_ENTRIES || !memchr(entry->d_name, 0, sizeof(entry->d_name))) break;
+      uint64_t bit = media_remove_bit(entry->d_name, slot);
+      if (present & bit) break;
+      present |= bit;
+    }
+    if (closedir(dir) != 0 || !budget_scan_current(epoch, deadline, 0)) break;
+    if (complete) return present;
+    if (!read_error) break;
+  }
+  return UINT64_MAX;
+}
+
+static void unlink_media_candidate(const char *path, size_t slot, uint64_t present) {
+  /* If the formatter ever grows a new layout, retain the original unlink. */
+  const char *name = strrchr(path, '/');
+  uint64_t bit = name ? media_remove_bit(name + 1, slot) : 0;
+  if (!bit || (present & bit)) (void)unlink(path);
+}
 void pet_cmedia_remove(size_t slot) {
   if (slot >= PET_CEV_COMPONENTS) return;
   lock();
   if (g_pending.serial) { unlock(); return; }
+  const uint64_t present = media_remove_snapshot(slot);
   char path[32];
   for (uint8_t generation = 0; generation < 2; generation++)
     for (pet_cext_media_kind_t kind = PET_CEXT_MEDIA_SAMPLE; kind <= PET_CEXT_MEDIA_BIG; kind++)
       for (unsigned i = 0; i < PET_SAMPLE_MAX_SLOTS; i++) {
-        media_path(slot, generation, kind, i, false, path, sizeof(path)); unlink(path);
-        media_path(slot, generation, kind, i, true, path, sizeof(path)); unlink(path);
+        media_path(slot, generation, kind, i, false, path, sizeof(path));
+        unlink_media_candidate(path, slot, present);
+        media_path(slot, generation, kind, i, true, path, sizeof(path));
+        unlink_media_candidate(path, slot, present);
       }
 #if PET_P4_WASM_AUDIO
   for (uint8_t generation = 0; generation < 2; ++generation) {
     speech_path(slot, generation, false, path);
-    unlink(path);
+    unlink_media_candidate(path, slot, present);
     speech_path(slot, generation, true, path);
-    unlink(path);
+    unlink_media_candidate(path, slot, present);
   }
 #endif
   unlock();

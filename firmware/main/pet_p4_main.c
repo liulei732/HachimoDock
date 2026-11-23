@@ -27,6 +27,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_spiffs.h"
+#include "pet_p4_shared_font.h"
 #include "esp_timer.h"
 #include "esp_random.h"
 #include "cJSON.h"
@@ -169,6 +170,8 @@ typedef struct {
   uint64_t cursor_token;
 #if PET_P4_SYSTEM_WIFI
   uint32_t lan_control;
+  void *community_job;
+  uint32_t settings_av;
 #endif
 #if PET_P4_HELLO_ASYNC
   bool unsolicited_hello;
@@ -1443,6 +1446,10 @@ static void run_catalog_cursor(uint64_t token) {
 
 static void run_component_activation(uint64_t token) {
   xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+#if PET_P4_GAP_PEAK_HOLDER
+  g_worker_locked_topic_hash = pet_topic_hash("component/activation", sizeof("component/activation")-1);
+  worker_locked_begin();
+#endif
   pet_p4_miniapp_activation_guard(!strcmp(g_state.screen_page, "components")
     && !pet_p4_conversation_active(&g_state) && !g_state.asset_transfer_active
     && !pet_p4_ota_transfer_active());
@@ -1465,6 +1472,10 @@ static void run_component_activation(uint64_t token) {
     configASSERT(left);
     (void)left;
   } else (void)pet_p4_miniapp_activation_reject_not_started(token);
+#if PET_P4_GAP_PEAK_HOLDER
+  worker_locked_end();
+  g_worker_locked_topic_hash = 0;
+#endif
   xSemaphoreGive(g_state_mutex);
   if (result == PET_MINIAPP_ACTIVATION_FAILED)
     ESP_LOGW(TAG, "component activation failed; previous runtime preserved");
@@ -1564,7 +1575,23 @@ bool pet_p4_protocol_query_timing(pet_p4_query_timing_t *out) {
 static bool volume_worker_idle(void) {
   return uxQueueMessagesWaiting(g_protocol_queue)==0 && pet_p4_audio_master_idle();
 }
+#if PET_P4_SYSTEM_WIFI
+/* Under the state mutex, on the protocol worker. A periodic check also observes
+ * commits that finished after the on-board Save receipt, without I2C polling. */
+static void settings_volume_receipt(void) {
+  int saved, pending;
+  bool failed;
+  pet_audio_volume_storage_state(&saved, &pending, &failed);
+  pet_settings_av_disk(saved, pending, failed);
+}
+#endif
 static void volume_worker_idle_commit(void) {
+#if PET_P4_SYSTEM_WIFI
+  if (xSemaphoreTake(g_state_mutex, 0) == pdTRUE) {
+    settings_volume_receipt();
+    xSemaphoreGive(g_state_mutex);
+  }
+#endif
   if (!pet_audio_volume_pending() || !volume_worker_idle()
       || xSemaphoreTake(g_state_mutex,0)!=pdTRUE) return;
   bool idle=!g_state.asset_transfer_active && !pet_p4_ota_transfer_active()
@@ -1594,18 +1621,52 @@ static void volume_worker_lan(void) {
 }
 #endif
 
-#if PET_P4_SYSTEM_WIFI
 bool pet_p4_lan_trust_wired(pet_p4_send_line_fn send, void *route) {
   if (send == pet_p4_native_usb_send_json_line) return pet_p4_native_usb_route_current(route);
   return send == transport_send_line && (route == &g_usb_serial_jtag_route || route == &g_uart_route);
 }
 
+#if PET_P4_SYSTEM_WIFI
 bool pet_p4_lan_schedule_control(uint32_t token) {
   const pet_p4_protocol_request_t request = {.lan_control = token};
   return g_protocol_queue && xQueueSend(g_protocol_queue, &request, 0) == pdTRUE;
 }
 
-static void run_lan_control(uint32_t token) {
+bool pet_settings_av_queue(uint32_t ticket) {
+  const pet_p4_protocol_request_t request={.settings_av=ticket};
+  return g_protocol_queue && xQueueSend(g_protocol_queue,&request,0)==pdTRUE;
+}
+
+static void settings_av_worker(uint32_t ticket) {
+  int volume=-1, brightness=-1;
+  xSemaphoreTake(g_state_mutex,portMAX_DELAY);
+  bool active=pet_settings_active(&g_state) && pet_settings_av_claim(ticket,&volume,&brightness);
+  bool admitted=active && !g_state.asset_transfer_active && !g_state.approval_active &&
+      !pet_p4_ota_transfer_active() && !pet_p4_diagnostics_reboot_pending() &&
+      !pet_p4_miniapp_storage_busy() && !pet_p4_conversation_active(&g_state);
+  xSemaphoreGive(g_state_mutex);
+  if (!active) return;
+  pet_audio_volume_status_t result={.volume=-1};
+  bool ok=admitted;
+  if (admitted && pet_p4_audio_playback_ready() && pet_p4_audio_master_idle()) {
+    esp_err_t err=volume<0 ? pet_audio_volume_get(&result) :
+      pet_audio_volume_set((unsigned)volume,(uint64_t)esp_timer_get_time()/1000,&result);
+    if (volume>=0 && (err!=ESP_OK || !result.confirmed)) ok=false;
+  } else if (volume>=0) ok=false;
+  const bool brightness_saved = admitted && brightness>=0 && pet_p4_lcd_save_brightness(brightness);
+  if (brightness>=0 && !brightness_saved) ok=false;
+  xSemaphoreTake(g_state_mutex,portMAX_DELAY);
+  pet_settings_av_finish(ticket,result.confirmed?result.volume:-1,pet_p4_lcd_brightness(),ok,brightness_saved);
+  settings_volume_receipt();
+  xSemaphoreGive(g_state_mutex);
+}
+
+bool pet_community_schedule(void *job) {
+  const pet_p4_protocol_request_t request={.community_job=job};
+  return g_protocol_queue && xQueueSend(g_protocol_queue,&request,0)==pdTRUE;
+}
+
+static void run_wireless_control(uint32_t token, void *community_job) {
   xSemaphoreTake(g_state_mutex, portMAX_DELAY);
 #if PET_P4_GAP_PEAK_HOLDER
   g_worker_locked_topic_hash = pet_topic_hash("lan/control", sizeof("lan/control") - 1);
@@ -1613,10 +1674,12 @@ static void run_lan_control(uint32_t token) {
 #endif
   const bool storage = pet_p4_miniapp_storage_lane_enter();
   g_protocol_storage_command_entered = storage;
-  pet_p4_lan_control_run(&g_state, token, storage &&
+  const bool admitted=storage &&
     !pet_p4_diagnostics_reboot_pending() && !pet_p4_ota_active() &&
     !g_state.approval_active && !pet_p4_conversation_active(&g_state) &&
-    pet_p4_audio_master_idle());
+    pet_p4_audio_master_idle();
+  if (community_job) pet_community_run(community_job,admitted && !g_state.asset_transfer_active && pet_settings_active(&g_state));
+  else pet_p4_lan_control_run(&g_state, token, admitted);
   if (storage) {
     const bool released = pet_p4_miniapp_storage_lane_leave();
     configASSERT(released);
@@ -1645,19 +1708,56 @@ static void protocol_worker_task(void *arg) {
   configASSERT(io_registered);(void)io_registered;
 #endif
   pet_p4_protocol_request_t request;
+  const TickType_t volume_period = pdMS_TO_TICKS(1000);
+  TickType_t last_volume_check = xTaskGetTickCount();
   while (true) {
     pet_p4_program_main_probe_reply();
     /* Only wake for snapshot expiry while a pull snapshot actually exists. */
     TickType_t wait=pet_p4_program_main_probe_pending()?pdMS_TO_TICKS(20)
       :g_screenshot.raw?pdMS_TO_TICKS(100):portMAX_DELAY;
-    if (pet_audio_volume_pending() && wait>pdMS_TO_TICKS(1000)) wait=pdMS_TO_TICKS(1000);
-    if(wait>pdMS_TO_TICKS(1000))wait=pdMS_TO_TICKS(1000);
-    asset_idle_worker();
-    if (xQueueReceive(g_protocol_queue, &request, wait) != pdTRUE){
+    /* Keep the deadline across dequeues, including fast-path requests. Only
+     * inspect audio, state and resource gates once per period, even if busy. */
+    TickType_t now = xTaskGetTickCount();
+    TickType_t elapsed = (TickType_t)(now - last_volume_check);
+    if (elapsed >= volume_period) {
+      last_volume_check = now;
 #if PET_P4_SYSTEM_WIFI
       volume_worker_lan();
 #endif
-      screenshot_poll();volume_worker_idle_commit();continue;
+      volume_worker_idle_commit();
+      elapsed = 0;
+    }
+    TickType_t until_volume = volume_period - elapsed;
+    if (wait > until_volume) wait = until_volume;
+    asset_idle_worker();
+#if PET_P4_EVENTS
+    /* Heartbeats can arrive more often than the queue timeout. Admit one
+     * pending slice between requests when the audio and protocol lanes idle. */
+    static uint64_t alarm_check_after;
+    if (pet_local_alarm_work()) {
+      uint64_t now = esp_timer_get_time()/1000ULL;
+      if (now >= alarm_check_after && volume_worker_idle() && xSemaphoreTake(g_state_mutex,0)==pdTRUE) {
+#if PET_P4_GAP_PEAK_HOLDER
+        g_worker_locked_topic_hash = pet_topic_hash("local/alarm", sizeof("local/alarm")-1);
+        worker_locked_begin();
+#endif
+        alarm_check_after = now + 1000;
+        if (!g_state.asset_transfer_active && !pet_p4_ota_active() && !g_state.approval_active &&
+            !pet_p4_conversation_active(&g_state) && pet_p4_miniapp_storage_lane_enter()) {
+          pet_local_alarm_run();
+          bool left = pet_p4_miniapp_storage_lane_leave();
+          configASSERT(left); (void)left;
+        }
+#if PET_P4_GAP_PEAK_HOLDER
+        worker_locked_end();
+        g_worker_locked_topic_hash = 0;
+#endif
+        xSemaphoreGive(g_state_mutex);
+      }
+    }
+#endif
+    if (xQueueReceive(g_protocol_queue, &request, wait) != pdTRUE){
+      screenshot_poll();continue;
     }
     screenshot_poll();
 #if PET_P4_HELLO_ASYNC
@@ -1674,8 +1774,9 @@ static void protocol_worker_task(void *arg) {
     }
 #endif
 #if PET_P4_SYSTEM_WIFI
-    if (request.lan_control) {
-      run_lan_control(request.lan_control);
+    if (request.settings_av) { settings_av_worker(request.settings_av); continue; }
+    if (request.lan_control || request.community_job) {
+      run_wireless_control(request.lan_control,request.community_job);
       continue;
     }
 #endif
@@ -1753,6 +1854,8 @@ static void protocol_worker_task(void *arg) {
 #else
       pet_p4_handle_line(&g_state, request.line, request.send_line, request.reply_ctx);
 #endif
+      if (strcmp(g_state.screen_page, "app") || g_state.approval_active || pet_p4_conversation_active(&g_state)
+          || g_state.asset_transfer_active || pet_p4_ota_transfer_active()) pet_p4_miniapp_hardware_guard(false);
       pet_p4_miniapp_activation_guard(!strcmp(g_state.screen_page, "components")
         && !pet_p4_conversation_active(&g_state) && !g_state.asset_transfer_active
         && !pet_p4_ota_transfer_active());
@@ -2216,8 +2319,12 @@ void app_main(void) {
   ESP_ERROR_CHECK(pet_p4_system_cues_init()?ESP_OK:ESP_ERR_INVALID_STATE);
   ESP_ERROR_CHECK(pet_p4_input_init());
   esp_err_t lcd_err = pet_p4_lcd_init();
-  esp_err_t touch_err = lcd_err == ESP_OK ? pet_p4_touch_init() : ESP_ERR_INVALID_STATE;
-  if (touch_err != ESP_OK) {
+  bool touch_expected = true;
+#if BSP_LCD_PANEL_AUTO
+  touch_expected = !pet_p4_lcd_no_touch_profile();
+#endif
+  esp_err_t touch_err = lcd_err == ESP_OK && touch_expected ? pet_p4_touch_init() : ESP_ERR_INVALID_STATE;
+  if (touch_expected && touch_err != ESP_OK) {
     ESP_LOGW(TAG, "P4 touchscreen unavailable, keeping buttons and display alive: %s",
              esp_err_to_name(touch_err));
   }
@@ -2251,6 +2358,8 @@ void app_main(void) {
   } else {
     ESP_LOGW(TAG, "LCD init failed, keep USB runtime alive: %s", esp_err_to_name(lcd_err));
   }
+  if (storage_err == ESP_OK) pet_shared_font_load();
+  pet_p4_font_boot_done();
 #if !PET_P4_HELLO_ASYNC
   (void) pet_p4_lcd_scan_i2c(i2c_devices, sizeof(i2c_devices));
 #endif
@@ -2268,6 +2377,9 @@ void app_main(void) {
   // Show the home screen before verifying the installed component packages.
   // Keep command and input processing gated on catalog recovery and seeding.
   boot_catalog_with_animation(runtime_render_healthy, &last_render_ms);
+#if PET_P4_EVENTS
+  pet_local_alarm_boot();
+#endif
   pet_p4_renderer_finish_boot();
   ESP_ERROR_CHECK(pet_p4_miniapp_storage_lane_configure(storage_command_unlock,
     storage_command_lock, storage_command_owner, NULL) ? ESP_OK : ESP_ERR_INVALID_STATE);
@@ -2367,6 +2479,7 @@ void app_main(void) {
     int64_t loop_wait_started_us = pet_p4_gap_clock_us();
 #endif
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    pet_p4_font_delivery_expire();
 #if PET_P4_GAP_PEAK_CONTEXT
     int64_t loop_held_started_us = pet_p4_gap_clock_us();
     uint32_t loop_wait_us = (uint32_t)(loop_held_started_us - loop_wait_started_us);
@@ -2393,8 +2506,6 @@ void app_main(void) {
     int64_t loop_miniapp_started_us = pet_p4_gap_clock_us();
 #endif
     pet_p4_miniapp_process(now_ms,!strcmp(g_state.screen_page,"app")&&!pet_p4_conversation_active(&g_state));
-    pet_p4_miniapp_host_process(now_ms,!strcmp(g_state.screen_page,"app")&&!pet_p4_conversation_active(&g_state),
-        pet_p4_state_host_connected(&g_state,now_ms));
     pet_p4_wasm_trial_tick(!strcmp(g_state.screen_page,"app")&&!pet_p4_conversation_active(&g_state));
 #if PET_P4_GAP_PEAK_CONTEXT
     uint32_t loop_miniapp_us = (uint32_t)(pet_p4_gap_clock_us() - loop_miniapp_started_us);
@@ -2403,12 +2514,24 @@ void app_main(void) {
     pet_reset_phase_leave(&program_phase);
 #endif
     pet_p4_state_process(&g_state, now_ms);
+    pet_p4_audio_feedback_sync(&g_state, now_ms);
 #if PET_P4_SYSTEM_WIFI
     pet_settings_maintain(&g_state, pet_p4_conversation_active(&g_state));
     pet_p4_lan_process(&g_state, now_ms);
 #endif
     pet_p4_touch_process(&g_state, transport_send_line, NULL);
     pet_p4_input_process(&g_state, transport_send_line, NULL);
+    pet_p4_miniapp_hardware_guard(!strcmp(g_state.screen_page, "app") && !g_state.approval_active
+      && !pet_p4_conversation_active(&g_state) && !g_state.asset_transfer_active
+      && !pet_p4_ota_transfer_active());
+#if PET_P4_GAP_PEAK_CONTEXT
+    int64_t loop_host_started_us = pet_p4_gap_clock_us();
+#endif
+    pet_p4_miniapp_host_process(now_ms,!strcmp(g_state.screen_page,"app")&&!pet_p4_conversation_active(&g_state),
+        pet_p4_state_host_connected(&g_state,now_ms));
+#if PET_P4_GAP_PEAK_CONTEXT
+    loop_miniapp_us += (uint32_t)(pet_p4_gap_clock_us() - loop_host_started_us);
+#endif
     pet_p4_miniapp_activation_guard(!strcmp(g_state.screen_page, "components")
       && !pet_p4_conversation_active(&g_state) && !g_state.asset_transfer_active
       && !pet_p4_ota_transfer_active());
@@ -2531,7 +2654,15 @@ void app_main(void) {
         && now_ms - last_render_ms >= ((!strcmp(g_state.screen_page,"app") && (pet_p4_miniapp_slicing_active() || pet_p4_miniapp_media_surface_animated())) || !strcmp(g_state.screen_page, "touch_test")
           ? 33ULL : PET_P4_MAIN_RENDER_INTERVAL_MS)) {
       memcpy(g_render_state, &g_state, sizeof(*g_render_state));
+      bool test_notice = pet_p4_test_message_visible(&g_state, now_ms);
+      if (test_notice) g_render_state->session_queue_count = 0;
       pet_p4_build_view_model(g_render_state, &render_view);
+      if (test_notice) {
+        render_view.title = "";
+        render_view.body = "hello from pet-manager";
+        render_view.show_bubble = true;
+        render_view.compact_bubble = false;
+      }
       render_view.component_loading = pet_p4_miniapp_activation_pending();
 #if PET_P4_SYSTEM_WIFI
       if (!strcmp(render_view.page, PET_SETTINGS_PAGE)) {
@@ -2619,7 +2750,16 @@ void app_main(void) {
       esp_err_t err;
       xSemaphoreTake(g_render_mutex, portMAX_DELAY);
       err = pet_p4_renderer_render(g_render_state, &render_view, now_ms);
+      bool draft_drawn = err == ESP_OK && pet_p4_renderer_voice_draft_drawn();
       xSemaphoreGive(g_render_mutex);
+      if (draft_drawn && !g_render_state->voice_feedback.presented_ms) {
+        xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+        if (g_state.voice_feedback.phase == PET_VOICE_DRAFT
+            && g_state.voice_feedback.token == g_render_state->voice_feedback.token
+            && !strcmp(g_state.screen_page, "main") && !g_state.approval_active)
+          g_state.voice_feedback.presented_ms = (uint64_t)esp_timer_get_time() / 1000;
+        xSemaphoreGive(g_state_mutex);
+      }
       if (err != ESP_OK) {
         ESP_LOGW(TAG, "render failed: %s", esp_err_to_name(err));
         runtime_render_healthy = false;

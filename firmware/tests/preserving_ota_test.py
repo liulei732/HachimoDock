@@ -78,8 +78,8 @@ def test_lost_commit_never_repeats_or_aborts(tmp_path):
     assert 'firmware/abort' not in link.calls
 
 
-@pytest.mark.parametrize('same_version', [False, True])
-def test_catalog_migration_failure_keeps_observation_without_reflashing(tmp_path, monkeypatch, same_version):
+@pytest.mark.parametrize('same_version,lost_ack', [(False, False), (True, False), (True, True)])
+def test_catalog_migration_failure_keeps_observation_without_reflashing(tmp_path, monkeypatch, same_version, lost_ack):
     target_elf = 'bb' * 32
     raw = image()[:176] + bytes.fromhex(target_elf) + image()[208:]
     path=tmp_path/'app.bin';path.write_bytes(raw)
@@ -100,6 +100,8 @@ def test_catalog_migration_failure_keeps_observation_without_reflashing(tmp_path
                                'chipRevision':302,'imageState':'valid','runningPartition':'ota_1' if new_boot else 'ota_0'},
                     'storage':{'activeAppearanceSlot':1},
                     'memory':{k:100 for k in ('freeInternalBytes','minimumFreeInternalBytes','largestInternalBlockBytes','freeDmaBytes','freePsramBytes')}}
+            if lost_ack and topic == 'firmware/commit':
+                raise TimeoutError(topic)
             if topic == 'debug/identity':
                 new_boot = self.diags > 2
                 return {'engine':'p4-evidence-identity-v1','boardDeviceId':'b','bootId':'new' if new_boot else 'old',
@@ -117,6 +119,8 @@ def test_catalog_migration_failure_keeps_observation_without_reflashing(tmp_path
     link=Fake();saved={}
     with pytest.raises(RuntimeError,match='Component catalog changed'):
         ota.upgrade(link,opts,lambda key,value:saved.__setitem__(key,value))
+    if lost_ack:
+        assert 'commit' not in saved and saved['commit_observed']['appElfSha256'] == target_elf
     assert saved['before']['activeAppearanceSlot']==1
     assert saved['after_observed']['componentIds']==['original','new-builtin']
     assert saved['after_observed']['activeAppearanceSlot']==1

@@ -103,6 +103,17 @@ static void test_clock(void) {
   pet_wifi_clock_load_offset();
   assert(pet_wifi_clock_read(time_ms + 1000, &utc, &offset, &age));
   assert(utc == 1794384061500ULL && age == 61500 && offset == -300);
+  /* A new AP connection creates a new SNTP callback. Its first fresh sample
+   * replaces the retained estimate without requiring a desktop heartbeat. */
+  pet_wifi_clock_service(false);
+  assert(!sync_callback);
+  pet_wifi_clock_service(true);
+  assert(sync_callback);
+  struct timeval reconnected = {.tv_sec = synced.tv_sec + 300};
+  sync_callback(&reconnected);
+  assert(pet_wifi_clock_read(time_ms, &utc, &offset, &age));
+  assert(utc == (uint64_t)reconnected.tv_sec * 1000 && age == 0 && offset == -300);
+  pet_wifi_clock_service(false);
 }
 
 static void test_cache(void) {

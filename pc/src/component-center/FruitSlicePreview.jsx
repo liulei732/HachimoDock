@@ -131,6 +131,6 @@ export default function FruitSlicePreview({scene,sprites=[],active=true,interact
   return <div className="fruit-slice-preview" onClick={interactive?e=>e.stopPropagation():undefined}>
     <canvas ref={canvas} width="640" height="480" aria-label="鲜果一刀触屏游戏预览" style={{touchAction:interactive?'none':'auto'}} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up} onLostPointerCapture={up}/>
     {error&&<p role="alert">{error}</p>}
-    {interactive&&<div className="fruit-slice-controls"><button type="button" disabled={!ready} onClick={()=>action('start')}>开始 / 重开</button><button type="button" disabled={!ready} onClick={()=>action('pause')}>模式 / 暂停 / 继续</button><span>点选模式 · 鼠标拖动或触屏划切</span></div>}
+    {interactive&&<div className="fruit-slice-controls"><button type="button" disabled={!ready} onClick={()=>action('start')}>开始 / 继续 / 再玩</button><button type="button" disabled={!ready} onClick={()=>action('pause')}>模式 / 暂停 / 继续</button><span>点选模式 · 鼠标拖动或触屏划切</span></div>}
   </div>;
 }

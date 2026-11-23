@@ -136,7 +136,7 @@ export async function processImageForPipeline(imageBlob, options = {}) {
       // Moderation is not a transport failure: never silently bypass it via
       // the legacy original-image fallback or suggest repeating a paid call.
       if (rejection) throw new Error(`${rejection.message}\n原始错误：${backgroundWarning}`, { cause: error });
-      if (!allowOriginalFallback) throw new Error(`参考图处理失败，已停止后续生成。可重试处理，或关闭背景处理后明确使用原图。${backgroundWarning}`);
+      if (!allowOriginalFallback) throw new Error(`参考图处理失败，已停止后续生成。可重试处理，或关闭背景处理后明确使用原图。${backgroundWarning}`, { cause: error });
       console.warn("[avatar-pipeline] Ark background edit failed; using original image:", error);
       onProgress?.("cloud_fallback", undefined, backgroundWarning);
     }

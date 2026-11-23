@@ -1,0 +1,7 @@
+{
+  "title": "配件温度",
+  "description": "在设备上逐次允许读取指定传感器的摄氏温度。",
+  "author": "PetUI",
+  "category": "tool",
+  "license": "HachimoDock Project License"
+}

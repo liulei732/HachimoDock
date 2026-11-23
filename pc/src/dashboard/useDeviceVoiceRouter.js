@@ -5,6 +5,7 @@
  * [Sync] If this file changes, update `pc/src/dashboard/.folder.md` and `pc/src/.folder.md`.
  */
 
+import { speechModelMessage } from "../lib/realtime-feedback.js";
 import { useEffect, useReducer, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 
@@ -360,7 +361,7 @@ export function transcriptMessage(payload, phase, composerMode) {
     return "已尝试提交，发送结果未确认；请核对目标对话，避免重复发送。";
   }
   if (phase === "error") {
-    return normalizeText(payload.error) || "设备语音处理失败。";
+    return (payload.failureDomain === "delivery" ? normalizeText(payload.error) : speechModelMessage(payload.error)) || "设备语音处理失败。";
   }
   return "";
 }
@@ -378,7 +379,8 @@ function audioActivity(payload) {
   if (phase === "cancelled") {
     message = normalizeText(payload.error) || "设备录音已取消。";
   } else if (!ok) {
-    message = `板端录音处理失败：${normalizeText(payload.error) || "音频流校验失败"}`;
+    const detail = speechModelMessage(payload.error);
+    message = detail && detail !== payload.error ? detail : `板端录音处理失败：${detail || "音频流校验失败"}`;
   } else if (phase === "begin") {
     message = `设备麦克风录音中，音频正通过 ${payload.transport === "wifi" ? "Wi-Fi" : "USB"} 转发...`;
   } else if (phase === "streaming") {
@@ -518,7 +520,7 @@ export function useDeviceVoiceRouter({ onAudioActivity } = {}) {
             staleCapture: payload.staleCapture === true, terminalAlreadyReported: payload.terminalAlreadyReported === true });
         } else if (payload.ok === false || payload.phase === "cancelled") {
           dispatch({ ...meta, type: "transcript", phase: payload.phase === "cancelled" ? "cancelled" : "error",
-            ok: false, message: normalizeText(payload.error) || "音频流处理失败",
+            ok: false, message: speechModelMessage(payload.error) || "音频流处理失败",
             staleCapture: payload.staleCapture === true, terminalAlreadyReported: payload.terminalAlreadyReported === true });
         }
         const activity = audioActivityGateRef.current(payload);

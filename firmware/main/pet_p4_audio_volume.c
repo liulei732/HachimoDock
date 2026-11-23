@@ -21,7 +21,7 @@ static i2c_master_dev_handle_t readback;
 static uint8_t level_regs[101];
 /* Init owns this until ready release; then the single protocol worker owns it. */
 static unsigned boot_volume = MASTER_DEFAULT_VOLUME, durable_volume, dirty_volume;
-static bool boot_loaded, durable_known, dirty, attempted;
+static bool boot_loaded, durable_known, dirty, attempted, dirty_save_failed;
 static uint64_t dirty_since, last_attempt, retry_at;
 static esp_err_t save_error;
 static int last_success = -1;
@@ -54,6 +54,12 @@ bool pet_audio_volume_ready(void) {
 bool pet_audio_volume_pending(void) {
   /* Single protocol-worker caller, never an audio/render-loop callback. */
   return pet_audio_volume_ready() && dirty;
+}
+void pet_audio_volume_storage_state(int *saved, int *pending, bool *failed) {
+  const bool available = pet_audio_volume_ready();
+  *saved = available && durable_known ? (int)durable_volume : -1;
+  *pending = available && dirty ? (int)dirty_volume : -1;
+  *failed = available && dirty && dirty_save_failed;
 }
 static void unknown(pet_audio_volume_status_t *out, esp_err_t err) {
   *out = (pet_audio_volume_status_t){.volume=-1,.error=err};
@@ -171,7 +177,7 @@ esp_err_t pet_audio_volume_set(unsigned volume, uint64_t now_ms, pet_audio_volum
   last_success=(int)volume;
   if (durable_known && durable_volume==volume) dirty=false;
   else if (!dirty || dirty_volume!=volume) {
-    dirty=true;dirty_volume=volume;dirty_since=now_ms;
+    dirty=true;dirty_volume=volume;dirty_since=now_ms;dirty_save_failed=false;
   }
   snapshot((int)volume,out);
   return ESP_OK;
@@ -220,6 +226,7 @@ completed:
     if (dirty && dirty_volume==target) dirty=false;
   } else {
     if (wrote) durable_known=false; /* Failure is not evidence of rollback. */
+    dirty_save_failed=dirty && dirty_volume==target;
     save_error=err;
     retry_at=now_ms>UINT64_MAX-MASTER_RETRY_MS ? UINT64_MAX : now_ms+MASTER_RETRY_MS;
   }

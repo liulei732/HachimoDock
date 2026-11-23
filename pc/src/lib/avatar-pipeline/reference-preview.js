@@ -1,3 +1,4 @@
+import { normalizeGenerationErrorMessage } from "../generation-issue.js";
 import { processImageForPipeline } from './image-processing.js';
 import { bytesToDataUrl } from './image.js';
 import { inspectReference } from './quality.js';
@@ -6,7 +7,7 @@ export const normalizeStyleDescription = value => String(value || '').trim().sli
 
 export async function generateReferencePreview({imageFile,styleDescription,cloudBackground,maxDimension,signal}) {
   if(!imageFile)throw Error('请先选择参考图片');
-  if(!cloudBackground?.apiKey)throw Error('请先在 API 配置中保存图片处理服务的 Key');
+  if(!cloudBackground?.apiKey)throw Error('请先在模型配置中保存图片处理服务的 Key');
   await inspectReference(imageFile,signal);
   const result=await processImageForPipeline(imageFile,{styleDescription:normalizeStyleDescription(styleDescription),cloudBackground,maxDimension,signal});
   const bytes=result.processedBytes;
@@ -26,7 +27,7 @@ export function createReferencePreviewController(onChange,generate=generateRefer
       const result=await generate({...input,signal:controller.signal});
       if(token===revision&&!controller.signal.aborted)onChange({busy:false,result:{...result,source:input.imageFile,style:normalizeStyleDescription(input.styleDescription)},error:''});
     }catch(error){
-      if(token===revision&&!controller.signal.aborted)onChange({busy:false,result:null,error:error?.message||'预览生成失败，请重试'});
+      if(token===revision&&!controller.signal.aborted)onChange({busy:false,result:null,error:normalizeGenerationErrorMessage(error)});
     }finally{if(token===revision)active=null;}
   }};
 }

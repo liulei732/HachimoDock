@@ -1,0 +1,12 @@
+frame 0
+observe
+event 1 24 140
+frame 0
+changed
+event 2 68 140
+event 3 68 140
+event 4 1 0
+event 4 2 0
+event 4 5 0
+event 4 6 0
+slot-changed 0 1

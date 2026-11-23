@@ -1,34 +1,44 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
+import { useDeviceContext } from "../shell/DeviceContext.jsx";
 import Card from "../shell/Card.jsx";
 import "./wifi-pairing.css";
-import { publishLanAgentPairing, readLanAgentPairing } from "./lanAgentPairing.js";
+import { boundedLanRead, matchesUsbPeer, publishLanAgentPairing } from "./lanAgentPairing.js";
 import { useExitProtection } from "../lib/exit-protection.js";
 import { firmwareUpdateDisposition } from "../lib/firmware-version.js";
 import { firmwareAlreadyLatest, firmwareRollback, firmwareUpdateFailureMessage } from "../lib/firmware-update-error.js";
 
-async function readControlStatus(usbConnected, onStatus) {
-  const status = await invoke("lan_device_status");
-  onStatus?.(status);
-  if (usbConnected && status.rebootSupported && !status.controlTrusted) {
-    try {
-      await invoke("lan_trust_usb");
-      return await invoke("lan_device_status");
-    } catch {
-      return status;
-    }
-  }
-  return status;
-}
+const SCAN_VALID_MS = 150_000; // Native discovery entries expire after 180 seconds.
 
-export default function LanAgentPairingPanel({ usb, wifi, active = true, maintenanceRequest = 0 }) {
-  const [address,setAddress]=useState(null), [devices,setDevices]=useState([]), [selected,setSelected]=useState(null);
-  const [busy,setBusy]=useState(""),[error,setError]=useState(""),[scanned,setScanned]=useState(false);
-  const initialScan = useRef(false);
-  const [pairingLoaded, setPairingLoaded] = useState(false);
-  const [localStatus, setDeviceStatus] = useState(null);
-  const [statusError, setStatusError] = useState("");
+export default function LanAgentPairingPanel({ usb, active = true, maintenanceRequest = 0 }) {
+  const { wifiPairing, pairedStatus, wifiReadError, readWifiStatus, setWifiSettingsOpen } = useDeviceContext();
+  const address = typeof wifiPairing === "string" ? wifiPairing : null;
+  const [devices, setDevices] = useState([]), [selected, setSelected] = useState(null);
+  const [busy, setBusy] = useState(""), [error, setError] = useState("");
+  const [scanState, setScanState] = useState(""), [scanError, setScanError] = useState("");
+  const [trustError, setTrustError] = useState("");
+  const usbConnected = Boolean(usb?.connected);
+  const deviceStatus = address && pairedStatus?.address === address ? pairedStatus : null;
+  const scope = JSON.stringify([usbConnected, usb?.connectionId, usb?.boardDeviceId, usb?.bootId,
+    address, deviceStatus?.boardDeviceId, deviceStatus?.bootId, deviceStatus?.controlTrusted]);
+  const generation = useRef(0);
+  // A reboot or OTA can take the same peer offline and change its boot ID.
+  // Keep its completion message across that transition, scoped to the actual peer.
+  const lastPeer = useRef(null);
+  const feedbackBoard = deviceStatus?.boardDeviceId ||
+    (lastPeer.current?.address === address ? lastPeer.current?.id : null);
+  const feedbackScope = JSON.stringify([address, feedbackBoard, usbConnected, usb?.connectionId, usb?.boardDeviceId]);
+  const feedbackGeneration = useRef(0);
+  const scanGeneration = useRef(0);
+  const scanExpiry = useRef(null);
+  const trustAttempt = useRef(null);
+  const matched = matchesUsbPeer(usb, deviceStatus);
+  const needsTrust = matched && deviceStatus.rebootSupported && !deviceStatus.controlTrusted;
+  useEffect(() => {
+    setWifiSettingsOpen(active);
+    return () => setWifiSettingsOpen(false);
+  }, [active, setWifiSettingsOpen]);
   const [deliveryMessage, setDeliveryMessage] = useState("");
   const [rebootMessage, setRebootMessage] = useState("");
   const [otaMessage, setOtaMessage] = useState("");
@@ -41,92 +51,101 @@ export default function LanAgentPairingPanel({ usb, wifi, active = true, mainten
     maintenance.current.open = true;
     maintenance.current.querySelector("summary")?.focus({ preventScroll: true });
     maintenance.current.scrollIntoView({ block: "center" });
-  }, [active, address, maintenanceRequest, wifi?.address]);
-  const usbConnected = Boolean(usb?.connected);
-  const verifiedWifi = address && wifi?.wifiConnected && wifi.address === address ? wifi : null;
-  const deviceStatus = verifiedWifi ?? (localStatus?.address === address ? localStatus : null);
+  }, [active, address, maintenanceRequest]);
   const firmwareDisposition = firmwareUpdateDisposition(deviceStatus?.firmware, deviceStatus?.bundledFirmwareVersion);
   const rollbackBlocked = firmwareDisposition !== "latest" && Boolean(deviceStatus &&
     (deviceStatus.bundledFirmwareRollbackBlocked || rollbackBoardId === deviceStatus.boardDeviceId));
-  useEffect(() => {
-    if (verifiedWifi && statusError) setStatusError("");
-  }, [verifiedWifi, statusError]);
-  const canMutateOverLan = !usbConnected && Boolean(address && deviceStatus?.controlTrusted);
+  const canMutateOverLan = !usbConnected && Boolean(deviceStatus?.controlTrusted);
   const savedPeerUnpaired = address && !deviceStatus && devices.some(device =>
     device.ip === address && device.ready && device.paired === false);
-  const usbConnectionId = usb?.connectionId;
-  useEffect(() => {
-    if (!active || !address) return;
-    let alive = true;
-    const updateStatus = status => { if (alive) setDeviceStatus(status); };
-    readControlStatus(usbConnected, updateStatus).then(updateStatus).catch(() => updateStatus(null));
-    return () => { alive = false; };
-  }, [active, address, usbConnected, usbConnectionId]);
-  useExitProtection(busy === "pair" ? "正在完成设备配对" : busy === "install" ? "正在通过 Wi-Fi 安装组件" : busy === "reboot" ? "正在确认设备重启" : busy === "ota" ? "正在通过 Wi-Fi 升级设备" : "");
-  useEffect(() => {
-    if (!active) return;
-    let alive = true;
-    let pending = false;
-    const refresh = async () => {
-      if (pending || busy) return;
-      pending = true;
-      try {
-        const saved = await readLanAgentPairing();
-        if (alive) {
-          setAddress(saved);
-          setPairingLoaded(true);
-        }
-      } catch {
-        if (alive) setError("配对记录读取失败，原记录已保留。请重试。");
-      } finally {
-        pending = false;
-      }
-    };
-    void refresh();
-    const timer = setInterval(refresh, 5000);
-    return () => {
-      alive = false;
-      clearInterval(timer);
-    };
-  }, [active, busy]);
-  const scan = useCallback(async () => {
-    setBusy("scan");
+
+  useLayoutEffect(() => {
+    lastPeer.current = { address, id: feedbackBoard };
+  }, [address, feedbackBoard]);
+  useLayoutEffect(() => {
+    setTrustError("");
+    return () => { generation.current += 1; };
+  }, [scope, active]);
+  useLayoutEffect(() => {
     setError("");
+    setDeliveryMessage("");
+    setRebootMessage("");
+    setOtaMessage("");
+    return () => { feedbackGeneration.current += 1; };
+  }, [feedbackScope]);
+  useExitProtection(busy === "pair" ? "正在完成设备配对" : busy === "install" ? "正在通过 Wi-Fi 安装组件" : busy === "reboot" ? "正在确认设备重启" : busy === "ota" ? "正在通过 Wi-Fi 升级设备" : "");
+  const scan = useCallback(async () => {
+    const id = ++scanGeneration.current;
+    clearTimeout(scanExpiry.current);
+    setDevices([]);
     setSelected(null);
+    setScanError("");
+    setScanState("scanning");
     try {
-      setDevices(await invoke("lan_agent_discover"));
-      setScanned(true);
-    } catch (error) {
-      setError(String(error));
-    } finally {
-      setBusy("");
+      const found = await boundedLanRead(invoke("lan_agent_discover"), "发现设备超时，请重新扫描。", 8000);
+      if (id !== scanGeneration.current) return;
+      setDevices(found);
+      setScanState("done");
+      scanExpiry.current = setTimeout(() => {
+        setSelected(null);
+        setDevices([]);
+        setScanState("expired");
+      }, SCAN_VALID_MS);
+    } catch (e) {
+      if (id !== scanGeneration.current) return;
+      setScanError(e?.message || String(e));
+      setScanState("failed");
     }
   }, []);
   useEffect(() => {
-    if (!active || initialScan.current) return;
-    initialScan.current = true;
-    void scan();
-  }, [active, scan]);
+    if (active) void scan();
+    return () => {
+      scanGeneration.current += 1;
+      clearTimeout(scanExpiry.current);
+    };
+  }, [active, address, feedbackBoard, usb?.connectionId, usb?.boardDeviceId, scan]);
+
+  const authorize = useCallback(async () => {
+    if (!needsTrust) return;
+    const owner = generation.current;
+    trustAttempt.current = scope;
+    setBusy("trust");
+    setTrustError("");
+    try {
+      await invoke("lan_trust_usb", { target: { boardDeviceId: deviceStatus.boardDeviceId,
+        bootId: deviceStatus.bootId, connectionId: usb.connectionId } });
+      if (owner !== generation.current) return;
+      const confirmed = await readWifiStatus(true);
+      if (owner === generation.current && !confirmed?.controlTrusted) {
+        setTrustError("无线控制授权尚未确认，请重试。");
+      }
+    } catch (e) {
+      if (owner === generation.current) setTrustError(e?.message || String(e));
+    } finally {
+      setBusy("");
+    }
+  }, [needsTrust, scope, readWifiStatus, deviceStatus, usb?.connectionId]);
+  useEffect(() => {
+    if (active && needsTrust && !busy && trustAttempt.current !== scope) void authorize();
+  }, [active, needsTrust, busy, scope, authorize]);
   const pair = async () => {
     if (!selected || busy) return;
+    const owner = generation.current;
     setBusy("pair");
     setError("");
     try {
       const saved = await invoke("lan_agent_pair_confirm", { id: selected.id, ip: selected.ip });
-      setDeviceStatus(null);
-      setStatusError("");
-      setAddress(saved);
-      setDeliveryMessage("");
-      setRebootMessage("");
-      setOtaMessage("");
       publishLanAgentPairing(saved);
-      setSelected(null);
-      setDevices(current => current.map(device => device.id === selected.id && device.ip === selected.ip
-        ? { ...device, ready: false, paired: true }
-        : device));
-      setDeviceStatus(await readControlStatus(usbConnected).catch(() => null));
-    } catch (error) {
-      setError(String(error));
+      if (owner === generation.current) {
+        setSelected(null);
+        setDevices(current => current.map(device => device.id === selected.id && device.ip === selected.ip
+          ? { ...device, ready: false, paired: true } : device));
+      }
+    } catch (e) {
+      if (owner === generation.current) {
+        setSelected(null);
+        setError(e?.message || String(e));
+      }
     } finally {
       setBusy("");
     }
@@ -134,30 +153,27 @@ export default function LanAgentPairingPanel({ usb, wifi, active = true, mainten
   const checkStatus = async () => {
     setBusy("status");
     setError("");
-    setStatusError("");
-    try {
-      setDeviceStatus(await readControlStatus(usbConnected));
-    } catch (e) {
-      setDeviceStatus(null);
-      setStatusError(String(e));
-    } finally {
-      setBusy("");
-    }
+    try { await readWifiStatus(); }
+    catch { /* The shared snapshot owns read errors and recovery. */ }
+    finally { setBusy(""); }
   };
   const chooseComponent = async () => {
     if (!canMutateOverLan || busy || !deviceStatus?.bootId || !deviceStatus?.boardDeviceId) return;
+    const owner = generation.current;
     setBusy("install");
     setError("");
     setDeliveryMessage("");
     try {
       const path = await openDialog({ filters: [{ name: "PetUI 组件", extensions: ["hachiapp", "clawpkg", "zip"] }] });
-      if (typeof path !== "string") return;
+      if (typeof path !== "string" || owner !== generation.current) return;
       const preview = await invoke("lan_component_preview", {path});
+      if (owner !== generation.current) return;
       await invoke("lan_component_install", { path, ...preview,
-        expectedBoardDeviceId: deviceStatus.boardDeviceId, expectedBootId: deviceStatus.bootId });
-      setDeliveryMessage("设备已提交安装。");
+        expectedBoardDeviceId: deviceStatus.boardDeviceId, expectedBootId: deviceStatus.bootId,
+        expectedAssociation: deviceStatus.componentTarget?.association });
+      if (owner === generation.current) setDeliveryMessage("设备已提交安装。");
     } catch (e) {
-      setError(String(e));
+      if (owner === generation.current) setError(e?.message || String(e));
     } finally {
       setBusy("");
     }
@@ -165,12 +181,13 @@ export default function LanAgentPairingPanel({ usb, wifi, active = true, mainten
   const rebootDevice = async () => {
     const expectedBootId = deviceStatus?.bootId;
     if (!canMutateOverLan || busy || !expectedBootId) return;
+    const owner = feedbackGeneration.current;
     setBusy("reboot");
     setError("");
     setRebootMessage("");
     try {
       const result = await invoke("lan_reboot", {expectedBootId});
-      setDeviceStatus(result.observed && { ...result.observed, address, bundledFirmwareVersion: deviceStatus?.bundledFirmwareVersion });
+      if (owner !== feedbackGeneration.current) return;
       if (result.observed) {
         setRebootMessage(result.scheduled ? "设备已重启并重新上线。" : "已验证设备重新上线，启动 ID 已改变。");
       } else {
@@ -179,8 +196,9 @@ export default function LanAgentPairingPanel({ usb, wifi, active = true, mainten
           : "重启结果未确认。请查看设备，或重新读取状态。");
       }
     } catch (e) {
-      setError(String(e));
+      if (owner === feedbackGeneration.current) setError(e?.message || String(e));
     } finally {
+      void readWifiStatus(true).catch(() => {});
       setBusy("");
     }
   };
@@ -188,25 +206,38 @@ export default function LanAgentPairingPanel({ usb, wifi, active = true, mainten
     const expectedBoardDeviceId = deviceStatus?.boardDeviceId;
     const expectedBootId = deviceStatus?.bootId;
     if (!canMutateOverLan || busy || rollbackBlocked || !expectedBoardDeviceId || !expectedBootId) return;
+    const owner = feedbackGeneration.current;
     setBusy("ota");
     setError("");
     setOtaMessage("");
     try {
       const { version } = await invoke("lan_update_bundled_firmware", {expectedBoardDeviceId, expectedBootId});
-      setOtaMessage(`已通过 Wi-Fi 升级至 ${version}。`);
+      if (owner === feedbackGeneration.current) setOtaMessage(`已通过 Wi-Fi 升级至 ${version}。`);
     } catch (e) {
+      if (owner !== feedbackGeneration.current) return;
       if (firmwareAlreadyLatest(e)) setOtaMessage("设备固件已是最新版本。");
       else {
         if (firmwareRollback(e)) setRollbackBoardId(expectedBoardDeviceId);
         setError(firmwareUpdateFailureMessage(e, { wireless: true }));
       }
     } finally {
-      try { setDeviceStatus(await invoke("lan_device_status")); }
-      catch { setDeviceStatus(null); }
+      void readWifiStatus(true).catch(() => {});
       setBusy("");
     }
   };
-  const forget=async()=>{setBusy("forget");setError("");try{await invoke("lan_agent_forget");setAddress(null);setDeviceStatus(null);setStatusError("");setDeliveryMessage("");setRebootMessage("");setOtaMessage("");publishLanAgentPairing(null);}catch{setError("无法移除本机配对，请重试。");}finally{setBusy("");}};
+  const forget = async () => {
+    const owner = generation.current;
+    setBusy("forget");
+    setError("");
+    try {
+      await invoke("lan_agent_forget");
+      publishLanAgentPairing(null);
+    } catch {
+      if (owner === generation.current) setError("无法移除本机配对，请重试。");
+    } finally {
+      setBusy("");
+    }
+  };
   return <Card title="Wi-Fi 设备配对" subtitle="电脑与设备位于同一局域网时，可通过 Wi-Fi 同步。USB 接入时优先使用 USB。">
     <div className="wifi-pairing">
       <section className="wifi-pairing__current" aria-label="当前配对">
@@ -217,14 +248,15 @@ export default function LanAgentPairingPanel({ usb, wifi, active = true, mainten
             <p className="muted small">{[
               deviceStatus?.boardDeviceId && address,
               deviceStatus?.firmware,
+              deviceStatus && (deviceStatus.controlTrusted ? "已授权无线控制" : "只读连接"),
               deviceStatus && (deviceStatus.wifiConnected ? "设备 Wi-Fi 已连接" : "设备 Wi-Fi 未连接"),
               deviceStatus && (deviceStatus.clockSynchronized ? "已校时" : "待校时"),
             ].filter(Boolean).join(" · ") || (savedPeerUnpaired
               ? "本机有旧记录，设备报告尚未配对。可在下方重新配对。"
               : "已保存本机配对，尚未验证设备连接。")}</p>
-          </> : <p role="status">{pairingLoaded ? "尚未配对，从下方选择设备。" : "正在读取配对记录…"}</p>}
+          </> : <p role="status">{wifiPairing === false ? "配对记录暂时无法读取，正在重试。" : wifiPairing === null ? "尚未配对，从下方选择设备。" : "正在读取配对记录…"}</p>}
         </div>
-        {address && <button type="button" className="btn-secondary btn-sm" disabled={!!busy} onClick={checkStatus}>
+        {(address || wifiReadError) && <button type="button" className="btn-secondary btn-sm" disabled={!!busy} onClick={checkStatus}>
           {busy === "status" ? "正在读取…" : "刷新状态"}
         </button>}
       </section>
@@ -232,13 +264,13 @@ export default function LanAgentPairingPanel({ usb, wifi, active = true, mainten
       <section aria-label="附近设备">
         <div className="wifi-pairing__section-head">
           <h3>附近设备</h3>
-          <button type="button" className="btn-secondary btn-sm" disabled={!!busy} onClick={scan}>
-            {busy === "scan" ? "正在发现…" : "重新扫描"}
+          <button type="button" className="btn-secondary btn-sm" disabled={!!busy || scanState === "scanning"} onClick={() => { setError(""); void scan(); }}>
+            {scanState === "scanning" ? "正在发现…" : "重新扫描"}
           </button>
         </div>
         <div className="wifi-pairing__list" role="radiogroup" aria-label="选择要配对的设备">
           {devices.map(device => {
-            const isCurrent = Boolean(address && deviceStatus?.boardDeviceId === device.id);
+            const isCurrent = Boolean(address === device.ip && deviceStatus?.boardDeviceId === device.id);
             const label = isCurrent ? "当前配对" : device.ready ? (device.ip === address ? "可重新配对" : "可配对")
               : !device.supportsAutomatic ? "需升级固件"
                 : device.paired ? "已有配对" : "暂不可配对";
@@ -251,7 +283,9 @@ export default function LanAgentPairingPanel({ usb, wifi, active = true, mainten
             </label>;
           })}
         </div>
-        {scanned && !devices.length && <p role="status" className="muted">暂未发现设备。确认双方连在同一局域网，再重新扫描。</p>}
+        {scanState === "expired" && <p role="status">扫描结果已过期，请重新扫描。</p>}
+        {scanError && <p role="alert">{scanError}</p>}
+        {scanState === "done" && !devices.length && <p role="status" className="muted">暂未发现设备。确认双方连在同一局域网，再重新扫描。</p>}
         {selected && <button type="button" className="btn-primary btn-sm" disabled={!!busy} onClick={pair}>确认配对</button>}
         {busy === "pair" && <p role="status">正在建立连接并保存配对。</p>}
       </section>
@@ -265,10 +299,17 @@ export default function LanAgentPairingPanel({ usb, wifi, active = true, mainten
         </ol>
       </details>
 
-      {(address || verifiedWifi || maintenanceRequest > 0) && <details ref={maintenance}>
+      {(address || maintenanceRequest > 0) && <details ref={maintenance}>
         <summary>设备维护与配对管理</summary>
-        {firmwareDisposition !== "latest" && (deviceStatus?.rebootSupported || deviceStatus?.wirelessOta || deviceStatus?.componentDelivery) && !deviceStatus.controlTrusted &&
-          <p role="status">通过 USB 连接同一台设备一次以授权无线控制，之后可断开 USB 并更新。</p>}
+        {deviceStatus && <p role="status">{deviceStatus.controlTrusted
+          ? "此电脑已获无线控制授权。"
+          : deviceStatus.rebootSupported ? "通过 USB 连接这台设备可授权无线控制。" : "当前固件仅支持读取无线状态。"}</p>}
+        {deviceStatus && usbConnected && <p>{matched
+          ? "当前通过 USB 控制设备，断开后可使用已授权的无线控制。"
+          : "当前 USB 连接与 Wi-Fi 配对目标尚未匹配。请核对设备。"}</p>}
+        {needsTrust && <button type="button" className="btn-secondary btn-sm" disabled={!!busy} onClick={authorize}>
+          {busy === "trust" ? "正在授权…" : "通过 USB 授权无线控制"}
+        </button>}
         <div className="wifi-pairing__actions">
           {canMutateOverLan && deviceStatus?.rebootSupported &&
             <button type="button" className="btn-secondary btn-sm" disabled={!!busy || !deviceStatus.bootId} onClick={rebootDevice}>
@@ -289,7 +330,8 @@ export default function LanAgentPairingPanel({ usb, wifi, active = true, mainten
       {rebootMessage && <p role="status">{rebootMessage}</p>}
       {otaMessage && <p role="status">{otaMessage}</p>}
       {deliveryMessage && <p role="status">{deliveryMessage}</p>}
-      {statusError && !verifiedWifi && <p className="api-settings__result is-error" role="alert">{statusError}</p>}
+      {needsTrust && trustError && <p className="api-settings__result is-error" role="alert">{trustError}</p>}
+      {wifiReadError && <p className="api-settings__result is-error" role="status">{wifiReadError}</p>}
       {error && <p className="api-settings__result is-error" role="alert">{error}</p>}
     </div>
   </Card>;

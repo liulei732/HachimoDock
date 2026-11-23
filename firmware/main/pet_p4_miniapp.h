@@ -7,8 +7,10 @@
 
 #pragma once
 #include "pet_p4_component_metadata.h"
+#include "pet_p4_ble_accessory.h"
 
 #include <stdbool.h>
+#include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -80,6 +82,8 @@ bool pet_p4_miniapp_program_peak_context(pet_p4_query_observation_t *query,pet_w
  * navigate, pin storage, load files or grant a resource. */
 bool pet_p4_miniapp_background_content(const char *id,uint32_t content[3]);
 size_t pet_p4_miniapp_background_list(pet_p4_miniapp_background_status_t out[PET_P4_MINIAPP_BACKGROUND_MAX]);
+bool pet_p4_miniapp_background_start_paired(const char *id,const uint32_t content[3],uint64_t *registration,
+    char *error,size_t size,bool (*pin)(void),void (*unpin)(void));
 bool pet_p4_miniapp_background_start(const char *id,const uint32_t content[3],uint64_t *registration,char *error,size_t error_size);
 bool pet_p4_miniapp_background_stop(const char *id,uint64_t registration,char *error,size_t error_size);
 /* Resource pack capacity. p4-graphics-v2 (PET_P4_GRAPHICS_V2, declared by a
@@ -176,6 +180,11 @@ typedef struct {
   char media_source[48];
   char confirmation_prompt[121];
   uint32_t image_revision;
+  uint32_t hardware_owner;
+  int8_t mic_mode;
+#if PET_BLE_ACCESSORY
+  uint8_t accessory;
+#endif
   uint32_t wasm_revision; /* zero when the captured view does not use WASM */
   uint32_t media_generation; /* captured with view under the same runtime lock */
   bool surface_active,side_active,images_changed,confirmation_active;
@@ -191,9 +200,14 @@ typedef struct {
   char widget_id[PET_P4_MINIAPP_WIDGET_ID_MAX];
   char title[64];
   pet_p4_component_metadata_t package_metadata;
+#if PET_P4_SYSTEM_WIFI
+  bool community_owned, community_persist;
+#endif
   bool active;
   uint8_t resource_state;
   uint32_t center_title_checksum;
+  uint32_t center_thumb_checksum;
+  uint8_t center_thumb_generation;
   uint8_t center_title_slot;
   uint8_t center_title_generation;
   uint8_t image_count;
@@ -217,6 +231,25 @@ void pet_p4_miniapp_sfx_process(uint64_t now_ms, bool audible);
 /* p4-events-v1 (Track C): PC-authorised background bubble policy and the one pending
  * hidden-alarm notification (title = component title, text <= 40 bytes). */
 void pet_p4_miniapp_alarm_policy(bool background_notify);
+enum { PET_ALARM_OFF = 1, PET_ALARM_COUNT, PET_ALARM_ALERT, PET_LOCAL_PROGRAM_ON, PET_LOCAL_PROGRAM_OFF };
+typedef struct {
+  char title[64], alarms[4][41];
+  unsigned declared, mode, completed;
+  char id[48];
+  uint8_t state[4]; /* idle, armed, pending, cancelled */
+  bool clock_valid, pending, failed, program, program_allowed, program_waiting, program_running;
+} pet_local_alarm_view_t;
+#define PET_ALARM_PAGE "app_alarms"
+static inline bool pet_alarm_button_hit(int x, int y) {
+  return x >= 252 && x < 428 && y >= 8 && y < 64;
+}
+bool pet_local_alarm_view(pet_local_alarm_view_t *out);
+bool pet_local_alarm_open(void);
+bool pet_local_alarm_choose(unsigned mode);
+bool pet_local_program_toggle(void);
+void pet_local_alarm_boot(void);
+bool pet_local_alarm_work(void);
+void pet_local_alarm_run(void);
 /* Existing protocol storage worker only: restore saved hidden alarms before
  * granting per-boot delivery. Failure preserves prior RAM state and policy. */
 bool pet_p4_miniapp_alarm_policy_prepare(bool background_notify);
@@ -245,6 +278,9 @@ bool pet_p4_miniapp_host_source(const char *source);
 #if PET_P4_SYSTEM_WIFI
 #include "pet_p4_private_feed.h"
 bool pet_p4_miniapp_private_feed(pet_private_feed_t *feed, pet_wifi_endpoint_t *endpoint);
+#if PET_P4_SCOPED_WRITE
+int pet_p4_miniapp_write_if_active(const uint8_t scope[32], int (*send)(void *), void *context);
+#endif
 #endif
 bool pet_p4_miniapp_get_surface_images(pet_p4_miniapp_sprite_pack_t *out, uint32_t *revision);
 bool pet_p4_miniapp_get_sprites(pet_p4_miniapp_sprite_pack_t *out);
@@ -259,6 +295,8 @@ pet_center_filter_t pet_p4_miniapp_center_filter(void);
 bool pet_p4_miniapp_center_set_filter(pet_center_filter_t filter);
 size_t pet_p4_miniapp_center_count(void);
 size_t pet_p4_miniapp_center_selected(void);
+#define PET_CENTER_THUMB_BYTES 1568U
+bool pet_p4_miniapp_center_read_thumb(const pet_p4_miniapp_catalog_entry_t *entry, uint8_t *packed, size_t capacity);
 size_t pet_p4_miniapp_center_read_title(const pet_p4_miniapp_catalog_entry_t *entry,
     uint8_t *data, size_t capacity);
 bool pet_p4_miniapp_center_get(size_t index, pet_p4_miniapp_catalog_entry_t *out);
@@ -308,6 +346,8 @@ bool pet_p4_miniapp_activation_pending(void);
  * Never releases a running scope or another request's occupancy. */
 bool pet_p4_miniapp_activation_reject_not_started(uint64_t token);
 bool pet_p4_miniapp_sync_stats(const pet_p4_stats_model_t *stats);
+void pet_p4_miniapp_hardware_guard(bool foreground);
+bool pet_p4_miniapp_hardware_key(bool down, bool click, uint64_t event_ms);
 void pet_p4_miniapp_process(uint64_t now_ms, bool visible);
 bool pet_p4_miniapp_dispatch_action(const char *action, uint64_t now_ms);
 bool pet_p4_miniapp_has_input(const char *event_name);
@@ -330,6 +370,8 @@ bool pet_p4_miniapp_dispatch_input(
 
 #define PET_P4_WIDGET_TRANSFER_PROTOCOL "p4-widget-files-v2"
 #define PET_P4_WIDGET_CHUNK_BYTES 4096
+#define WIDGET_TRANSFER_FILES_MAX 128
+#define WIDGET_TRANSFER_BYTES_MAX (16U * 1024U * 1024U)
 bool pet_p4_miniapp_transfer_begin(const cJSON *payload, char *error, size_t error_size);
 bool pet_p4_miniapp_transfer_chunk(const cJSON *payload, char *error, size_t error_size);
 #define PET_P4_WIDGET_COMMIT_STORAGE_DEFERRED "component storage is busy; commit has not started; staged package preserved"
@@ -366,6 +408,8 @@ bool pet_p4_miniapp_storage_lane_configure(pet_storage_lock_fn unlock,
 bool pet_p4_miniapp_storage_lane_enter(void);
 bool pet_p4_miniapp_storage_lane_leave(void);
 bool pet_p4_miniapp_storage_busy(void);
+/* Write an unpublished font chunk while this command owns physical storage. */
+bool pet_p4_miniapp_stage_font_chunk(FILE *file, const uint8_t *bytes, size_t size);
 
 #ifdef __cplusplus
 }

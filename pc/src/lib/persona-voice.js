@@ -1,5 +1,5 @@
 /**
- * [Input] Appearance name/description, stored `persona-voice.json` documents, and Doubao Seed TTS speaker ids.
+ * [Input] Appearance name/description, stored `persona-voice.json` documents, Doubao speaker IDs and active native TTS settings.
  * [Output] Normalized per-appearance persona + voice model (defaults, factory Terrier persona, templates,
  *          validation, realtime system prompt assembly, human labels) plus the "persona setup pending" marker
  *          that forces the persona step right after a new appearance is created, and saved-persona events.
@@ -8,11 +8,13 @@
  */
 
 import voiceCatalog from "./tts-voices.json" with { type: "json" };
+import { speechRequestUrl } from "./custom-speech-settings.js";
+import { hasMimoVoiceDescription, isMimoVoiceDesignModel } from "./mimo-tts-voices.js";
 
 export const PERSONA_VOICE_FILE = "persona-voice.json";
 export const PERSONA_VOICE_SCHEMA_VERSION = 1;
 
-/** 首期只接豆包 Seed TTS 2.0；`voice.provider` 预留给以后的提供方。 */
+/** 旧文档继续保留豆包音色字段，合成路由由本机设置决定。 */
 export const TTS_PROVIDER_DOUBAO = "doubao_tts";
 
 export const PERSONA_LANGUAGE_OPTIONS = Object.freeze([
@@ -143,6 +145,52 @@ export function createDefaultPersonaVoice({ name = "", description = "", isBuilt
   };
 }
 
+const utf8 = new TextEncoder();
+const withinBytes = (value, limit) => utf8.encode(value).length <= limit;
+
+function overrideScope(provider, model, baseUrl) {
+  model = text(model);
+  if (!model || !withinBytes(model, 256)) return null;
+  if (provider === "mimo") return { model };
+  if (provider !== "openai") return null;
+  const endpoint = speechRequestUrl("tts", baseUrl);
+  return endpoint && withinBytes(endpoint, 2048) ? { model, baseUrl: endpoint } : null;
+}
+
+function normalizedOverrides(raw) {
+  const result = {};
+  for (const provider of ["mimo", "openai"]) {
+    const slot = raw?.[provider];
+    const scope = overrideScope(provider, slot?.model, slot?.baseUrl);
+    const voice = text(slot?.voice);
+    if (scope && voice && withinBytes(voice, 1024)) result[provider] = { ...scope, voice };
+  }
+  return Object.keys(result).length ? result : undefined;
+}
+
+export function personaTtsService(status) {
+  if (!status || typeof status.ttsProvider !== "string") return null;
+  const provider = status.ttsProvider || "volcengine";
+  const labels = { volcengine: "豆包 Seed TTS 2.0", mimo: "MiMo", openai: "自定义 TTS" };
+  if (!Object.hasOwn(labels, provider)) return null;
+  const scope = overrideScope(provider, status.ttsModel, status.ttsBaseUrl);
+  const design = isMimoVoiceDesignModel(scope?.model)
+    && (provider === "mimo" || scope?.baseUrl?.endsWith("/chat/completions"));
+  return { provider, label: labels[provider], scope, design, globalVoice: text(status.ttsVoice) };
+}
+
+export function personaVoiceDescription(service, value) {
+  if (service?.provider === "mimo" && !hasMimoVoiceDescription(value)) return "";
+  return text(value);
+}
+
+export function scopedPersonaVoice(voice, service) {
+  const slot = voice?.tts_overrides?.[service?.provider];
+  const scope = service?.scope;
+  if (!scope || slot?.model !== scope.model || slot.baseUrl !== scope.baseUrl) return "";
+  return typeof slot.voice === "string" ? slot.voice : "";
+}
+
 /**
  * Merge a stored document (may be null/partial/corrupt) with defaults.
  * `configured` is true only when a document was actually saved by the user
@@ -174,6 +222,8 @@ export function normalizePersonaVoice(raw, { name = "", description = "", isBuil
     speed: clampNumber(rawVoice.speed ?? defaults.voice.speed, VOICE_SPEED_RANGE),
     volume: clampNumber(rawVoice.volume ?? defaults.voice.volume, VOICE_VOLUME_RANGE),
   };
+  const overrides = normalizedOverrides(rawVoice.tts_overrides);
+  if (overrides) voice.tts_overrides = overrides;
   const configured = isBuiltin || Boolean(source && text(rawPersona.display_name) && text(rawPersona.style) && text(rawVoice.speaker));
   const voiceMigrationNotice = !voice.clone_speaker_id && voiceCatalog.legacySpeakerIds.includes(text(rawVoice.speaker))
     ? "旧版音色不兼容当前 TTS 2.0，已改用 Vivi 2.0，可在人设与声音中重新选择。" : "";
@@ -188,6 +238,13 @@ export function validatePersonaVoice({ persona = {}, voice = {} } = {}) {
   if (!text(voice.speaker) && !text(voice.clone_speaker_id)) errors.speaker = "请选择一个音色";
   if (text(persona.intro).length > 300) errors.intro = "自我介绍请控制在 300 字以内";
   if (text(persona.style).length > 500) errors.style = "性格描述请控制在 500 字以内";
+  if (["mimo", "openai"].some(provider => !withinBytes(text(voice.tts_overrides?.[provider]?.voice), 1024))) {
+    errors.tts_overrides = "形象音色或声音描述超过 1024 字节，请缩短后保存。";
+  }
+  const mimo = voice.tts_overrides?.mimo;
+  if (isMimoVoiceDesignModel(mimo?.model) && text(mimo.voice) && !hasMimoVoiceDescription(mimo.voice)) {
+    errors.tts_overrides = "请填写 MiMo 的声音描述，或留空跟随全局。";
+  }
   return errors;
 }
 
@@ -203,9 +260,23 @@ export function speakerLabel(voice = {}) {
 }
 
 /** Card subtitle: `人设 · 音色` or a prompt to configure. */
-export function personaSummaryLabel(personaVoice) {
+export function personaSummaryLabel(personaVoice, status) {
   if (!personaVoice || !personaVoice.configured) return "未配置人设";
-  return `${personaVoice.persona.display_name} · ${speakerLabel(personaVoice.voice)}`;
+  const name = personaVoice.persona.display_name;
+  const service = personaTtsService(status);
+  if (!service) return name;
+  if (service.provider === "volcengine") return `${name} · ${speakerLabel(personaVoice.voice)}`;
+  const choice = scopedPersonaVoice(personaVoice.voice, service);
+  let label;
+  if (service.design) {
+    const hasDescription = personaVoiceDescription(service, choice || service.globalVoice);
+    label = hasDescription ? (choice ? "形象声音描述" : "跟随全局声音描述") : "待填写声音描述";
+  } else {
+    const id = choice || service.globalVoice;
+    const voiceLabel = service.provider === "mimo" && id === "mimo_default" ? "MiMo 默认音色" : id;
+    label = choice ? voiceLabel : `跟随全局${voiceLabel ? `（${voiceLabel}）` : ""}`;
+  }
+  return [name, service.label, label].join(" · ");
 }
 
 /**
@@ -276,7 +347,9 @@ export function listPersonaSetupPending() {
 /** Voice fields as the Rust realtime chat expects them (camelCase, numbers coerced). */
 export function voiceSpecFor(personaVoice) {
   const voice = personaVoice?.voice || {};
+  const ttsOverrides = normalizedOverrides(voice.tts_overrides);
   return {
+    ...(ttsOverrides ? { ttsOverrides } : {}),
     speaker: text(voice.speaker) || DEFAULT_SPEAKER_ID,
     cloneSpeakerId: text(voice.clone_speaker_id),
     speed: clampNumber(voice.speed, VOICE_SPEED_RANGE),

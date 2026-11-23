@@ -1,3 +1,4 @@
+#include "pet_component_network_device.h"
 #include "pet_p4_wasm_trial.h"
 #include "hachi_runtime.h"
 #include "mbedtls/sha256.h"
@@ -15,6 +16,9 @@
 
 #include "pet_p4_miniapp.h"
 #include "pet_p4_builtin_index.h"
+#if PET_P4_SYSTEM_WIFI
+#include "pet_p4_community.h"
+#endif
 #include "pet_p4_center_text.h"
 #include "pet_p4_wifi_clock.h"
 #include <stdatomic.h>
@@ -396,7 +400,14 @@ typedef enum {
 typedef struct {
   bool active;
   char widget_id[PET_P4_MINIAPP_WIDGET_ID_MAX];
+#if PET_COMPONENT_NETWORK_ENABLED
+  char wasm_network[PET_NETWORK_POLICY_BYTES];
+#endif
   bool resource_incomplete;
+  #if PET_BLE_ACCESSORY
+  uint8_t accessory;
+  #endif
+  int8_t mic_mode; /* 0 absent, -1 meter, 1..100 quiet threshold */
   uint8_t var_count;
   miniapp_var_t vars[MINIAPP_MAX_VARS];
   uint8_t state_count;
@@ -556,8 +567,6 @@ static void runtime_action_accepted(miniapp_runtime_t *r,const char *action,uint
   }
 }
 
-#define WIDGET_TRANSFER_FILES_MAX 128
-#define WIDGET_TRANSFER_BYTES_MAX (16U * 1024U * 1024U)
 #define WIDGET_TRANSFER_PATH_MAX 96
 
 typedef struct {
@@ -579,6 +588,9 @@ typedef struct {
 #endif
   char widget_id[PET_P4_MINIAPP_WIDGET_ID_MAX];
   pet_p4_component_metadata_t package_metadata;
+#if PET_P4_SYSTEM_WIFI
+  char community_save[65];
+#endif
   char manifest_json[PET_P4_COMPONENT_METADATA_BYTES + 1];
   char widget_json[MINIAPP_WIDGET_JSON_MAX];
   size_t widget_len;
@@ -586,6 +598,10 @@ typedef struct {
   char buttons_json[MINIAPP_BUTTONS_JSON_MAX];
   size_t buttons_len;
   uint32_t buttons_next_index;
+  uint8_t center_thumb[PET_CENTER_THUMB_BYTES + 1];
+  size_t center_thumb_len;
+  uint8_t thumb_match[33];
+  bool thumb_match_present, thumb_only;
   uint32_t center_title_next_index;
   size_t center_title_len;
   uint8_t center_title[64 + PET_CENTER_TITLE_MASK_MAX + 1];
@@ -599,12 +615,16 @@ typedef struct {
   char widget_id[PET_P4_MINIAPP_WIDGET_ID_MAX];
   char title[64];
   pet_p4_component_metadata_t package_metadata;
+#if PET_P4_SYSTEM_WIFI
+  char community_save[65];
+#endif
   uint8_t slot;
   uint8_t package_generation;
   uint32_t widget_checksum;
   uint32_t buttons_checksum;
   uint32_t sprites_checksum;
-  uint32_t center_title_checksum;
+  uint32_t center_title_checksum, center_thumb_checksum;
+  uint8_t center_thumb_generation;
   /* Recomputed from committed files, never trusted from catalog JSON. */
   uint8_t resource_state; /* 0 unchecked, 1 ready, 2 bootstrap, 3 damaged */
   uint8_t image_count;
@@ -664,6 +684,16 @@ static bool component_program_snapshot_locked(pet_program_snapshot_t *out){
 }
 #endif
 static uint32_t g_image_revision=1;
+static uint32_t g_hw_generation, g_hw_owner;
+
+static void hardware_leave_locked(void) {
+  if (!g_hw_owner) return;
+  g_hw_owner = 0;
+#if PET_BLE_ACCESSORY
+  pet_accessory_select(0,0);
+#endif
+  pet_p4_audio_meter_select(0);
+}
 #if PET_COMPONENT_BACKGROUND_ENABLED
 static EXT_RAM_BSS_ATTR pet_program_registry_t g_background_programs;
 static SemaphoreHandle_t g_background_mutex;
@@ -864,6 +894,12 @@ static size_t g_catalog_selected;
 static _Atomic pet_center_filter_t g_center_filter = PET_CENTER_ALL;
 static int g_catalog_file_generation = -1;
 static uint32_t g_catalog_sequence;
+#if PET_P4_EVENTS
+static bool local_alarm_retire(unsigned slot,const char *id,const miniapp_catalog_item_t *replacement);
+#if PET_COMPONENT_BACKGROUND_ENABLED
+static bool local_program_authorized(unsigned slot,const char *id,const uint32_t content[3]);
+#endif
+#endif
 /* Task-only runtime: publication/sprite snapshots can copy over 128 KiB and
  * must not mask interrupts. Keep the RTOS object in internal BSS (not PSRAM).
  * Lock order: state/render/media/diagnostics mutex -> this mutex -> bounded
@@ -949,6 +985,15 @@ static void storage_scope_finish(pet_storage_scope_t *scope){
   memset(&g_storage_resource_lease,0,sizeof(g_storage_resource_lease));
   memset(&g_storage_resource_owner,0,sizeof(g_storage_resource_owner));
 }
+bool pet_p4_miniapp_stage_font_chunk(FILE *file, const uint8_t *bytes, size_t size) {
+  pet_storage_scope_t scope __attribute__((cleanup(storage_scope_finish))) = {0};
+  if (!storage_scope_begin(&scope, false) || !scope.may_unlock ||
+      !pet_storage_scope_advance(&scope, PET_STORAGE_PREPARE) ||
+      !pet_storage_scope_unlock(&scope)) return false;
+  const bool written = fwrite(bytes, 1, size, file) == size && fflush(file) == 0;
+  return pet_storage_scope_lock(&scope) && written && storage_work_current();
+}
+
 static bool storage_audio_busy(void){
   return pet_p4_audio_active()||pet_p4_audio_playback_active()
     ||pet_p4_audio_conversation_active()||pet_p4_audio_music_active()
@@ -2776,6 +2821,7 @@ static bool save_component_program_snapshot(pet_program_snapshot_t *snapshot){
 #endif
   if(g_runtime.active&&g_runtime.program.enabled&&g_runtime.program.image.cells<=PET_PROGRAM_CELLS&&g_component_program_initialized&&g_component_program.revision==g_image_revision){
     capture=component_program_snapshot_locked(snapshot);
+    if(!capture&&g_component_program.live){miniapp_runtime_unlock();return false;}
     if(capture)copy_utf8(id,sizeof(id),g_runtime.widget_id);
   }
   miniapp_runtime_unlock();
@@ -3120,6 +3166,7 @@ static bool restore_component_runtime(miniapp_runtime_t*r){
     }
     r->program_seed_ready=true;
     if(!component_program_apply_seed(r))return false;
+    refresh_view(r);
     r->program_suspended=false; /* Explicit prepared activation, never focus recovery. */
   }
 #endif
@@ -3201,6 +3248,9 @@ static void merge_live_persistent_runtime(miniapp_runtime_t *next){
     }
   }
   miniapp_runtime_unlock();
+#if PET_COMPONENT_PROGRAM_ENABLED
+  valid|=next->program.enabled;
+#endif
   if(valid)refresh_view(next);
   finish_component_restore(next);
 }
@@ -3249,8 +3299,19 @@ static bool wasm_declaration_valid(const cJSON *root, const pet_p4_miniapp_sprit
   const cJSON *host=cJSON_GetObjectItemCaseSensitive(root,"hachiHost");
   const cJSON *audio=cJSON_GetObjectItemCaseSensitive(root,"hachiAudio");
   const cJSON *audio_hash=cJSON_GetObjectItemCaseSensitive(root,"hachiAudioSha256");
+  const cJSON *network=cJSON_GetObjectItemCaseSensitive(root,"hachiNetwork");
+  if(network){
+#if PET_COMPONENT_NETWORK_ENABLED
+    pet_net_policy_t *policy=pet_net_alloc(sizeof *policy);
+    bool ok = policy && pet_net_policy_parse(network, policy);
+    free(policy);
+    if (!ok) return false;
+#else
+    return false;
+#endif
+  }
   if(!decl){
-    return !canvas && !host && !audio && !audio_hash && bytes==0;
+    return !canvas && !host && !audio && !audio_hash && !network && bytes==0;
   }
   if(!cJSON_IsString(decl)||strlen(decl->valuestring)!=64||!bytes||bytes>HACHI_MAX_MODULE
       ||pack->data_length>sizeof(pack->pixels)-bytes)return false;
@@ -3258,6 +3319,7 @@ static bool wasm_declaration_valid(const cJSON *root, const pet_p4_miniapp_sprit
   unsigned char hash[32];
   bool native, services, uses_audio;
   if (!hachi_module_host_profile(module, bytes, &native, &services, &uses_audio)) return false;
+  bool net=false;if(!hachi_module_network_profile(module,bytes,&net)||net!=(network!=NULL))return false;
   if (uses_audio) {
     if (!cJSON_IsString(audio) || strcmp(audio->valuestring, HACHI_AUDIO_PROFILE) ||
         !cJSON_IsString(audio_hash) || strlen(audio_hash->valuestring) != 64 ||
@@ -3286,7 +3348,7 @@ static bool __attribute__((optimize("Oz"))) parse_runtime_impl(
 ) {
   PET_WIDGET_TRACE_SCOPE(trace_parse, PET_WTRACE_PARSE);
   static const char *const allowed[] = {
-    "schema_version", "vars", "states", "initial_state", "pages", "initial_page", "hachiWasm", "hachiCanvas", "hachiHost",
+    "accessory", "hardware", "schema_version", "vars", "states", "initial_state", "pages", "initial_page", "hachiWasm", "hachiCanvas", "hachiHost", "hachiNetwork",
 #if PET_P4_WASM_AUDIO
     "hachiAudio", "hachiAudioSha256",
 #endif
@@ -3342,6 +3404,15 @@ static bool __attribute__((optimize("Oz"))) parse_runtime_impl(
     return false;
   }
   copy_utf8(parsed->widget_id, sizeof(parsed->widget_id), widget_id);
+#if PET_COMPONENT_NETWORK_ENABLED
+  const cJSON *network=cJSON_GetObjectItemCaseSensitive(root,"hachiNetwork");
+  if (network && !cJSON_PrintPreallocated((cJSON *)network, parsed->wasm_network,
+                                        sizeof parsed->wasm_network, false)) {
+    set_error(error, error_size, "network policy size limit");
+    goto fail;
+  }
+#endif
+
   schema = cJSON_GetObjectItemCaseSensitive(root, "schema_version");
   fetchers = cJSON_GetObjectItemCaseSensitive(root, "fetchers");
   readers = cJSON_GetObjectItemCaseSensitive(root, "readers");
@@ -3358,6 +3429,37 @@ static bool __attribute__((optimize("Oz"))) parse_runtime_impl(
     goto fail;
   }
   const bool runtime_v4 = strcmp(engine, "p4-bounded-runtime-v4") == 0;
+  if (cJSON_HasObjectItem(root,"accessory")) {
+#if PET_BLE_ACCESSORY
+    static const char *const shell[]={"schema_version","engine","accessory","vars","states","initial_state","transitions","tick","dashboard"};
+    const char *kind=json_string(root,"accessory");
+    parsed->accessory=!strcmp(kind,"battery-level") ? PET_ACCESSORY_BATTERY :
+                      !strcmp(kind,"ambient-temperature") ? PET_ACCESSORY_TEMPERATURE : 0;
+    if (!runtime_v4 || !parsed->accessory || !object_keys_allowed(root,shell,sizeof(shell)/sizeof(shell[0])) ||
+        cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(root,"vars")) ||
+        cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(root,"transitions")) ||
+        cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(root,"tick"))) {
+      set_error(error,error_size,"invalid foreground accessory declaration"); goto fail;
+    }
+#else
+    set_error(error,error_size,"BLE accessory needs a WiFi6 central/client build"); goto fail;
+#endif
+  }
+  if (cJSON_HasObjectItem(root, "hardware")) {
+    static const char *const shell[] = {"schema_version","engine","hardware","vars","states","initial_state",
+      "transitions","tick","dashboard","fetchers","readers"};
+    static const char *const fields[] = {"service","quiet_below"};
+    const cJSON *hw = cJSON_GetObjectItemCaseSensitive(root, "hardware");
+    const cJSON *limit = cJSON_GetObjectItemCaseSensitive(hw, "quiet_below");
+    if (!runtime_v4 || !object_keys_allowed(root, shell, sizeof(shell)/sizeof(shell[0]))
+        || !cJSON_IsObject(hw) || !object_keys_allowed(hw, fields, 2)
+        || strcmp(json_string(hw, "service"), "microphone-level-v1")
+        || (limit && (!cJSON_IsNumber(limit) || limit->valuedouble != limit->valueint
+                      || limit->valueint < 1 || limit->valueint > 100))) {
+      set_error(error, error_size, "invalid foreground hardware declaration"); goto fail;
+    }
+    parsed->mic_mode = limit ? limit->valueint : -1;
+  }
   parsed->app_expressions=runtime_v4&&!strcmp(json_string(cJSON_GetObjectItemCaseSensitive(root,"surface"),"engine"),"p4-app-surface-v1");
   if(cJSON_HasObjectItem(root,"logic")){
     /* Capability negotiation: only v4 packages that name the exact profile get
@@ -3603,6 +3705,9 @@ static bool __attribute__((optimize("Oz"))) parse_runtime_impl(
       if (!pet_wifi_data_feed_init(&parsed->wifi_feed, widget_id, json_string(data, "url"), response_map, http, connection)) {
         set_error(error, error_size, "invalid wifi.feed URL, connection, response_map or http"); goto fail;
       }
+      if (pet_feed_is_write(parsed->wifi_feed.private.kind) && cJSON_HasObjectItem(data, "refresh_action")) {
+        set_error(error, error_size, "writes require the native send action"); goto fail;
+      }
       source = parsed->wifi_feed.source;
 #else
       set_error(error, error_size, "wifi.feed requires WiFi6 firmware"); goto fail;
@@ -3664,6 +3769,11 @@ static bool __attribute__((optimize("Oz"))) parse_runtime_impl(
     parsed->center_category = PET_CENTER_TOOLS;
   }
   if (!parse_buttons(parsed, buttons_json, error, error_size)) goto fail;
+#if PET_BLE_ACCESSORY
+  if (parsed->accessory && parsed->button_count) {
+    set_error(error,error_size,"accessory panel owns its physical controls"); goto fail;
+  }
+#endif
   if(!parse_input_policy(parsed,root)){set_error(error,error_size,"invalid input policy");goto fail;}
   if(parsed->transition_count>12&&!parsed->input_v1){set_error(error,error_size,"extended transitions require input v1");goto fail;}
   const cJSON *surface=cJSON_GetObjectItemCaseSensitive(root,"surface");
@@ -4448,6 +4558,37 @@ bool pet_p4_miniapp_dispatch_input(
   return pet_p4_miniapp_dispatch_action(resolved_action, now_ms);
 }
 
+void pet_p4_miniapp_hardware_guard(bool foreground) {
+  miniapp_runtime_lock();
+  bool requested=g_runtime.mic_mode!=0;
+#if PET_BLE_ACCESSORY
+  requested |= g_runtime.accessory!=0;
+#endif
+  if (!foreground || !g_runtime.active || !requested) hardware_leave_locked();
+  else if (!g_hw_owner) {
+    if (!++g_hw_generation) ++g_hw_generation;
+    g_hw_owner = g_hw_generation;
+#if PET_BLE_ACCESSORY
+    if (g_runtime.accessory) pet_accessory_select(g_hw_owner,g_runtime.accessory);
+    else
+#endif
+    pet_p4_audio_meter_select(g_hw_owner);
+  }
+  miniapp_runtime_unlock();
+}
+
+bool pet_p4_miniapp_hardware_key(bool down, bool click, uint64_t event_ms) {
+  miniapp_runtime_lock();
+  uint32_t owner = g_hw_owner;
+#if PET_BLE_ACCESSORY
+  if (owner && g_runtime.accessory) pet_accessory_key(owner,down,click,event_ms);
+  else
+#endif
+  if (owner) pet_p4_audio_meter_key(owner, down, click, event_ms);
+  miniapp_runtime_unlock();
+  return owner != 0;
+}
+
 void pet_p4_miniapp_process(uint64_t now_ms, bool visible) {
 #if PET_P4_H264_PREFETCH
   bool native_window=pet_p4_renderer_program_window_begin();
@@ -5213,6 +5354,23 @@ unsigned pet_p4_wasm_package(void *bytes, size_t capacity, size_t *size,
   return revision;
 }
 
+bool pet_p4_wasm_network_policy(unsigned revision, cJSON **policy) {
+  *policy = NULL;
+#if PET_COMPONENT_NETWORK_ENABLED
+  miniapp_runtime_lock();
+  bool current = revision && g_runtime.active && revision == g_image_revision + 1;
+  if (current && g_runtime.wasm_network[0]) {
+    *policy = cJSON_Parse(g_runtime.wasm_network);
+    current = *policy != NULL;
+  }
+  miniapp_runtime_unlock();
+  return current;
+#else
+  (void)revision;
+  return true;
+#endif
+}
+
 #if PET_P4_WASM_AUDIO
 uint32_t pet_p4_wasm_speech_generation(unsigned revision) {
   miniapp_runtime_lock();
@@ -5284,6 +5442,11 @@ bool pet_p4_miniapp_render_snapshot(pet_p4_miniapp_render_snapshot_t *out,
 #if PET_P4_DATA_ROWS
   if(!g_runtime.data_rows.enabled)pet_p4_widget_data_set_filter(NULL,NULL,NULL);
 #endif
+  out->mic_mode = g_runtime.mic_mode;
+#if PET_BLE_ACCESSORY
+  out->accessory=g_runtime.accessory;
+#endif
+  out->hardware_owner = g_hw_owner;
   out->view=g_runtime.view;out->surface_active=false;out->side_active=false;out->images_changed=false;
   out->media_source[0]=0;out->image_revision=g_image_revision;
   out->wasm_revision = g_runtime.active && g_runtime.sprites.wasm_size ? g_image_revision + 1 : 0;
@@ -5348,9 +5511,21 @@ bool pet_p4_miniapp_side_axis(int horizontal){
 }
 
 #if PET_P4_SYSTEM_WIFI
+#if PET_P4_SCOPED_WRITE
+/* Serialize the installed component switch with a single nonblocking TLS write. */
+int pet_p4_miniapp_write_if_active(const uint8_t scope[32], int (*send)(void *), void *context) {
+  miniapp_runtime_lock();
+  int result = -1;
+  if (g_runtime.active && !pet_p4_miniapp_storage_busy() &&
+      pet_feed_is_write(g_runtime.wifi_feed.private.kind) &&
+      !memcmp(scope, g_runtime.wifi_feed.private.id, 32)) result = send(context);
+  miniapp_runtime_unlock();
+  return result;
+}
+#endif
 bool pet_p4_miniapp_private_feed(pet_private_feed_t *feed, pet_wifi_endpoint_t *endpoint) {
   miniapp_runtime_lock();
-  const bool found = g_runtime.active && pet_feed_requires_account(g_runtime.wifi_feed.private.kind);
+  const bool found = g_runtime.active && !pet_p4_miniapp_storage_busy() && pet_feed_requires_account(g_runtime.wifi_feed.private.kind);
   if (found) {
     if (feed) *feed = g_runtime.wifi_feed.private;
     if (endpoint) *endpoint = g_runtime.wifi_feed.endpoint;
@@ -5361,16 +5536,20 @@ bool pet_p4_miniapp_private_feed(pet_private_feed_t *feed, pet_wifi_endpoint_t *
 #endif
 
 void pet_p4_miniapp_host_process(uint64_t now_ms,bool visible,bool pc_connected){
-  char media_source[48]="";
+  char media_source[PET_P4_MEDIA_SOURCE_MAX]="";
 #if PET_P4_SYSTEM_WIFI
   char media_widget[PET_P4_MINIAPP_WIDGET_ID_MAX] = "";
   static bool wifi_playlist_visible;
   static uint32_t wifi_playlist_revision;
   static EXT_RAM_BSS_ATTR char playlist_snapshot[PET_P4_MEDIA_WIFI_PLAYLIST_BYTES];
+#endif
   miniapp_runtime_lock();
-  bool media_active = g_runtime.active && g_runtime.media && g_runtime.surface.count;
+  bool media_active = g_runtime.active && g_runtime.media;
+  if (media_active) copy_utf8(media_source, sizeof(media_source), g_runtime.media_source);
+  else if (g_runtime.active && g_runtime.app_host)
+    snprintf(media_source, sizeof(media_source), "app.%s", g_runtime.widget_id);
+#if PET_P4_SYSTEM_WIFI
   if (media_active) {
-    memcpy(media_source, g_runtime.media_source, sizeof(media_source));
     copy_utf8(media_widget, sizeof(media_widget), g_runtime.widget_id);
   }
   const uint32_t media_revision = g_image_revision;
@@ -5378,7 +5557,9 @@ void pet_p4_miniapp_host_process(uint64_t now_ms,bool visible,bool pc_connected)
   const bool load_playlist = use_playlist &&
     (!wifi_playlist_visible || wifi_playlist_revision != media_revision);
   if (load_playlist) memcpy(playlist_snapshot, g_runtime.wifi_playlist, sizeof(playlist_snapshot));
+#endif
   miniapp_runtime_unlock();
+#if PET_P4_SYSTEM_WIFI
   cJSON *playlist = load_playlist ? cJSON_Parse(playlist_snapshot) : NULL;
   pet_p4_media_authorize_live_playlist_revision(media_widget, media_source, visible && media_active,
     pc_connected, media_revision, playlist);
@@ -5387,10 +5568,8 @@ void pet_p4_miniapp_host_process(uint64_t now_ms,bool visible,bool pc_connected)
   cJSON_Delete(playlist);
 #else
   (void)pc_connected;
-  bool media_active=pet_p4_miniapp_media_config(media_source,NULL);
 #endif
-  pet_p4_media_visibility(media_source,visible&&media_active,now_ms);
-  static char prior[48];
+  pet_p4_media_visibility(media_source,visible,now_ms);
   char id[48]="";uint32_t rev;uint8_t page;
 #if PET_SERVICE_BRIDGE_ENABLED
   char binding[65]={0};
@@ -5423,11 +5602,6 @@ void pet_p4_miniapp_host_process(uint64_t now_ms,bool visible,bool pc_connected)
   if (wifi_feed.source[0]) pet_wifi_data_observe_feed(&wifi_feed);
   else pet_wifi_data_observe(wifi_source);
 #endif
-  if(prior[0]&&(!visible||strcmp(prior,id))){
-    static EXT_RAM_BSS_ATTR pet_p4_media_view_t media;pet_p4_media_view(&media);
-    if(!strncmp(media.source,"app.",4)&&!strcmp(media.source+4,prior)&&pet_p4_audio_music_active())pet_p4_audio_stream_flush();
-  }
-  copy_utf8(prior,sizeof(prior),id);
   /* An empty current ID still closes the previous host instance. */
 #if PET_SERVICE_BRIDGE_ENABLED
   pet_app_host_tick_bound(id,rev,page,visible&&id[0],now_ms,binding);
@@ -5468,7 +5642,12 @@ bool pet_p4_miniapp_sync_stats(const pet_p4_stats_model_t *stats) {
   char breakdown[64];
   const char *agent_label;
   bool changed = false;
-  if (!stats || (stats->valid == 0 && !stats->source[0] && !stats->session_title[0])) return false;
+  if (!stats) return false;
+  miniapp_runtime_lock();
+  if (!g_runtime.active || strcmp(g_runtime.widget_id, "token-usage") != 0) {
+    miniapp_runtime_unlock();
+    return false;
+  }
 
   format_compact_u64(total, sizeof(total), stats->total_tokens,
                      stats->valid & PET_P4_STATS_HAS_TOTAL_TOKENS);
@@ -5493,17 +5672,18 @@ bool pet_p4_miniapp_sync_stats(const pet_p4_stats_model_t *stats) {
   } else if (strcmp(stats->source, "openclaw") == 0) {
     agent_label = "OpenClaw";
   } else {
-    agent_label = stats->source[0] ? stats->source : "Agent";
+    agent_label = stats->source[0] ? stats->source : "当前 Agent";
   }
 
-  miniapp_runtime_lock();
-  if (g_runtime.active && strcmp(g_runtime.widget_id, "token-usage") == 0) {
+  {
     changed |= set_string_var(&g_runtime, "agent_label", agent_label);
     changed |= set_string_var(&g_runtime, "total_display", total);
     changed |= set_string_var(&g_runtime, "input_display", input);
     changed |= set_string_var(&g_runtime, "output_display", output);
     changed |= set_string_var(&g_runtime, "cache_display", cache_label);
-    changed |= set_string_var(&g_runtime, "headline_text", "今日消耗");
+    const uint32_t token_fields = PET_P4_STATS_HAS_TOTAL_TOKENS | PET_P4_STATS_HAS_INPUT_TOKENS
+      | PET_P4_STATS_HAS_OUTPUT_TOKENS | PET_P4_STATS_HAS_CACHED_TOKENS;
+    changed |= set_string_var(&g_runtime, "headline_text", stats->valid & token_fields ? "已上报用量" : "等待用量统计");
     changed |= set_string_var(&g_runtime, "breakdown_text", breakdown);
     if (changed) refresh_view(&g_runtime);
   }
@@ -5830,6 +6010,8 @@ static void center_title_path(unsigned slot, unsigned generation, bool temporary
   snprintf(out, capacity, "/spiffs/p4ct%02u-%u.%s", slot, generation,
       temporary ? "tmp" : "rle");
 }
+
+#include "pet_p4_center_thumb.inc"
 
 static bool write_center_title(unsigned slot, unsigned generation, const uint8_t *mask, size_t length) {
   char path[40], temporary[40];
@@ -6452,7 +6634,8 @@ static bool write_catalog_snapshot_at(
     char widget_checksum[9];
     char buttons_checksum[9];
     char sprites_checksum[9];
-    char center_title_checksum[9];
+    char center_title_checksum[9], thumb[9];
+    snprintf(thumb, sizeof(thumb), "%08x", catalog[i].center_thumb_checksum);
     if (!item) goto done;
     snprintf(widget_checksum, sizeof(widget_checksum), "%08x", catalog[i].widget_checksum);
     snprintf(buttons_checksum, sizeof(buttons_checksum), "%08x", catalog[i].buttons_checksum);
@@ -6462,6 +6645,12 @@ static bool write_catalog_snapshot_at(
            !cJSON_AddStringToObject(item, "packageVersion", catalog[i].package_metadata.version))
         || (catalog[i].package_metadata.kind[0] &&
            !cJSON_AddStringToObject(item, "packageKind", catalog[i].package_metadata.kind))
+#if PET_P4_SYSTEM_WIFI
+        || (catalog[i].community_save[0] && !cJSON_AddStringToObject(item,"communitySave",catalog[i].community_save))
+#endif
+        || (catalog[i].center_thumb_checksum &&
+            (!cJSON_AddStringToObject(item,"thumb",thumb) ||
+             !cJSON_AddNumberToObject(item,"thumbBank",catalog[i].center_thumb_generation)))
         || (catalog[i].center_title_checksum &&
            !cJSON_AddStringToObject(item, "centerTitleChecksum", center_title_checksum))
         ||!cJSON_AddStringToObject(item, "widgetId", catalog[i].widget_id)
@@ -6491,6 +6680,7 @@ static bool write_catalog_snapshot_at(
   );
 #endif
   if (ok) {
+    center_thumb_catalog(target_generation,catalog,count,true);
     commit->generation = target_generation;
     commit->sequence = next_sequence;
   }
@@ -6823,8 +7013,19 @@ static bool __attribute__((optimize("Oz"))) load_catalog_snapshot(
     snapshot->items[count].package_metadata = pet_p4_component_metadata_fields(
       cJSON_GetObjectItemCaseSensitive(item, "packageVersion"),
       cJSON_GetObjectItemCaseSensitive(item, "packageKind"));
+#if PET_P4_SYSTEM_WIFI
+    const char *grant=json_string(item,"communitySave");
+    const size_t grant_size=strlen(grant);
+    if ((grant_size==32 || grant_size==64) && strspn(grant,"0123456789abcdef")==grant_size)
+      strcpy(snapshot->items[count].community_save,grant);
+#endif
     snapshot->items[count].slot = (uint8_t) slot;
     snapshot->items[count].package_generation = (uint8_t) package_generation;
+    const cJSON *thumb_bank = cJSON_GetObjectItemCaseSensitive(item,"thumbBank");
+    if (cJSON_IsNumber(thumb_bank) && (thumb_bank->valuedouble == 0 || thumb_bank->valuedouble == 1 || thumb_bank->valuedouble == 2)) {
+      snapshot->items[count].center_thumb_generation = (uint8_t)thumb_bank->valueint;
+      (void)parse_checksum_hex(item,"thumb",&snapshot->items[count].center_thumb_checksum);
+    }
     (void)parse_checksum_hex(item, "centerTitleChecksum", &snapshot->items[count].center_title_checksum);
     if (!parse_checksum_hex(item, "widgetChecksum", &snapshot->items[count].widget_checksum)
         || !parse_checksum_hex(item, "buttonsChecksum", &snapshot->items[count].buttons_checksum)
@@ -7965,6 +8166,7 @@ static bool activate_catalog_index_in_memory(size_t index) {
 #if PET_COMPONENT_PROGRAM_ENABLED
   component_program_retire_locked();
 #endif
+  hardware_leave_locked();
   g_runtime = *next; g_image_revision++;
   g_catalog_selected = index;
   miniapp_runtime_unlock();
@@ -8112,6 +8314,7 @@ static pet_p4_miniapp_activation_result_t activate_catalog_index_prepared(size_t
 #if PET_COMPONENT_PROGRAM_ENABLED
   component_program_retire_locked();
 #endif
+  hardware_leave_locked();
   g_runtime = *next; g_image_revision++;
   g_catalog_selected = index;
   if(token)g_activation.published=true;
@@ -8275,10 +8478,13 @@ esp_err_t pet_p4_miniapp_init(void) {
   miniapp_catalog_snapshot_t *snapshot1;
   miniapp_catalog_snapshot_t *selected = NULL;
   uint32_t highest_seen_sequence = 0;
+  miniapp_runtime_lock();
 #if PET_COMPONENT_PROGRAM_ENABLED
-  miniapp_runtime_lock();component_program_retire_locked();miniapp_runtime_unlock();
+  component_program_retire_locked();
 #endif
+  hardware_leave_locked();
   memset(&g_runtime, 0, sizeof(g_runtime));
+  miniapp_runtime_unlock();
   widget_install_stage_reset();
   g_image_used=0;g_image_next=0;g_image_id[0]=0;
   memset(g_catalog, 0, sizeof(g_catalog));
@@ -8298,6 +8504,10 @@ esp_err_t pet_p4_miniapp_init(void) {
   }
   (void) load_catalog_snapshot(0, snapshot0);
   (void) load_catalog_snapshot(1, snapshot1);
+  memset(center_thumb_ref,0,sizeof(center_thumb_ref));
+  memset(center_thumb_known,0,sizeof(center_thumb_known));
+  if(snapshot0->parsed)center_thumb_catalog(0,snapshot0->items,snapshot0->count,false);
+  if(snapshot1->parsed)center_thumb_catalog(1,snapshot1->items,snapshot1->count,false);
   selected=catalog_latest_snapshot(snapshot0,snapshot1,&highest_seen_sequence);
 
   if (selected) {
@@ -8305,6 +8515,14 @@ esp_err_t pet_p4_miniapp_init(void) {
     int64_t validation_started = esp_timer_get_time();
     unsigned current_loads = 0, backup_loads = 0;
     (void) validate_catalog_snapshot(selected, NULL, &current_loads);
+    /* A scratch allocation failure leaves the newest entries unchecked.
+     * Recovering against them would durably publish older package generations. */
+    if (current_loads != selected->count) {
+      g_catalog_recovery_blocked = true;
+      free(snapshot0);
+      free(snapshot1);
+      return ESP_ERR_NO_MEM;
+    }
     if (backup->parsed) (void) validate_catalog_snapshot(backup, selected, &backup_loads);
     ESP_LOGI(TAG, "catalog boot current_checked=%u backup_checked=%u validate_us=%lld",
       current_loads, backup_loads, (long long)(esp_timer_get_time() - validation_started));
@@ -8461,7 +8679,7 @@ bool pet_p4_miniapp_catalog_recovery_blocked(void) {
 }
 
 bool pet_p4_miniapp_resource_repair_active(void) {
-  return g_staging.active && g_staging.repair_resources;
+  return g_staging.active && (g_staging.repair_resources || g_staging.thumb_match_present);
 }
 
 size_t pet_p4_miniapp_catalog_count(void) {
@@ -8494,10 +8712,16 @@ static bool catalog_get_filtered(size_t index, pet_center_filter_t filter, pet_p
     copy_utf8(out->widget_id, sizeof(out->widget_id), g_catalog[index].widget_id);
     copy_utf8(out->title, sizeof(out->title), g_catalog[index].title);
     out->package_metadata = g_catalog[index].package_metadata;
+#if PET_P4_SYSTEM_WIFI
+    out->community_owned = g_catalog[index].community_save[0]!=0;
+    out->community_persist = strlen(g_catalog[index].community_save)==64;
+#endif
     out->active = g_runtime.active
       && strcmp(g_runtime.widget_id, g_catalog[index].widget_id) == 0;
     out->resource_state = g_catalog[index].resource_state;
     out->image_count = g_catalog[index].image_count;
+    out->center_thumb_checksum = g_catalog[index].center_thumb_checksum;
+    out->center_thumb_generation = g_catalog[index].center_thumb_generation;
     out->center_title_checksum = g_catalog[index].center_title_checksum;
     out->center_title_slot = g_catalog[index].slot;
     out->center_title_generation = g_catalog[index].package_generation;
@@ -8776,6 +9000,7 @@ bool pet_p4_miniapp_install_begin(const cJSON *payload, char *error, size_t erro
   g_image_used=0;g_image_next=0;g_image_id[0]=0;
   g_staging.active = true;
   g_staging.repair_resources = repair_resources;
+  g_staging.thumb_only = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(payload,"thumbOnly"));
 #if PET_P4_STORAGE_PRESERVE_UNCHANGED
   g_staging.preserve_unchanged=cJSON_IsTrue(preserve);
 #endif
@@ -8947,6 +9172,22 @@ static bool install_chunk_owned(const cJSON *payload, char *error, size_t error_
       return false;
     }
     g_staging.buttons_next_index += 1U;
+  } else if (!strcmp(path,"runtime/center-thumb.match")) {
+    size_t used=0;
+    if (!g_staging.files.enabled || index != 0 ||
+        !decode_chunk(data,(char *)g_staging.thumb_match,sizeof(g_staging.thumb_match),&used,&decoded_len,true,error,error_size) ||
+        used != 32 || !verify_chunk_integrity(payload,g_staging.thumb_match,used,error,error_size)) return false;
+    g_staging.thumb_match_present=true;
+  } else if (strcmp(path, "runtime/center-thumb.p4t") == 0) {
+    size_t used = 0;
+    if (index != 0 || !decode_chunk(data,(char *)g_staging.center_thumb,sizeof(g_staging.center_thumb),
+        &used,&decoded_len,true,error,error_size) || used != PET_CENTER_THUMB_BYTES ||
+        !verify_chunk_integrity(payload,g_staging.center_thumb,used,error,error_size)) {
+      g_staging.center_thumb_len = 0;
+      set_error(error,error_size,"invalid launcher thumbnail");
+      return false;
+    }
+    g_staging.center_thumb_len = used;
   } else if (strcmp(path, "runtime/center-title.rle") == 0) {
     if ((uint32_t)index + 1U == g_staging.center_title_next_index) return true;
     if ((uint32_t)index != g_staging.center_title_next_index) {
@@ -9274,6 +9515,8 @@ static int preserve_unchanged_package(const miniapp_runtime_t *next, uint32_t ti
   char path[48];
   catalog_slot_path(item.slot,item.package_generation,false,false,path,sizeof(path));
   int result=pet_file_exact(path,g_staging.widget_json,g_staging.widget_len,NULL,0,unchanged_storage_current);
+  if(result==PET_FILE_EXACT_MATCH && g_staging.center_thumb_len && !center_thumb_matches(&item))
+    result=PET_FILE_EXACT_DIFFERENT;
   if(result==1){
     catalog_slot_path(item.slot,item.package_generation,true,false,path,sizeof(path));
     result=pet_file_exact(path,g_staging.buttons_json,g_staging.buttons_len,NULL,0,unchanged_storage_current);
@@ -9359,6 +9602,57 @@ static bool widget_commit_audio_busy(void) {
   return usage.realtime_reservations != 0;
 }
 
+/* A repair carries only the thumbnail and a SHA-256 of the installed runtime.
+ * Ownership, state, saved bindings and package generations stay in place. */
+static bool commit_thumb_repair(const cJSON *payload,widget_commit_live_fn live,void *context,char *error,size_t error_size) {
+  if (!g_staging.thumb_match_present || g_staging.center_thumb_len!=PET_CENTER_THUMB_BYTES ||
+      g_staging.files.file_count!=2 || g_staging.files.total_bytes!=32+PET_CENTER_THUMB_BYTES ||
+      strcmp(json_string(payload,"widgetId"),g_staging.widget_id) || g_catalog_recovery_blocked) {
+    set_error(error,error_size,"invalid thumbnail repair manifest");
+    return false;
+  }
+  pet_storage_scope_t storage __attribute__((cleanup(storage_scope_finish)))={0};
+  if (widget_commit_audio_busy() || !storage_scope_begin(&storage,false)) {
+    set_error(error,error_size,PET_P4_WIDGET_COMMIT_STORAGE_DEFERRED);
+    return false;
+  }
+  int at=catalog_find(g_catalog,g_catalog_count,g_staging.widget_id);
+  if (at<0) {set_error(error,error_size,"component is not installed");return false;}
+  miniapp_catalog_item_t *catalog __attribute__((cleanup(catalog_scratch_free)))=malloc(sizeof(g_catalog));
+  if (!catalog) {set_error(error,error_size,"thumbnail catalog allocation failed");return false;}
+  memcpy(catalog,g_catalog,sizeof(g_catalog));
+  char active[PET_P4_MINIAPP_WIDGET_ID_MAX]={0},selected[PET_P4_MINIAPP_WIDGET_ID_MAX]={0};
+  if(g_runtime.active)copy_utf8(active,sizeof(active),g_runtime.widget_id);
+  if(g_catalog_selected<g_catalog_count)copy_utf8(selected,sizeof(selected),g_catalog[g_catalog_selected].widget_id);
+  if(!pet_storage_scope_advance(&storage,PET_STORAGE_PREPARE)||!pet_storage_scope_unlock(&storage))return false;
+  char path[40]; size_t bytes=0; uint8_t digest[32];
+  catalog_slot_path(catalog[at].slot,catalog[at].package_generation,false,false,path,sizeof(path));
+  if (!read_binary_file(path,(uint8_t *)g_staging.widget_json,sizeof(g_staging.widget_json)-1,&bytes) ||
+      mbedtls_sha256((uint8_t *)g_staging.widget_json,bytes,digest,0)!=0 || memcmp(digest,g_staging.thumb_match,32)) {
+    set_error(error,error_size,"installed runtime differs from thumbnail source");
+    return false;
+  }
+  if (!center_thumb_matches(&catalog[at])) {
+    miniapp_catalog_commit_t commit;
+    if (!stage_center_thumb(&catalog[at]) || widget_commit_audio_busy() || !storage_work_current() ||
+        (live && !live(context)) || !write_catalog_snapshot_at(catalog,g_catalog_count,active,selected,
+            g_catalog_seed_pending,g_catalog_file_generation,g_catalog_sequence,&commit)) {
+      set_error(error,error_size,"thumbnail catalog commit unconfirmed");
+      return false;
+    }
+    (void)pet_storage_scope_advance(&storage,PET_STORAGE_DURABLE);
+    (void)pet_storage_scope_lock(&storage);
+    miniapp_runtime_lock();
+    g_catalog[at].center_thumb_checksum=catalog[at].center_thumb_checksum;
+    g_catalog[at].center_thumb_generation=catalog[at].center_thumb_generation;
+    g_catalog_file_generation=commit.generation;g_catalog_sequence=commit.sequence;
+    miniapp_runtime_unlock();
+    (void)pet_storage_scope_advance(&storage,PET_STORAGE_PUBLISHED);
+  } else if (live && !live(context)) return false;
+  widget_install_stage_reset();
+  return true;
+}
+
 static bool transfer_commit_fenced(const cJSON *payload, char *error, size_t error_size,
                                    widget_commit_live_fn live, void *context) {
   if (g_staging.files.enabled && (!transfer_matches(payload) || !widget_transfer_complete(payload))) {
@@ -9371,11 +9665,14 @@ static bool transfer_commit_fenced(const cJSON *payload, char *error, size_t err
       ? PET_P4_WIDGET_COMMIT_AUDIO_BUSY : PET_P4_WIDGET_COMMIT_STORAGE_DEFERRED);
     return false;
   }
-  if (report_receipt && !order_widget_resources(g_staging.widget_json, &g_staging.sprites)) {
+  const bool thumb_only = g_staging.thumb_match_present || g_staging.thumb_only;
+  if (report_receipt && !thumb_only && !order_widget_resources(g_staging.widget_json, &g_staging.sprites)) {
     set_error(error, error_size, "component image or sprite IDs do not match the declaration; existing package preserved");
     return false;
   }
-  if (!install_commit_fenced(payload, error, error_size, live, context)) return false;
+  if (thumb_only) {
+    if (!report_receipt || !commit_thumb_repair(payload,live,context,error,error_size)) return false;
+  } else if (!install_commit_fenced(payload, error, error_size, live, context)) return false;
   if (report_receipt) {
     copy_utf8(g_widget_transfer_receipt.id, sizeof(g_widget_transfer_receipt.id), json_string(payload, "transferId"));
     copy_utf8(g_widget_transfer_receipt.digest, sizeof(g_widget_transfer_receipt.digest), json_string(payload, "packageSha256"));
@@ -9392,9 +9689,13 @@ bool pet_p4_miniapp_transfer_commit(const cJSON *payload, char *error, size_t er
 #if PET_P4_SYSTEM_WIFI
 bool pet_p4_miniapp_lan_commit(const cJSON *payload, bool (*live)(void *), void *context,
                                 char *error, size_t error_size) {
-  return live && (!g_lan_bundle_owned || g_staging.buttons_len) &&
+  return live && (!g_lan_bundle_owned || g_staging.buttons_len || g_staging.thumb_match_present) &&
     transfer_commit_fenced(payload, error, error_size, live, context);
 }
+#endif
+
+#if PET_P4_SYSTEM_WIFI
+#include "pet_p4_community_store.inc"
 #endif
 
 bool pet_p4_miniapp_install_commit(const cJSON *payload, char *error, size_t error_size) {
@@ -9587,6 +9888,8 @@ static bool install_commit_fenced(const cJSON *payload, char *error, size_t erro
       return false;
     }
     catalog_index = next_count++;
+    next_catalog[catalog_index].center_thumb_checksum = 0;
+    next_catalog[catalog_index].center_thumb_generation = 0;
     next_catalog[catalog_index].slot = (uint8_t) slot;
     package_generation = 0;
     new_component = true;
@@ -9626,6 +9929,11 @@ static bool install_commit_fenced(const cJSON *payload, char *error, size_t erro
   );
   if (!g_staging.repair_resources)
     next_catalog[catalog_index].package_metadata = g_staging.package_metadata;
+#if PET_P4_SYSTEM_WIFI
+  /* Only the verified on-device path can set this stamp. Ordinary installs
+   * replacing an ID also replace its provenance in the same catalog commit. */
+  strcpy(next_catalog[catalog_index].community_save,g_staging.community_save);
+#endif
   next_catalog[catalog_index].center_title_checksum = title_checksum;
   next_catalog[catalog_index].center_category = next->center_category;
   next_catalog[catalog_index].package_generation = package_generation;
@@ -9652,6 +9960,7 @@ static bool install_commit_fenced(const cJSON *payload, char *error, size_t erro
                                 g_staging.widget_json,g_staging.widget_len)
       || !write_spare_package_json((size_t)slot,package_generation,true,
                                    g_staging.buttons_json,g_staging.buttons_len)
+      || !stage_center_thumb(&next_catalog[catalog_index])
       || (title_mask && !write_center_title((unsigned)slot, package_generation, title_mask, title_mask_length))
       || !persist_sprite_pack((size_t) slot, package_generation, &g_staging.sprites)
 #if PET_P4_CAPABILITY_EXT
@@ -9723,7 +10032,11 @@ static bool install_commit_fenced(const cJSON *payload, char *error, size_t erro
   }
   const char *next_cursor=g_staging.repair_resources&&g_catalog_selected<g_catalog_count
     ?g_catalog[g_catalog_selected].widget_id:g_staging.widget_id;
-  if(!write_catalog_snapshot_at(next_catalog,next_count,
+  if(
+#if PET_P4_EVENTS
+       !local_alarm_retire(slot,g_staging.widget_id,&next_catalog[catalog_index]) ||
+#endif
+       !write_catalog_snapshot_at(next_catalog,next_count,
        g_staging.repair_resources&&prior_active[0]?prior_active:g_staging.widget_id,
        next_cursor,g_builtin_sync_in_progress&&g_catalog_seed_pending,
        base_generation,base_sequence,&commit)){
@@ -9760,6 +10073,7 @@ static bool install_commit_fenced(const cJSON *payload, char *error, size_t erro
 #if PET_COMPONENT_PROGRAM_ENABLED
     component_program_retire_locked();
 #endif
+    hardware_leave_locked();
     g_runtime = *next; g_image_revision++;
     g_catalog_selected = catalog_index;
   }
@@ -10253,6 +10567,9 @@ static bool remove_component(const char *widget_id, char *error, size_t error_si
       ||!pet_storage_scope_unlock(&storage)){
     set_error(error,error_size,"storage command owner was not current");return false;
   }
+  if(preserve_save&&!pet_app_store_preserve_with_lease(widget_id,g_storage_resource_lease)){
+    set_error(error,error_size,"private save checkpoint failed; original component retained");return false;
+  }
   if (removing_active) {
     int visible=catalog_visible_preferred_in(next_catalog,next_count,(int)next_selected);
     if (visible >= 0) {
@@ -10298,7 +10615,17 @@ static bool remove_component(const char *widget_id, char *error, size_t error_si
     free(next_runtime);set_error(error,error_size,"deletion cancelled before catalog commit; original component preserved");return false;
   }
 #endif
-  if (!write_catalog_snapshot_at(next_catalog, next_count, next_active_id,
+  if (
+#if PET_P4_EVENTS
+      !local_alarm_retire(removed_slot,widget_id,NULL) ||
+#endif
+#if PET_COMPONENT_NETWORK_ENABLED
+      !pet_net_device_forget(widget_id) ||
+#endif
+#if PET_P4_SCOPED_WRITE
+      !pet_private_retire_component(widget_id) ||
+#endif
+      !write_catalog_snapshot_at(next_catalog, next_count, next_active_id,
                                  next_count?next_catalog[next_selected].widget_id:NULL,false,
                                  base_generation,base_sequence,&commit)) {
 #if PET_P4_CAPABILITY_EXT
@@ -10312,19 +10639,25 @@ static bool remove_component(const char *widget_id, char *error, size_t error_si
   }
   (void)pet_storage_scope_advance(&storage,PET_STORAGE_DURABLE);
   (void)pet_storage_scope_lock(&storage);
-  (void)save_app_runtime();
+  /* Inputs can advance while the catalog is written. Capture the final
+   * committed model on the state lane before publishing the replacement. */
+  bool captured=save_app_runtime();
   if(removing_active&&next_runtime)merge_live_persistent_runtime(next_runtime);
+  bool publishable=!preserve_save||!removing_active||captured;
 #if PET_P4_CAPABILITY_EXT
-  if(removing_active&&!miniapp_ext_commit(&media_ticket)){
+  if(publishable&&removing_active)publishable=miniapp_ext_commit(&media_ticket);
+#endif
+  if(!publishable){
     g_catalog_recovery_blocked=true;
-    /* Resolve the physical job as quarantined, keeping the old runtime/files. */
+    /* Keep the old runtime and its last committed model available for saving. */
     (void)pet_storage_scope_advance(&storage,PET_STORAGE_PUBLISHED);
     (void)pet_storage_scope_advance(&storage,PET_STORAGE_CLEANUP);
     (void)pet_storage_scope_unlock(&storage);
+#if PET_P4_CAPABILITY_EXT
     (void)miniapp_ext_abort(&media_ticket);
-    free(next_runtime);set_error(error,error_size,"durable deletion media publication failed; old runtime retained, recovery required");return false;
-  }
 #endif
+    free(next_runtime);set_error(error,error_size,"durable deletion publication failed; old runtime retained, recovery required");return false;
+  }
   PET_WIDGET_TRACE_SCOPE(trace_publish, PET_WTRACE_PUBLISH);
   miniapp_runtime_lock();
   /* A user may browse the catalog while flash is busy. Keep that selection by
@@ -10342,6 +10675,7 @@ static bool remove_component(const char *widget_id, char *error, size_t error_si
 #if PET_COMPONENT_PROGRAM_ENABLED
     component_program_retire_locked();
 #endif
+    hardware_leave_locked();
     if (next_runtime) {g_runtime = *next_runtime;g_image_revision++;}
     else memset(&g_runtime, 0, sizeof(g_runtime));
   }
@@ -10357,6 +10691,9 @@ static bool remove_component(const char *widget_id, char *error, size_t error_si
   miniapp_ext_removed(widget_id, removed_slot);
 #endif
 
+  if(preserve_save&&removing_active&&!pet_app_store_preserve_with_lease(widget_id,g_storage_resource_lease)){
+    set_error(error,error_size,"component removed; final save checkpoint unconfirmed; inspect before retry");return false;
+  }
   pet_file_cleanup_target_t targets[MINIAPP_DELETE_TARGETS];
   pet_file_cleanup_plan_t cleanup;
   uint32_t cleanup_sequence=g_catalog_sequence;

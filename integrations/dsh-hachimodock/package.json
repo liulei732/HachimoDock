@@ -18,14 +18,13 @@
     "capability.js",
     "pair.js",
     "windows-acl.js",
-    "windows-acl.ps1",
+    "windows-acl.exe",
     "host-contract.js",
     "managed-install.js",
     "vendor/js-yaml.cjs",
     "vendor/js-yaml-LICENSE",
     "dsh-state-contract.js",
-    "profile-metadata-windows-acl.js",
-    "profile-metadata-windows-acl.ps1"
+    "profile-metadata-windows-acl.js"
   ],
   "scripts": {
     "test": "node --test"

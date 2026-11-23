@@ -28,6 +28,7 @@ pub fn computer_status() -> DataSnapshot {
 pub fn local_widget_snapshot(source: String) -> Result<DataSnapshot, String> {
     match source.as_str() {
         "computer.status" => Ok(computer_status()),
+        "stocks.watchlist" => crate::stock_quotes::preview_snapshot(),
         "location.current" => Ok(crate::shared_location::snapshot()),
         "todos.upcoming" => Ok(crate::todos::snapshot()),
         other if crate::auth_provider::is_source(other) => crate::auth_provider::snapshot(other),
@@ -70,6 +71,7 @@ struct Sampler {
     system: sysinfo::System,
     networks: sysinfo::Networks,
     sampled: Instant,
+    peak_cpu: f32,
 }
 impl Sampler {
     fn new() -> Self {
@@ -79,6 +81,7 @@ impl Sampler {
             system,
             networks: sysinfo::Networks::new_with_refreshed_list(),
             sampled: Instant::now(),
+            peak_cpu: 0.0,
         }
     }
     fn sample(&mut self) -> DataSnapshot {
@@ -102,11 +105,15 @@ impl Sampler {
         } else {
             "—".into()
         };
+        let cpu = self.system.global_cpu_usage();
+        self.peak_cpu = self.peak_cpu.max(cpu);
+        let uptime = sysinfo::System::uptime();
+        let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / 1073741824.0);
         let rows = vec![
             row(
                 "cpu",
                 "CPU",
-                format!("{:.0}%", self.system.global_cpu_usage()),
+                format!("{cpu:.0}%"),
                 String::new(),
                 "处理器总占用",
             ),
@@ -140,16 +147,30 @@ impl Sampler {
                 "开机时长",
                 format!(
                     "{}h {}m",
-                    sysinfo::System::uptime() / 3600,
-                    sysinfo::System::uptime() % 3600 / 60
+                    uptime / 3600,
+                    uptime % 3600 / 60
                 ),
                 String::new(),
                 "电脑启动至今",
             ),
+            row("available", "可用内存",
+                if total > 0 { gib(self.system.available_memory()) } else { "—".into() },
+                String::new(), "系统可供分配的内存"),
+            row("swap", "交换空间", gib(self.system.used_swap()),
+                gib(self.system.total_swap()), "已用 / 总量"),
+            row("peak_cpu", "CPU 峰值", format!("{:.0}%", self.peak_cpu),
+                String::new(), "客户端本次运行的采样峰值"),
         ];
         snapshot(rows, "ok", "")
     }
 }
+fn todo_due(last: Option<&(Route, Instant, serde_json::Value)>, route: &Route,
+           now: Instant, payload: &serde_json::Value, ttl_ms: u64) -> bool {
+    last.is_none_or(|(old_route, sent, old)| {
+        old_route != route || old != payload || now.duration_since(*sent) >= Duration::from_millis(ttl_ms / 2)
+    })
+}
+
 pub fn start(usb: crate::usb_serial::UsbSerialManager) {
     let providers_usb = usb.clone();
     // Provider HTTP deadlines must not stall the local sampler or expiry updates.
@@ -174,6 +195,7 @@ pub fn start(usb: crate::usb_serial::UsbSerialManager) {
         .name("local-widget-sampler".into())
         .spawn(move || {
             let mut sampler = Sampler::new();
+            let mut todo_sent = None;
             let mut location_sent: Option<(Route, Instant, String)> = None;
             loop {
                 std::thread::sleep(Duration::from_secs(2));
@@ -183,11 +205,18 @@ pub fn start(usb: crate::usb_serial::UsbSerialManager) {
                 }
                 let Some(target) = Target::current(&usb) else {
                     location_sent = None;
+                    todo_sent = None;
                     continue;
                 };
-                for snapshot in [sample, crate::todos::snapshot()] {
-                    if let Ok(payload) = serde_json::to_value(snapshot) {
-                        let _ = target.publish(&usb, &payload);
+                if let Ok(payload) = serde_json::to_value(sample) {
+                    let _ = target.publish(&usb, &payload);
+                }
+                let todos = crate::todos::snapshot();
+                let ttl_ms = u64::from(todos.ttl_ms);
+                if let Ok(payload) = serde_json::to_value(todos) {
+                    if todo_due(todo_sent.as_ref(), &target.route, Instant::now(), &payload, ttl_ms) {
+                        todo_sent = target.publish(&usb, &payload).ok()
+                            .map(|()| (target.route.clone(), Instant::now(), payload));
                     }
                 }
                 if target.supports_expiry() {
@@ -217,6 +246,33 @@ pub fn start(usb: crate::usb_serial::UsbSerialManager) {
 mod tests {
     use super::*;
     #[test]
+    fn unchanged_todos_renew_before_expiry_and_new_route_sends_immediately() {
+        let route = Route::Usb {board:"test".into(), connection:1};
+        let next = Route::Usb {board:"test".into(), connection:2};
+        let now = Instant::now();
+        let data = serde_json::json!({"status":"ok","rows":[]});
+        let last = Some((route.clone(), now, data.clone()));
+        assert!(todo_due(None, &route, now, &data, 30_000));
+        assert!(!todo_due(last.as_ref(), &route, now + Duration::from_secs(14), &data, 30_000));
+        assert!(todo_due(last.as_ref(), &route, now + Duration::from_secs(15), &data, 30_000));
+        assert!(todo_due(last.as_ref(), &next, now, &data, 30_000));
+        assert!(todo_due(last.as_ref(), &route, now, &serde_json::Value::Null, 30_000));
+
+        let mut sent = None;
+        let mut deliveries = 0;
+        for tick in 0..=150 {
+            let at = now + Duration::from_secs(tick * 2);
+            if todo_due(sent.as_ref(), &route, at, &data, 30_000) {
+                if let Some((_, previous, _)) = sent.as_ref() {
+                    assert!(at.duration_since(*previous) < Duration::from_secs(30));
+                }
+                deliveries += 1;
+                sent = Some((route.clone(), at, data.clone()));
+            }
+        }
+        assert_eq!(deliveries, 19);
+    }
+    #[test]
     fn rate_uses_measured_interval() {
         assert_eq!(rate(2048, 2.0), "1.0 KiB/s");
         assert_eq!(rate(2097152, 2.0), "1.0 MiB/s");
@@ -224,8 +280,17 @@ mod tests {
     }
     #[test]
     fn local_sample_is_bounded_and_contains_no_identity() {
-        let result = Sampler::new().sample();
-        assert_eq!(result.rows.len(), 5);
+        let mut sampler = Sampler::new();
+        let first = sampler.sample();
+        let result = sampler.sample();
+        let ids: Vec<_> = result.rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["cpu", "memory", "down", "up", "uptime", "available", "swap", "peak_cpu"]);
+        let percent = |r: &DataRow| r.value.trim_end_matches('%').parse::<u32>().unwrap();
+        assert_eq!(percent(&result.rows[7]), percent(&first.rows[0]).max(percent(&result.rows[0])));
+        assert_eq!(result.rows[6].value, format!("{:.1} GiB", sampler.system.used_swap() as f64 / 1073741824.0));
+        if sampler.system.total_memory() > 0 {
+            assert_eq!(result.rows[5].value, format!("{:.1} GiB", sampler.system.available_memory() as f64 / 1073741824.0));
+        }
         for r in result.rows {
             assert!(
                 r.id.len() <= 23

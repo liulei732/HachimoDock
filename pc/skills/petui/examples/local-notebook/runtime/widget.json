@@ -1,0 +1,289 @@
+{
+  "schema_version": 1,
+  "engine": "p4-bounded-runtime-v4",
+  "quota": "p4-quota-v2",
+  "states": [
+    "ready"
+  ],
+  "initial_state": "ready",
+  "pages": [
+    {
+      "id": "edit"
+    }
+  ],
+  "initial_page": "edit",
+  "vars": {
+    "focus": {
+      "type": "int",
+      "init": 0
+    },
+    "editing": {
+      "type": "int",
+      "init": 0
+    },
+    "key": {
+      "type": "int",
+      "init": 0
+    },
+    "cursor": {
+      "type": "int",
+      "init": 0
+    },
+    "label": {
+      "type": "string",
+      "init": ""
+    },
+    "buffer": {
+      "type": "string",
+      "init": ""
+    },
+    "cands": {
+      "type": "string",
+      "init": ""
+    },
+    "note1": {
+      "type": "string",
+      "init": ""
+    },
+    "note1Draft": {
+      "type": "string",
+      "init": ""
+    },
+    "note2": {
+      "type": "string",
+      "init": ""
+    },
+    "note2Draft": {
+      "type": "string",
+      "init": ""
+    }
+  },
+  "form": {
+    "engine": "p4-app-form-v3",
+    "page": "edit",
+    "focus_var": "focus",
+    "active_var": "editing",
+    "fields": [
+      {
+        "id": "note1",
+        "var": "note1",
+        "draft_var": "note1Draft",
+        "kind": "text",
+        "max_bytes": 40,
+        "keyboard": "latin"
+      },
+      {
+        "id": "note2",
+        "var": "note2",
+        "draft_var": "note2Draft",
+        "kind": "text",
+        "max_bytes": 40,
+        "keyboard": "pinyin"
+      }
+    ],
+    "keyboard": {
+      "key_var": "key",
+      "cursor_var": "cursor",
+      "buffer_var": "buffer",
+      "label_var": "label",
+      "candidates_var": "cands"
+    },
+    "actions": {
+      "previous": "field.prev",
+      "next": "field.next",
+      "decrease": "key.down",
+      "increase": "key.up",
+      "accept": "form.accept",
+      "cancel": "form.cancel",
+      "append": "text.append",
+      "erase": "text.erase"
+    }
+  },
+  "input": {
+    "engine": "p4-input-v1"
+  },
+  "transitions": [
+    {
+      "from": "*",
+      "on": "field.prev"
+    },
+    {
+      "from": "*",
+      "on": "field.next"
+    },
+    {
+      "from": "*",
+      "on": "key.down"
+    },
+    {
+      "from": "*",
+      "on": "key.up"
+    },
+    {
+      "from": "*",
+      "on": "form.accept"
+    },
+    {
+      "from": "*",
+      "on": "form.cancel"
+    },
+    {
+      "from": "*",
+      "on": "text.append"
+    },
+    {
+      "from": "*",
+      "on": "text.erase"
+    }
+  ],
+  "tick": [],
+  "dashboard": {
+    "title": "Pocket notebook",
+    "metricLabel": "Note 1",
+    "metricValue": {
+      "var": "note1"
+    },
+    "visualStyle": "clean",
+    "visualPalette": "mint",
+    "visualLayout": "tool",
+    "visualSprite": "star",
+    "badge": {
+      "var": "note2"
+    }
+  },
+  "persist": {
+    "version": 1,
+    "vars": [
+      "note1",
+      "note2"
+    ],
+    "states": {
+      "ready": "ready"
+    }
+  },
+  "surface": {
+    "engine": "p4-app-surface-v1",
+    "graphics": "p4-app-graphics-v1",
+    "bindings": "p4-variable-bindings-v1",
+    "background": 0,
+    "elements": [
+      {
+        "type": "text",
+        "x": 16,
+        "y": 22,
+        "w": 120,
+        "h": 32,
+        "color": 65535,
+        "text": "0  latin"
+      },
+      {
+        "type": "text",
+        "x": 142,
+        "y": 22,
+        "w": 478,
+        "h": 32,
+        "color": 65535,
+        "field_bind": "note1"
+      },
+      {
+        "type": "text",
+        "x": 16,
+        "y": 68,
+        "w": 120,
+        "h": 32,
+        "color": 65535,
+        "text": "1  pinyin"
+      },
+      {
+        "type": "text",
+        "x": 142,
+        "y": 68,
+        "w": 478,
+        "h": 32,
+        "color": 65535,
+        "field_bind": "note2"
+      },
+      {
+        "type": "text",
+        "x": 16,
+        "y": 222,
+        "w": 90,
+        "h": 32,
+        "color": 65535,
+        "text": "Row"
+      },
+      {
+        "type": "text",
+        "x": 110,
+        "y": 222,
+        "w": 42,
+        "h": 32,
+        "color": 65535,
+        "var_bind": "focus"
+      },
+      {
+        "type": "text",
+        "x": 184,
+        "y": 222,
+        "w": 106,
+        "h": 32,
+        "color": 65535,
+        "text": "Editing"
+      },
+      {
+        "type": "text",
+        "x": 298,
+        "y": 222,
+        "w": 40,
+        "h": 32,
+        "color": 65535,
+        "var_bind": "editing"
+      },
+      {
+        "type": "text",
+        "x": 16,
+        "y": 262,
+        "w": 294,
+        "h": 32,
+        "color": 65535,
+        "var_bind": "label"
+      },
+      {
+        "type": "text",
+        "x": 316,
+        "y": 262,
+        "w": 302,
+        "h": 32,
+        "color": 65535,
+        "var_bind": "cands"
+      },
+      {
+        "type": "text",
+        "x": 16,
+        "y": 316,
+        "w": 608,
+        "h": 32,
+        "color": 65535,
+        "text": "Stick up/down: row or letter. Turn: key group."
+      },
+      {
+        "type": "text",
+        "x": 16,
+        "y": 361,
+        "w": 608,
+        "h": 32,
+        "color": 65535,
+        "text": "Press knob: append. Hold knob: erase."
+      },
+      {
+        "type": "text",
+        "x": 16,
+        "y": 406,
+        "w": 608,
+        "h": 32,
+        "color": 65535,
+        "text": "SW1: edit, accept or save. SW2: cancel."
+      }
+    ]
+  }
+}

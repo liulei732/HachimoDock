@@ -1,0 +1,11 @@
+{
+  "dashboard": {
+    "title": "Pocket notebook",
+    "metricLabel": "Note 1",
+    "metricValue": "",
+    "visualStyle": "clean",
+    "visualPalette": "mint",
+    "visualLayout": "tool",
+    "visualSprite": "star"
+  }
+}

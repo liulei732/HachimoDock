@@ -1,6 +1,7 @@
 /* WiFi6 lab candidate. HID keyboard reports are accepted only from the
  * physical-action path and only sent to an authenticated, bonded peer. */
 #include "pet_p4_ble_shortcut.h"
+#include "pet_p4_ble_accessory.h"
 #include "esp_hosted.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -35,21 +36,9 @@ static const uint8_t report_map[] = {
 static struct ble_npl_callout poll;
 static _Atomic int available, paired, ready, radio_error;
 static atomic_uint advertising;
-#define CHORD_QUEUE_SIZE 16u
-static uint16_t chord_queue[CHORD_QUEUE_SIZE];
-static atomic_uint chord_read, chord_write;
-
-static void clear_chord_queue(void) {
-  atomic_store(&chord_read, atomic_load(&chord_write));
-}
-
-static uint16_t next_chord(void) {
-  const unsigned read = atomic_load(&chord_read);
-  if (read == atomic_load(&chord_write)) return 0;
-  const uint16_t chord = chord_queue[read % CHORD_QUEUE_SIZE];
-  atomic_store(&chord_read, read + 1);
-  return chord;
-}
+#include "pet_p4_hid_queue.h"
+static pet_hid_queue_t chord_queue;
+static atomic_uint link_generation, not_ready;
 static atomic_int directed_result;
 static atomic_uint connects, disconnect_reason, security_result, address_hash;
 static uint32_t fast_adv_until;
@@ -68,6 +57,9 @@ static _Atomic uint32_t pair_deadline, displayed_code, sent_press, sent_release,
 unsigned pet_ble_shortcut_report_counter(unsigned which) {
   if (which==0) return atomic_load(&sent_press);
   if (which==1) return atomic_load(&sent_release);
+  if (which==3) return atomic_load(&chord_queue.full);
+  if (which==4) return atomic_load(&chord_queue.dropped);
+  if (which==5) return atomic_load(&not_ready);
   return atomic_load(&send_error);
 }
 static uint16_t peer = NO_PEER, input_handle, boot_handle, protocol_handle;
@@ -196,15 +188,12 @@ static void update_ready(void) {
 }
 
 bool pet_ble_keyboard_send(uint16_t chord) {
-  if (!chord || !pet_ble_keyboard_connected()) return false;
-  const unsigned write = atomic_load(&chord_write);
-  if (write - atomic_load(&chord_read) >= CHORD_QUEUE_SIZE) {
-    atomic_fetch_add(&send_error, 1);
-    return false;
-  }
-  chord_queue[write % CHORD_QUEUE_SIZE] = chord;
-  atomic_store(&chord_write, write + 1);
-  return true;
+  if (!chord) return false;
+  unsigned generation = atomic_load(&link_generation);
+  if (!pet_ble_keyboard_connected()) { atomic_fetch_add(&not_ready, 1); return false; }
+  if (pet_hid_enqueue(&chord_queue, chord, generation)) return true;
+  atomic_fetch_add(&send_error, 1);
+  return false;
 }
 
 static bool read_gatt(uint16_t handle, void *data, size_t size) {
@@ -282,6 +271,7 @@ static int gap_event(struct ble_gap_event *event, void *arg) {
   switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
       if (event->connect.status==0) {
+        atomic_fetch_add(&link_generation, 1);
         peer=event->connect.conn_handle;
         peer_since=now_ms();
         atomic_fetch_add(&connects,1);
@@ -298,7 +288,7 @@ static int gap_event(struct ble_gap_event *event, void *arg) {
       neutral_pending=false;
       peer=NO_PEER; input_subscribed=false; boot_subscribed=false; suspended=false;
       release_due=false; protocol_mode=1;
-      clear_chord_queue();
+      pet_hid_clear(&chord_queue);
       atomic_store(&displayed_code,0);
       update_ready();
       break;
@@ -339,11 +329,12 @@ static int gap_event(struct ble_gap_event *event, void *arg) {
   return 0;
 }
 
-static bool send_report(uint16_t handle, const uint8_t data[8]) {
+static pet_hid_result_t send_report(uint16_t handle, const uint8_t data[8]) {
   struct os_mbuf *m=ble_hs_mbuf_from_flat(data,8);
-  if (m && !ble_gatts_notify_custom(peer,handle,m)) return true;
+  if (!m) { atomic_fetch_add(&send_error,1); return HID_NOT_SUBMITTED; }
+  if (!ble_gatts_notify_custom(peer,handle,m)) return HID_SUBMITTED;
   atomic_fetch_add(&send_error,1);
-  return false;
+  return HID_SUBMISSION_FAILED;
 }
 
 static void tick(struct ble_npl_event *event) {
@@ -351,7 +342,7 @@ static void tick(struct ble_npl_event *event) {
   if (atomic_exchange(&forget,false)) {
     pet_ble_shortcut_close_pair();
     atomic_store(&ready,0);
-    clear_chord_queue();
+    pet_hid_clear(&chord_queue);
     if (peer!=NO_PEER) (void)ble_gap_terminate(peer,BLE_ERR_REM_USER_CONN_TERM);
     ble_addr_t bonded;
     int count=0;
@@ -362,9 +353,17 @@ static void tick(struct ble_npl_event *event) {
     }
     if (ble_gap_adv_active()) (void)ble_gap_adv_stop();
   }
+#if PET_BLE_ACCESSORY
+  if (pet_accessory_poll(local_address, pet_ble_keyboard_enabled() || pairing_open() ||
+                         peer!=NO_PEER || ble_gap_adv_active(),
+                         bonded_identity_valid ? bonded_identity.val : NULL)) {
+    ble_npl_callout_reset(&poll,ble_npl_time_ms_to_ticks32(25));
+    return;
+  }
+#endif
   if (!pet_ble_keyboard_enabled()) {
     atomic_store(&ready,0);
-    clear_chord_queue();
+    pet_hid_clear(&chord_queue);
     if (ble_gap_adv_active()) (void)ble_gap_adv_stop();
     if (peer!=NO_PEER) {
       if (release_due) (void)send_report(release_handle,(const uint8_t[8]){0});
@@ -399,7 +398,7 @@ static void tick(struct ble_npl_event *event) {
       }
     }
   } else if (release_due) {
-    if ((int32_t)(now_ms()-release_at)>=0 && send_report(release_handle,(const uint8_t[8]){0})) {
+    if ((int32_t)(now_ms()-release_at)>=0 && send_report(release_handle,(const uint8_t[8]){0}) == HID_SUBMITTED) {
       release_due=false;
       atomic_fetch_add(&sent_release,1);
     }
@@ -410,13 +409,15 @@ static void tick(struct ble_npl_event *event) {
     if (read_gatt(protocol_handle,&mode,1) && mode<=1) protocol_mode=mode;
     update_ready();
     if (neutral_pending && atomic_load(&ready) &&
-        send_report(protocol_mode ? input_handle : boot_handle,(const uint8_t[8]){0}))
+        send_report(protocol_mode ? input_handle : boot_handle,(const uint8_t[8]){0}) == HID_SUBMITTED)
       neutral_pending=false;
-    int command = atomic_load(&ready) ? next_chord() : 0;
+    int command = !neutral_pending && atomic_load(&ready) ? pet_hid_peek(&chord_queue, atomic_load(&link_generation)) : 0;
     if (command && atomic_load(&ready) && secure(peer)) {
       const uint8_t data[8]={(uint8_t)(command >> 8),0,(uint8_t)command};
       release_handle=protocol_mode ? input_handle : boot_handle;
-      if (send_report(release_handle,data)) {
+      pet_hid_result_t result = send_report(release_handle,data);
+      pet_hid_complete(&chord_queue, result);
+      if (result == HID_SUBMITTED) {
         atomic_fetch_add(&sent_press,1);
         release_due=true;
         release_at=now_ms()+KEY_RELEASE_MS;
@@ -428,11 +429,14 @@ static void tick(struct ble_npl_event *event) {
 }
 
 static void reset(int reason) {
+#if PET_BLE_ACCESSORY
+  pet_accessory_reset();
+#endif
   (void)reason;
   peer=NO_PEER;
   input_subscribed=false; boot_subscribed=false; suspended=false;
   release_due=false; protocol_mode=1;
-  clear_chord_queue();
+  pet_hid_clear(&chord_queue);
   atomic_store(&ready,0);
   atomic_store(&available,0);
   ble_npl_callout_stop(&poll);
@@ -458,10 +462,15 @@ static void synced(void) {
     atomic_store(&address_hash,digest);
   }
   fast_adv_until=now_ms()+30000;
-  bonded_identity_valid=!ble_store_util_bonded_peers(&bonded_identity,&count,1) && count==1;
+  int bond_status=ble_store_util_bonded_peers(&bonded_identity,&count,1);
+  bonded_identity_valid=!bond_status && count==1;
   atomic_store(&paired,bonded_identity_valid);
   atomic_store(&radio_error,0);
   atomic_store(&available,1);
+#if PET_BLE_ACCESSORY
+  if (!bond_status) pet_accessory_sync();
+  else pet_accessory_reset();
+#endif
   ble_npl_callout_reset(&poll,0);
 }
 

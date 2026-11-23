@@ -104,6 +104,14 @@ int main(int argc,char**argv){
  assert(argc==3);int mode=atoi(argv[2]);FILE*f=fopen(argv[1],"rb");assert(f);char target[16384];size_t len=fread(target,1,sizeof(target)-1,f);assert(len==5625&&!ferror(f)&&feof(f)&&!fclose(f));target[len]=0;
  cJSON*root=cJSON_Parse(target);assert(root);const cJSON*array=cJSON_GetObjectItemCaseSensitive(root,"items");assert(cJSON_GetArraySize(array)==32);
  miniapp_catalog_item_t items[32]={0};for(unsigned i=0;i<32;i++){const cJSON*x=cJSON_GetArrayItem(array,(int)i);snprintf(items[i].widget_id,48,"%s",cJSON_GetObjectItemCaseSensitive(x,"widgetId")->valuestring);snprintf(items[i].title,64,"%s",cJSON_GetObjectItemCaseSensitive(x,"title")->valuestring);items[i].slot=(uint8_t)cJSON_GetObjectItemCaseSensitive(x,"slot")->valueint;items[i].package_generation=(uint8_t)cJSON_GetObjectItemCaseSensitive(x,"packageGeneration")->valueint;items[i].widget_checksum=(uint32_t)strtoul(cJSON_GetObjectItemCaseSensitive(x,"widgetChecksum")->valuestring,NULL,16);items[i].buttons_checksum=(uint32_t)strtoul(cJSON_GetObjectItemCaseSensitive(x,"buttonsChecksum")->valuestring,NULL,16);items[i].sprites_checksum=(uint32_t)strtoul(cJSON_GetObjectItemCaseSensitive(x,"spritesChecksum")->valuestring,NULL,16);}
+ for(unsigned i=0;i<32;i++){
+   const cJSON *record=cJSON_GetArrayItem(array,(int)i);
+   const cJSON *hash=cJSON_GetObjectItemCaseSensitive(record,"thumb"), *bank=cJSON_GetObjectItemCaseSensitive(record,"thumbBank");
+   if(!hash){assert(!bank);continue;}
+   assert(cJSON_IsString(hash)&&cJSON_IsNumber(bank));
+   items[i].center_thumb_checksum=(uint32_t)strtoul(hash->valuestring,NULL,16);
+   items[i].center_thumb_generation=(uint8_t)bank->valueint;
+ }
  const char*active=cJSON_GetObjectItemCaseSensitive(root,"activeWidgetId")->valuestring;const char*cursor=cJSON_GetObjectItemCaseSensitive(root,"selectedWidgetId")->valuestring;bool seed=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root,"seedPending"));
  for(int fc=0;fc<=16;fc++){
   spiffs fs;spiffs_config cfg;format_new(&fs,&cfg);live_fs=&fs;fault=0;owner_current=true;g_catalog_recovery_blocked=false;memset(files,0,sizeof(files));

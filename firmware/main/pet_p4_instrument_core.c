@@ -55,7 +55,7 @@ void pet_instrument_render_tone(pet_instrument_core_t *s,int16_t *out,size_t n,
           +p[4]*sinf(TAU*p[1]*t)*expf(-p[7]*t)
           +p[5]*sinf(TAU*p[2]*t)*expf(-p[8]*t)
           +p[9]*((int32_t)(s->noise&65535)-32768)/32768.0f*expf(-p[10]*t));
-      if(t<0.28f)duck=0.5f+0.5f*t/0.28f;
+      if(t<0.28f)duck=fminf(duck,0.5f+0.5f*t/0.28f);
     }
     /* Original pentatonic plucks. Eight 2-second notes, bounded phase clock. */
     uint32_t clock=s->samples++%256000;

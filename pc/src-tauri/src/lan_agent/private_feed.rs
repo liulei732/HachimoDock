@@ -115,6 +115,9 @@ pub(crate) fn cli(args: &[OsString]) -> Result<String, String> {
     if manifest["data"]["connection"]["type"] == "mqtt-public" {
         return Err("公开订阅打开即可使用。".into());
     }
+    if !matches!(manifest["data"]["connection"]["type"].as_str(), Some("mqtt" | "bearer")) {
+        return Err("请在组件的设备服务账号面板授权或移除授权。".into());
+    }
     let peer = load_peer().ok_or("请先配对设备并授予控制权限。")?;
     let status = query_status(&peer).map_err(|_| "无法确认设备身份，请检查 Wi-Fi。")?;
     if Some(status.board_device_id.as_str()) != board.to_str()

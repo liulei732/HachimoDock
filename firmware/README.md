@@ -4,7 +4,7 @@
 
 本目录是 HachimoDock 当前使用的 ESP32-P4 固件源码，与 [PC 客户端](../pc/) 配合使用：PC 负责 Agent 状态监听、语音识别服务对接、素材预处理与传输；设备负责 USB 通信、受支持板型的 Wi-Fi／蓝牙、按键与摇杆输入、屏幕渲染、形象播放及组件运行。
 
-为设备安装固件，请下载 [完整烧录包](https://github.com/ai-maker-lab/HachimoDock/releases/latest)，解压后按中文指南操作。已能连接 Pet Manager 的设备，可直接使用客户端内的“固件升级”。需要自行编译时，请参考 [构建与烧录指南](BUILD.md)。
+为设备安装固件，请下载 [完整烧录包](https://github.com/ai-maker-lab/HachimoDock/releases/latest)，解压后按中文指南操作。已能连接 Pet Manager 的设备，可直接使用客户端内的“固件升级”。R302 起，配套客户端会在升级后核对设备上的 MiSans 气泡字库，缺少时通过当前连接自动补齐。需要自行编译时，请参考 [构建与烧录指南](BUILD.md)。
 
 ## 目标硬件
 
@@ -21,6 +21,8 @@
 板型、引脚与分区配置以 [boards/](boards/)、[sdkconfig.defaults](sdkconfig.defaults) 和 [partitions.csv](partitions.csv) 为准。不同硬件版本烧录前需核对配置。
 
 ESP32-P4-WIFI6-M 的 M 表示焊接排针，不代表芯片版本。v1 与 v3 使用不同固件镜像，同一种芯片的镜像由 Windows/macOS 共用；v3 的构建与实机验收要求见 [BUILD.md](BUILD.md)。
+
+Wi‑Fi 6 和 Pico 的 v1/v3 固件均支持 ST7701S 和 NV3049F，见 [屏幕配置](BUILD.md#st7701s-与-nv3049f-屏幕配置)。
 
 ## 已支持的功能
 

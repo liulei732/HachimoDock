@@ -36,20 +36,24 @@ int main(void) {
   state.session_queue_count = 1;
   assert(pet_p4_conversation_update(&state, "rtc-1", "preparing", "小西", "", false, false, 1));
   assert(!pet_p4_conversation_update(&state, "old", "ended", "", "", false, false, 2));
-  assert(pet_p4_conversation_update(&state, "rtc-1", "listening", "小西", "用户的话", true, true, 3));
+  /* Final recognition and the thinking phase arrive together from SW2. */
+  assert(pet_p4_conversation_update(&state, "rtc-1", "thinking", "小西", "用户的话", true, true, 3));
   pet_p4_build_view_model(&state, &view);
   assert(view.realtime_conversation && !view.compact_bubble && !view.show_voice_overlay);
   assert(!strcmp(view.page, "main") && !view.agent[0] && !view.stats_json[0]);
   assert(!strcmp(view.title, "你") && !strcmp(view.body, "用户的话"));
 
-  assert(pet_p4_conversation_update(&state, "rtc-1", "speaking", "小西", "", false, false, 4));
+  assert(pet_p4_conversation_update(&state, "rtc-1", "speaking", "小西", "宠物第一句", false, false, 4));
+  pet_p4_build_view_model(&state, &view);
+  assert(!strcmp(view.body, "宠物第一句") && state.conversation_history_count == 1);
   pet_p4_conversation_playback_begin(&state, "rtc-1-turn");
   assert(!pet_p4_conversation_queue_cue(&state, "old-turn", 0, "wrong"));
   assert(!pet_p4_conversation_queue_cue(&state, "rtc-1-turn", 1, "unaligned"));
   assert(pet_p4_conversation_queue_cue(&state, "rtc-1-turn", 0, "宠物第一句"));
   assert(pet_p4_conversation_queue_cue(&state, "rtc-1-turn", 32000, "宠物第二句"));
   pet_p4_conversation_advance(&state, 0, false, 5);
-  assert(!state.conversation_text[0]); // prebuffering must not start subtitles
+  assert(!strcmp(state.conversation_text, "宠物第一句"));
+  assert(state.conversation_caption_since_ms == 4 && state.conversation_history_count == 1); // Preview remains until playback consumes the first cue.
   pet_p4_conversation_advance(&state, 0, true, 6);
   pet_p4_build_view_model(&state, &view);
   assert(!strcmp(view.body, "宠物第一句") && !strcmp(view.title, "小西"));

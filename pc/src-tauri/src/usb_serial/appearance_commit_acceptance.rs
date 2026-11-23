@@ -464,7 +464,7 @@ fn production_full_upload_commit_once(){
             "packId":plan.pack_id,"files":2,"bytes":plan.expected_bytes,"parentOnce":plan.once_receipt.as_ref().unwrap().path,"syncCalls":1,"noReplay":true}))?;
         report["syncCalls"]=1.into();
         let tx=s.trace.clone();let stages=s.trace.clone();let alarm=s.bad.clone();let stage_alarm=s.bad.clone();
-        let outcome=s.usb.sync_appearance_p4_with_stages(&plan.pack_directory,&plan.app_data_directory,&plan.board,false,
+        let outcome=s.usb.sync_appearance_p4_with_stages(&plan.pack_directory,&plan.app_data_directory,&plan.board,None,false,
             move|files,total,bytes,all|{assert!(!alarm.load(Ordering::Acquire),"unexpected device activity; no replay");
                 let mut t=tx.lock().unwrap();assert!(t.progress.len()<4096);t.progress.push(json!({"files":files,"totalFiles":total,"bytes":bytes,"totalBytes":all}));},
             move|name|{assert!(!stage_alarm.load(Ordering::Acquire),"unexpected device activity; stop before next phase");let mut t=stages.lock().unwrap();assert!(t.stages.len()<64);t.stages.push(json!({"stage":name}));})?;

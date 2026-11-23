@@ -35,7 +35,7 @@ try{
   const cmp=a.reduce((r,n,i)=>r||Math.sign(n-b[i]),0);
   if(cmp<0)throw Error('Local version is older: '+id);
   if(cmp===0)manifest.version=[b[0],b[1],b[2]+1].join('.');
-  const allowed=n=>['component.json','negative-screen.json','buttons.json','runtime/widget.json','share.json','pc/extension.json','pc/application.json','assets/.keep','LICENSE.txt','THIRD_PARTY_NOTICES.txt'].includes(n)||/^assets\/[\w-]+\.png$/.test(n)||/^licenses\/[\w.-]+\.(txt|md)$/.test(n);
+  const allowed=n=>['pc/cover.png','hachiapp.json','component.json','negative-screen.json','buttons.json','runtime/widget.json','share.json','pc/extension.json','pc/application.json','assets/.keep','LICENSE.txt','THIRD_PARTY_NOTICES.txt'].includes(n)||/^assets\/[\w-]+\.png$/.test(n)||/^licenses\/[\w.-]+\.(txt|md)$/.test(n);
   function copy(dir,prefix=''){for(const e of fs.readdirSync(dir,{withFileTypes:true})){
    const rel=prefix+e.name;if(e.isSymbolicLink())throw Error('Symlink: '+rel);
    if(e.isDirectory())copy(path.join(dir,e.name),rel+'/');
@@ -59,23 +59,24 @@ try{
   // Put the real cover at an integral viewport origin; capture exactly 640×480.
   await page.evaluate(()=>scrollTo(0,0));
   await coverLocator.evaluate(el=>{el.style.position='fixed';el.style.left='0px';el.style.top='0px';el.style.zIndex='9999';});
-  const cover=await page.screenshot({clip:{x:0,y:0,width:640,height:480},path:path.join(out,id+'.png')});
+  const screenshot=await page.screenshot({clip:{x:0,y:0,width:640,height:480},path:path.join(out,id+'.png')});
   await coverLocator.evaluate(el=>el.removeAttribute('style'));
-  if(cover.readUInt32BE(16)!==640||cover.readUInt32BE(20)!==480)throw Error('PNG dimensions: '+id);
+  if(screenshot.readUInt32BE(16)!==640||screenshot.readUInt32BE(20)!==480)throw Error('PNG dimensions: '+id);
+  const cover=fs.readFileSync(path.join(stage,'pc/cover.png'));
   const zip=path.join(out,id+'.clawpkg');
   const packed=spawnSync('python3',['-m','zipfile','-c',zip,...fs.readdirSync(stage).sort()],{cwd:stage,encoding:'utf8'});
   if(packed.status)throw Error(packed.stderr);
   const data=fs.readFileSync(zip),license=fs.readFileSync(path.join(stage,'LICENSE.txt'),'utf8');
   batch.push({approve:true,publication:{
    requestId:'refresh-'+createHash('sha256').update(data).update(cover).digest('hex').slice(0,48),
-   rightsConfirmed:true,privacyConfirmed:true,package:data.toString('base64'),covers:[cover.toString('base64')],
+   rightsConfirmed:true,privacyConfirmed:true,package:data.toString('base64'),covers:[],
    metadata:{author:manifest.author||previous.author,summary:manifest.description.slice(0,160),
     description:manifest.description+'\n封面为当前资源包的 640×480 默认界面，不包含用户数据。建议使用 Pet Manager 0.1.131 及固件 0.7.90 或更新版本；联网和语音功能需要配置对应服务。',
     category:id.startsWith('hachimi-')?'hachimi':previous.category,
     license:license.includes('MIT License')?(id==='hachimi-learn'?'MIT / CC BY-SA 4.0 / OFL-1.1':'MIT / OFL-1.1'):previous.license,
     sourceUrl:previous.sourceUrl,releaseNotes:'同步最新组件界面与功能资源，更新完整 4:3 封面；保留原组件 ID，支持覆盖更新。'}
   }});
-  report.push({id,name:manifest.name,from:previous.version,to:manifest.version,bytes:data.length,coverWidth:640,coverHeight:480});
+  report.push({id,name:manifest.name,from:previous.version,to:manifest.version,bytes:data.length,coverWidth:cover.readUInt32BE(16),coverHeight:cover.readUInt32BE(20)});
   console.log(id,previous.version,'->',manifest.version,'ready');
  }
  fs.writeFileSync(path.join(out,'batch.json'),JSON.stringify(batch),{mode:0o600});

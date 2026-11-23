@@ -109,9 +109,9 @@ test("provider polls USB status but does not auto-connect inside the polling eff
 });
 
 test("provider obtains Wi-Fi reachability from the authenticated paired status", () => {
-  assert.match(source, /invoke\("lan_device_status"\)/);
-  assert.match(source, /usb\.connected \? null : wifiStatus/);
-  assert.match(source, /target = pairedWifiTarget\(await invoke\("lan_device_status"\)\)/);
+  assert.match(source, /invoke\("lan_connection_snapshot"\)/);
+  assert.match(source, /usb\.connected \? null : pairedStatus/);
+  assert.match(source, /status && pairedWifiTarget\(status\)/);
   assert.match(source, /activeBoardDeviceId = onlineBoardDeviceId \|\| binding\?\.boardDeviceId/);
   assert.match(source, /deriveDeviceReachability\(\{ usb, wifi \}\)/);
   assert.match(source, /if \(usb.connected\) return applyDesktopPet\(agentId, appearance, options\)/);
@@ -212,11 +212,14 @@ test("P4 reachability prefers USB and uses authenticated Wi-Fi when USB disconne
   assert.equal(pairedWifiTarget({ ...status, wifiConnected: false }), null);
   assert.equal(pairedWifiTarget({ ...status, bootId: "" }), null);
   const wifi = pairedWifiTarget(status);
-  const wifiCapabilities = { trustedVolume: true, controlTrusted: true, wirelessOta: true, componentDelivery: true, appearanceCapacity: 8388608, panelControl: true };
+  assert.equal(pairedWifiTarget({ ...status, centerThumb: true, componentBundle: true }).centerThumb, true);
+  assert.equal(pairedWifiTarget({ ...status, centerThumb: true }).centerThumb, false);
+  assert.equal(pairedWifiTarget({ ...status, centerThumb: 1, componentBundle: true }).centerThumb, false);
+  const wifiCapabilities = { globalAudioCues: true, trustedVolume: true, controlTrusted: true, wirelessOta: true, componentDelivery: true, appearanceCapacity: 8388608, panelControl: true };
   assert.deepEqual(wifi, { boardDeviceId: status.boardDeviceId, bootId: status.bootId,
     address: "", firmware: "", bundledFirmwareVersion: "", bundledFirmwareRollbackBlocked: false, wifiConnected: true,
-    clockSynchronized: false, rebootSupported: false, wirelessRealtime: false, wirelessVoiceInput: false,
-    trustedVolume: false, controlTrusted: false, wirelessOta: false, componentDelivery: false,
+    clockSynchronized: false, widgetCredentialStorageReady: false, rebootSupported: false, wirelessRealtime: false, wirelessVoiceInput: false,
+    globalAudioCues: false, trustedVolume: false, controlTrusted: false, wirelessOta: false, componentDelivery: false, componentBundle: false, componentTarget: null, componentTargetError: null, centerThumb: false,
     appearanceCapacity: 0, inputDoublePress: false, systemSettings: false, panelControl: false });
   assert.deepEqual(pairedWifiTarget({ ...status, ...wifiCapabilities }), { ...wifi, ...wifiCapabilities });
   assert.deepEqual(deriveDeviceReachability({ usb, wifi }), connected);
@@ -360,4 +363,16 @@ test("supported Wi-Fi follows always verify the native pack before following the
   const follow = source.slice(source.indexOf("const followAgent"), source.indexOf("const cancelAppearanceSync"));
   assert.match(follow, /if \(wifi\.appearanceCapacity\) \{\s*return applyWifiDesktopPet\(agentId, appearance, \{ follow: true \}\)/);
   assert.doesNotMatch(follow, /appearance\?\.id !== currentDisplay\.appearance/);
+});
+
+test("LAN snapshots retain capabilities only for the authenticated board, association and boot",()=>{
+  const identity={boardDeviceId:"p4-0123456789ab",bootId:"0123456789abcdef",association:2};
+  const status={...identity,wifiConnected:true,controlTrusted:true,componentBundle:true,
+    componentTarget:{...identity,capabilities:{widgetWasm:"hachi-wasm-v1"}}};
+  const first=pairedWifiTarget(status);
+  assert.deepEqual(first.componentTarget,status.componentTarget);
+  assert.equal(pairedWifiTargetsEqual(first,pairedWifiTarget(structuredClone(status))),true);
+  assert.equal(pairedWifiTargetsEqual(first,pairedWifiTarget({...status,componentTarget:{...status.componentTarget,association:3}})),false);
+  assert.equal(pairedWifiTarget({...status,bootId:"0000000000000001"}).componentTarget,null);
+  assert.equal(pairedWifiTarget({...status,controlTrusted:false}).componentTarget,null);
 });

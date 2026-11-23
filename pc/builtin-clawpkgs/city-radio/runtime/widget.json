@@ -157,7 +157,7 @@
         "w": 180,
         "h": 48,
         "color": 40016,
-        "text": "可选电台",
+        "text": "打开电台列表",
         "page": 0,
         "action": "media.queue"
       },

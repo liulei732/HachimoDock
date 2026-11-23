@@ -1,0 +1,549 @@
+:root {
+  --bg:#ffffff;
+  --bg-soft:#f0efec;
+  --surface:#ffffff;
+  --surface-muted:#f6f6f6;
+  --surface-sunken:#eeeeee;
+  --surface-elevated:#ffffff;
+  --text:#272727;
+  --text-soft:#484848;
+  --text-muted:#646464;
+  --text-faint:#737373;
+  --accent-action:var(--accent);
+  --accent-strong:#e25600;
+  --accent-ink:var(--text);
+  --line:#dddddd;
+  --line-soft:#eeeeee;
+  --line-strong:#bcbcbc;
+  --success:#487253;
+  --success-soft:#eaf0e4;
+  --warning:var(--text-soft);
+  --info:var(--text-soft);
+  --radius-lg:7px;
+  --shadow-sm:none;
+  --shadow-xs:none;
+  --sidebar-width:208px;
+  --workspace-section-gap: var(--space-3);
+  --workspace-content-gap: var(--space-2);
+  --serif:Georgia,'Songti SC','STSong',serif;
+}
+body,.app-shell,.app-main,.app-content {
+  background:var(--bg)!important;
+  color:var(--text);
+}
+.app-sidebar {
+  padding:23px 13px 14px!important;
+  background:var(--bg-soft)!important;
+  border-right: 0;
+}
+.sidebar-head {
+  padding:0 0 17px;
+  border-bottom: 0;
+  margin-bottom:8px;
+}
+.sidebar-brand {
+  gap:7px;
+  padding-inline:2px;
+}
+.sidebar-brand-name {
+  font:700 21px/1.1 Georgia,serif;
+  letter-spacing:-.055em;
+}
+.sidebar-brand__copy span {
+  font-size:11px;
+  color:var(--text-muted);
+}
+.sidebar-nav {
+  border-top:0;
+  gap:4px;
+}
+.sidebar-nav__item {
+  border-radius:4px;
+  font-size:13px;
+  min-height:40px;
+}
+.sidebar-nav__item.is-active {
+  box-shadow:none!important;
+}
+/* The firmware icon and label use the same spacing as the other nav items. */
+.sidebar-firmware-update > svg { flex-shrink: 0; }
+.sidebar-firmware-update .sidebar-nav-label { flex-shrink: 0; }
+html, body, .app-content, .app-sidebar {
+  scrollbar-width: thin;
+  scrollbar-color: #bababa transparent;
+}
+@supports selector(::-webkit-scrollbar) {
+  html, body, .app-content, .app-sidebar {
+    scrollbar-width: auto;
+    scrollbar-color: auto;
+  }
+  :is(html, body, .app-content, .app-sidebar)::-webkit-scrollbar { width: 5px; height: 5px; }
+  :is(html, body, .app-content, .app-sidebar)::-webkit-scrollbar-thumb { background: #bababa; border-radius: 5px; }
+  :is(html, body, .app-content, .app-sidebar)::-webkit-scrollbar-track { background: transparent; }
+}
+/* The parent owns the space between sections, including when a status appears. */
+.page-shell, .page-shell__body {
+  gap: var(--workspace-section-gap);
+}
+.page-shell__header {
+  padding-block: 0;
+}
+.api-settings__draft {
+  margin-block: 0;
+}
+.page-shell__title,.detail-page-header h1,.ca-wizard h1 {
+  font:600 29px/1.28 var(--serif);
+  letter-spacing:-.045em;
+}
+.page-shell__subtitle {
+  font-size:13px;
+  color:var(--text-muted);
+  line-height:1.65;
+}
+.card {
+  background:transparent;
+  border:0;
+  border-radius:0;
+  box-shadow:none;
+}
+.card__header {
+  padding: var(--workspace-content-gap) 0 var(--space-1);
+  border: 0;
+}
+.card__header--toggle {
+  padding: 18px 0 10px;
+}
+.card__body {
+  padding: var(--workspace-content-gap) 0 var(--workspace-section-gap);
+}
+.card__header + .card__body {
+  padding-block-start: var(--space-1);
+}
+.card__title,.modal-title,.home-detail h2 {
+  font:600 21px/1.35 var(--serif);
+  color:var(--text);
+}
+.card__subtitle,.muted {
+  color:var(--text-muted);
+}
+:is(.btn-primary,.btn--primary,.button--primary) {
+  background:var(--accent-action);
+  border-color:var(--accent-action);
+}
+button,input,select,textarea {
+  accent-color:var(--accent-action);
+}
+:is(.modal-card,.home-detail,.component-action-confirm) {
+  background:var(--surface-elevated);
+}
+:is(.appearance-card,.channel-row,.home-device,.device-binding-card) {
+  box-shadow:none;
+}
+.appearance-card {
+  background:var(--surface);
+  border-color:var(--line);
+  border-radius:7px;
+}
+.channel-matrix__rows {
+  display:grid!important;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  column-gap:24px;
+  row-gap:0;
+}
+.channel-matrix__rows .channel-row {
+  display:grid;
+  grid-template-columns:1fr auto;
+  gap:5px 10px;
+  padding:12px 4px;
+  align-items:center;
+  min-width:0;
+  border:0;
+  border-bottom: 0;
+  border-radius:0;
+  background:transparent;
+  box-shadow:none;
+}
+.channel-row__channel {
+  grid-column:1;
+  min-width:0;
+}
+.channel-row__follow {
+  grid-column:2;
+  grid-row:1;
+}
+.channel-row__settings {
+  grid-column:1/-1;
+  padding-inline-start:38px;
+}
+.companion-hero {
+  display:grid;
+  grid-template-columns:1fr minmax(220px,400px);
+  align-items:center;
+  gap:28px;
+  padding:22px 0 30px;
+  border-bottom: 0;
+}
+.companion-hero .kicker {
+  font-size:12px;
+  color:var(--text-muted);
+}
+.companion-hero h2 {
+  font:600 52px/1.25 var(--serif);
+  letter-spacing:-.055em;
+  margin:14px 0;
+}
+.companion-hero .meta {
+  color:var(--text-muted);
+  font-size:13px;
+}
+.companion-hero .meta strong {
+  font:700 21px Georgia;
+  color:var(--text);
+  margin-left:8px;
+}
+.companion-hero__actions {
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin-top:24px;
+}
+.companion-hero .action,
+.companion-hero .companion-hero__switch {
+  display:inline-flex;
+  align-items:center;
+  gap:7px;
+  color:white;
+  background:var(--accent-action);
+  border-radius:5px;
+  padding:9px 16px;
+  border:1px solid transparent;
+}
+.companion-hero .screen {
+  margin:0;
+}
+.companion-hero .film {
+  position:relative;
+}
+.companion-hero .companion-media {
+  width:100%;
+  display:block;
+  aspect-ratio:16/9;
+  border-radius:8px;
+  background:#080805;
+}
+.companion-hero .film button {
+  position:absolute;
+  right:8px;
+  bottom:8px;
+  border:1px solid #fff7;
+  border-radius:50%;
+  background:#202020bd;
+  color:white;
+  display:grid;
+  place-items:center;
+  width:29px;
+  height:29px;
+}
+.companion-hero figcaption {
+  display:flex;
+  justify-content:space-between;
+  font-size:11px;
+  margin-top:7px;
+  color:var(--text-muted);
+}
+.appearance-grid:has(>.appearance-card:only-child) {
+  display:block;
+}
+.appearance-grid>.appearance-card:only-child {
+  display:grid;
+  grid-template-columns:minmax(260px,400px) 1fr;
+  align-items:center;
+  background:transparent;
+  border:0;
+  border-bottom: 0;
+  border-radius:0;
+  box-shadow:none;
+  padding:27px 0;
+  gap:28px;
+}
+.appearance-grid>.appearance-card:only-child .appearance-card-preview {
+  width:100%;
+  aspect-ratio:16/9;
+  height:auto;
+  border-radius:8px;
+  overflow:hidden;
+}
+.appearance-grid>.appearance-card:only-child .appearance-card-body {
+  padding:0 12px;
+}
+.appearance-grid>.appearance-card:only-child h3 {
+  font:600 34px var(--serif);
+}
+.appearance-card__badge--active {
+  background:var(--success-soft);
+  color:var(--success);
+}
+.companion-hero .companion-media {
+  object-fit:contain;
+}
+.companion-hero .action:disabled {
+  opacity:.55;
+}
+.companion-hero .film {
+  overflow:hidden;
+  border-radius:8px;
+  background:#080805;
+}
+@media(max-width:900px) {
+  .channel-matrix__rows {
+    grid-template-columns:1fr;
+  }
+  .companion-hero h2 {
+    font-size:36px;
+  }
+  .companion-hero {
+    grid-template-columns:1fr minmax(180px,42%);
+  }
+}
+@media(max-width:660px) {
+  .companion-hero,.appearance-grid>.appearance-card:only-child {
+    grid-template-columns:1fr;
+  }
+  .companion-hero .screen {
+    max-width:400px;
+  }
+  .app-sidebar {
+    padding:8px!important;
+  }
+  .sidebar-head {
+    margin-bottom:0;
+    padding:0;
+    border:0;
+  }
+}
+
+/* Secondary workspaces share the desktop palette. Device previews keep their own colors. */
+:root {
+  --backdrop: rgb(38 38 38 / 38%);
+  --dialog-shadow: 0 20px 68px rgb(38 38 38 / 20%), 0 3px 12px rgb(38 38 38 / 8%);
+  --editorial-heading: Georgia, "Songti SC", "SimSun", serif;
+}
+.channel-row__follow-current {
+  padding: 4px 11px;
+  border-radius: var(--radius-pill);
+  background: var(--success-soft);
+  color: #395d42;
+}
+.channel-row__follow-current::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-inline-end: 6px;
+  vertical-align: 2px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.modal-backdrop,
+.component-replace-modal,
+.component-center-drawer-backdrop,
+.home-overlay,
+dialog.devin-config-dialog::backdrop {
+  background: var(--backdrop);
+}
+.modal-backdrop > .modal-card,
+.component-replace-modal > section,
+.modal-backdrop > .community-dialog,
+.component-center-drawer-backdrop > .component-center-drawer,
+.home-overlay > .home-detail,
+.ota-modal,
+dialog.devin-config-dialog {
+  background-color: var(--surface-elevated);
+  color: var(--text);
+  border: 1px solid var(--line);
+  box-shadow: var(--dialog-shadow);
+}
+.modal-card,
+.modal-backdrop .community-dialog,
+.ota-modal,
+.component-action-confirm {
+  border-radius: 12px;
+}
+.modal-card .modal-header,
+.community-dialog > header,
+.component-center-drawer__head,
+.home-detail > header {
+  background-color: var(--surface-elevated);
+  border-bottom: 0;
+  column-gap: var(--space-4);
+}
+.modal-header > :first-child,
+.component-center-drawer__head > :first-child {
+  min-width: 0;
+}
+.modal-card .modal-header h3,
+.modal-card .modal-title,
+.community-dialog > header h2,
+.component-center-drawer__head h2,
+.component-replace-modal h2,
+.home-detail > header h2,
+.ota-modal h2,
+.ca-card h3,
+.usb-setup-card h2 {
+  font-family: var(--editorial-heading);
+  font-size: clamp(19px, 2vw, 25px);
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.modal-card .modal-subtitle,
+.community-dialog > header p,
+.component-center-drawer__head p {
+  color: var(--text-muted);
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+.modal-body,
+.community-dialog,
+.home-detail,
+.component-center-drawer {
+  overscroll-behavior: contain;
+}
+.modal-card .modal-footer,
+.devin-config-dialog__footer,
+.single-state-regenerate-modal__footer,
+.component-preview-modal__footer {
+  border-top: 0;
+  background-color: var(--surface-elevated);
+  flex-wrap: wrap;
+}
+.modal-header .icon-btn,
+.community-dialog > header .icon-btn,
+.home-detail > header .icon-btn {
+  flex-shrink: 0;
+}
+.modal-card > .modal-header {
+  padding-block: var(--workspace-section-gap) var(--workspace-content-gap);
+}
+.modal-card > .modal-body {
+  padding-block: var(--workspace-content-gap) var(--space-4);
+}
+.page, .ca-wizard {
+  gap: var(--workspace-section-gap);
+}
+.detail-page-header {
+  padding-block-end: 0;
+  row-gap: var(--workspace-content-gap);
+}
+.ca-card {
+  gap: var(--workspace-content-gap);
+  padding-block: var(--space-4);
+}
+.usb-setup-card {
+  padding-block: var(--space-6);
+}
+.usb-setup-card__icon {
+  margin-block-end: var(--workspace-section-gap);
+}
+.usb-setup-checklist, .usb-setup-device {
+  margin-block: var(--space-4);
+}
+.ca-wizard .ca-card,
+.detail-context-drawer,
+.usb-setup-card {
+  background-color: var(--surface);
+  border-color: var(--line);
+  border-radius: 8px;
+}
+.ca-tabs .ca-tab,
+.creation-source-grid .creation-source-card {
+  border-radius: 6px;
+}
+.creation-source-grid .creation-source-card:hover,
+.ca-tabs .ca-tab.active {
+  border-color: var(--accent-action);
+}
+.dashboard-actions-menu__list {
+  background: var(--surface-elevated);
+  border-color: var(--line);
+  box-shadow: var(--shadow-md);
+}
+:where(.modal-card, .community-dialog, .home-detail, .component-center-drawer, .ca-wizard, .page-appearance-detail, .usb-setup-card)
+  :where(button, a, input, textarea, select, summary, [tabindex="0"]):focus-visible {
+  outline: 2px solid var(--accent-action);
+  outline-offset: 2px;
+}
+@media (max-width: 720px) {
+  .modal-backdrop { padding: 12px; }
+  .modal-backdrop > .modal-card { max-height: calc(100dvh - 24px); }
+  .detail-page-header { flex-wrap: wrap; }
+}
+
+/* Shared interaction colors for the desktop shell, including modal portals. */
+:is(.btn-secondary, .button--secondary, .btn-ghost, .button--ghost,
+    .icon-btn, .dashboard-status-bar__scan-btn, .dashboard-actions-menu__trigger) {
+  color: var(--accent-ink);
+}
+.app-shell :is(button, [role="button"], [role="menuitem"], summary, a):hover:not(:disabled):not([aria-disabled="true"]),
+.modal-backdrop button:hover:not(:disabled) {
+  color: var(--accent-ink);
+  background-color: var(--accent-soft);
+}
+.app-shell :is(.btn-primary, .button--primary, .btn--primary, .companion-hero .action):hover:not(:disabled),
+.modal-backdrop :is(.btn-primary, .button--primary):hover:not(:disabled) {
+  color: var(--text-on-accent);
+  background-color: var(--accent-strong);
+  border-color: var(--accent-strong);
+}
+
+/* The same action ink is used by the label and its currentColor icon. */
+.app-shell :is(.channel-row__icon,
+    .dashboard-status-bar__icon, .btn-secondary, .button--secondary, .btn-ghost,
+    .button--ghost, .btn-link, .icon-btn, .button--icon, .dashboard-status-bar__scan-btn,
+    .dashboard-actions-menu__item, .settings-section-links button, [role="tab"]) {
+  color:var(--accent-ink);
+}
+.app-shell .sidebar-nav > button[aria-current="page"],
+.app-shell [role="tab"][aria-selected="true"] {
+  color:var(--accent-ink);
+  background-color:var(--accent-soft);
+  box-shadow:none;
+  border-bottom-color:transparent;
+}
+.app-shell .community-tabs > button[aria-selected="true"]::after,
+.app-shell .community-divider::before, .app-shell .community-divider::after,
+.app-shell .appearance-channel-divider, .app-shell hr {
+  display:none;
+}
+.app-shell button:disabled:not([aria-selected="true"]) {
+  color:var(--text-muted);
+  cursor:not-allowed;
+}
+
+.app-sidebar .sidebar-nav .sidebar-nav__item {
+  color: var(--text);
+}
+.app-shell .app-sidebar .sidebar-nav button:not(:disabled):is([aria-current="page"], :hover) {
+  color: var(--text);
+  background-color: var(--accent-soft);
+}
+.app-shell .app-sidebar .sidebar-nav button[aria-current="page"] {
+  background-color: rgb(0 0 0 / 3%);
+}
+.app-sidebar .sidebar-nav button[aria-current="page"] svg {
+  color: var(--accent);
+}
+
+.app-shell .companion-hero .companion-hero__switch {
+  color:var(--text);
+  background:#fff;
+  border-color:var(--border);
+}
+.app-shell .companion-hero .companion-hero__switch:hover:not(:disabled) {
+  background:#fff;
+  color:var(--text);
+  border-color:var(--accent-action);
+}
+.companion-hero__switch:disabled { opacity:.55; }

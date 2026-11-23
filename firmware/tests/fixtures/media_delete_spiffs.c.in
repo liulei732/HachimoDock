@@ -1,0 +1,117 @@
+#include <dirent.h>
+#include <strings.h>
+#include "pet_p4_file_cleanup.h"
+#include "pet_p4_component_ext.h"
+#define ESP_PLATFORM 1
+#define ESP_OK 0
+typedef struct {spiffs *fs;} esp_spiffs_t;
+typedef struct {spiffs_DIR d; struct dirent e; char path[SPIFFS_OBJ_NAME_LEN]; unsigned offset;} vfs_spiffs_dir_t;
+static esp_spiffs_t ctx;
+/* The VFS uses BSD strlcpy for the fixed "/" mount path. */
+static size_t copy_mount_path(char *dst, const char *src, size_t size) {
+  size_t length = strlen(src);
+  assert(length < size);
+  memcpy(dst, src, length + 1);
+  return length;
+}
+#define strlcpy copy_mount_path
+/* SDK_VFS */
+
+enum {CMEDIA_BUDGET_SCAN_US = 5000000};
+static bool held, idle;
+static unsigned scans, unlinks, misses, stop_after;
+static uint64_t epoch;
+static int64_t now;
+static enum { NORMAL, EPOCH_CHANGE, DEADLINE, BAD_CLOSE } fault;
+static struct {unsigned serial;} g_pending;
+static void lock(void) { assert(!held); held = true; }
+static void unlock(void) { assert(held); held = false; }
+static int64_t esp_timer_get_time(void) { return now; }
+static void vTaskDelay(unsigned ticks) { assert(ticks == 1); }
+static bool pet_fs_activity_idle_epoch(uint64_t *out) { *out = epoch; return idle; }
+static DIR *open_dir(const char *p) {
+  assert(held && !strcmp(p, "/spiffs")); ++scans;
+  return vfs_spiffs_opendir(&ctx, "/");
+}
+static int close_dir(DIR *dir) {
+  int rc = vfs_spiffs_closedir(&ctx, dir);
+  if (fault == EPOCH_CHANGE) ++epoch;
+  if (fault == DEADLINE) now += CMEDIA_BUDGET_SCAN_US;
+  return fault == BAD_CLOSE ? -1 : rc;
+}
+static int remove_file(const char *p) {
+  assert(held && !strncmp(p, "/spiffs/", 8)); ++unlinks;
+  if (stop_after && unlinks > stop_after) { errno = EIO; return -1; }
+  int rc = vfs_spiffs_unlink(&ctx, p + 7);
+  if (rc < 0 && errno == ENOENT) ++misses;
+  return rc;
+}
+#define opendir open_dir
+#define closedir close_dir
+#define readdir(d) vfs_spiffs_readdir(&ctx, d)
+#define unlink remove_file
+/* DEVICE_SWEEP */
+
+static void put(const char *path) {
+  int fd = SPIFFS_open(ctx.fs, path, SPIFFS_CREAT | SPIFFS_WRONLY, 0);
+  assert(fd >= 0 && SPIFFS_write(ctx.fs, fd, "keep", 4) == 4 && SPIFFS_close(ctx.fs, fd) == 0);
+}
+static void check_file(const char *path, bool present) {
+  char bytes[4];
+  int fd = SPIFFS_open(ctx.fs, path, SPIFFS_RDONLY, 0);
+  if (present) {
+    assert(fd >= 0 && SPIFFS_read(ctx.fs, fd, bytes, 4) == 4 && !memcmp(bytes,"keep",4));
+    assert(SPIFFS_close(ctx.fs,fd) == 0);
+  } else {
+    assert(fd < 0 && SPIFFS_errno(ctx.fs) == SPIFFS_ERR_NOT_FOUND);
+    SPIFFS_clearerr(ctx.fs);
+  }
+}
+static void delete_slot(void) {
+  scans = unlinks = misses = 0;
+  pet_cmedia_remove(7);
+  assert(!held);
+}
+int main(void) {
+  enum { candidates = 48 + 4 * PET_P4_WASM_AUDIO };
+  spiffs fs; spiffs_config cfg;
+  ctx.fs = &fs;
+  format_new(&fs, &cfg);
+  put("/p4m08-1-c3.tmp"); put("/private-save"); put("/p4m07-0-a1.bin");
+  for (unsigned i=0; i<28; ++i) {
+    char path[32]; snprintf(path,sizeof(path),"/other-%02u",i); put(path);
+  }
+  idle = false;
+  reads = 0; delete_slot();
+  uint64_t baseline = reads;
+  assert(scans == 0 && unlinks == candidates && misses == candidates);
+  idle = true;
+  reads = 0; delete_slot();
+  assert(scans >= 1 && scans <= 2 && unlinks == 0 && reads < baseline);
+  printf("empty media slot: fallback %u misses, %" PRIu64 " NOR reads; eligible 0 misses, %" PRIu64 " NOR reads\n", candidates, baseline, reads);
+  for (fault=EPOCH_CHANGE; fault<=BAD_CLOSE; ++fault) {
+    put("/p4m07-1-b3.bin");
+    delete_slot();
+    assert(scans == 1 && unlinks == candidates && misses == candidates - 1);
+    check_file("/p4m07-1-b3.bin", false);
+  }
+  fault = NORMAL;
+  put("/p4m07-0-s0.bin"); put("/p4m07-1-c3.tmp"); put("/p4m07-1-a0.bin");
+  stop_after = 1; delete_slot();
+  assert(unlinks == 2 + PET_P4_WASM_AUDIO && misses == 0);
+  /* Simulate losing all transaction-local state between completed unlinks. */
+  SPIFFS_unmount(&fs); mount_new(&fs,&cfg);
+  check_file("/p4m07-0-s0.bin",false);
+  check_file("/p4m07-1-c3.tmp",true);
+  check_file("/p4m07-1-a0.bin",true);
+  stop_after = 0; delete_slot();
+  assert(unlinks == 1 + PET_P4_WASM_AUDIO && misses == 0);
+  SPIFFS_unmount(&fs); mount_new(&fs,&cfg);
+  check_file("/p4m07-1-c3.tmp",false);
+  check_file("/p4m07-1-a0.bin",!PET_P4_WASM_AUDIO);
+  check_file("/p4m08-1-c3.tmp",true);
+  check_file("/p4m07-0-a1.bin",true);
+  check_file("/private-save",true);
+  SPIFFS_unmount(&fs);
+  return 0;
+}

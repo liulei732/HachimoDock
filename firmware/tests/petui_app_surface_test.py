@@ -39,8 +39,16 @@ def interactive():
 def test_python_and_real_c_surface_agree(tmp_path):
     source=tmp_path/'test.c'
     source.write_text('''#include "pet_p4_surface.h"
-#include <stdio.h>
-int main(int argc,char **argv){(void)argc;FILE *f=fopen(argv[1],"rb");char b[8192];size_t n=fread(b,1,sizeof(b)-1,f);b[n]=0;fclose(f);cJSON *j=cJSON_Parse(b);pet_surface_t s;int ok=pet_surface_parse(j,&s);cJSON_Delete(j);return ok?0:1;}
+#include <stdlib.h>
+int main(int argc, char **argv) {
+    if (argc != 4) return 2;
+    cJSON *layout = cJSON_Parse(argv[1]);
+    if (!layout) return 2;
+    pet_surface_t surface;
+    bool ok = pet_surface_parse_profile(layout, &surface, atoi(argv[2]), atoi(argv[3]) != 0);
+    cJSON_Delete(layout);
+    return ok ? 0 : 1;
+}
 ''')
     vendor=ROOT/'firmware/tests/vendor/cjson';exe=tmp_path/'parser'
     subprocess.run(['cc','-std=c11','-fsanitize=address,undefined','-I',str(ROOT/'firmware/main'),'-I',str(vendor),str(source),str(ROOT/'firmware/main/pet_p4_surface.c'),str(vendor/'cJSON.c'),'-lm','-o',str(exe)],check=True)
@@ -97,14 +105,24 @@ int main(int argc,char **argv){(void)argc;FILE *f=fopen(argv[1],"rb");char b[819
     bad=graphics();bad.pop('graphics');cases.append((bad,False))
     for field,value in [('frame_width',320),('encoding','webp'),('frame_height',481)]:
         bad=graphics();bad['images'][0][field]=value;cases.append((bad,False))
+    def check_surface(surface, expected, runtime=None):
+        errors = app_surface_errors(surface, runtime)
+        assert (not errors) == expected, (errors, surface)
+        profile = runtime or {}
+        node_cap = {None: 32, 'p4-quota-v2': 48, 'p4-quota-v3': 64}[profile.get('quota')]
+        graphics_v2 = profile.get('graphics') == 'p4-graphics-v2'
+        result = subprocess.run([str(exe), json.dumps(surface, ensure_ascii=False),
+                                 str(node_cap), str(int(graphics_v2))])
+        assert result.returncode == (0 if expected else 1), surface
+
+    for surface, expected in cases:
+        check_surface(surface, expected)
     if os.environ.get('PET_APP_PACKAGE_DIR'):
-        for path in Path(os.environ['PET_APP_PACKAGE_DIR']).glob('*/runtime/widget.json'):
-            s=json.loads(path.read_text()).get('surface',{})
-            if s.get('engine')=='p4-app-surface-v1':cases.append((s,True))
-    for s,ok in cases:
-        path=tmp_path/'surface.json';path.write_text(json.dumps(s))
-        assert (not app_surface_errors(s))==ok,s
-        assert (subprocess.run([str(exe),str(path)]).returncode==0)==ok,s
+        for path in sorted(Path(os.environ['PET_APP_PACKAGE_DIR']).glob('*/runtime/widget.json')):
+            runtime = json.loads(path.read_text())
+            surface = runtime.get('surface', {})
+            if surface.get('engine') == 'p4-app-surface-v1':
+                check_surface(surface, True, runtime)
 
 def test_icon_tables_are_one_bounded_product_owned_set():
     from app_surface import ICONS

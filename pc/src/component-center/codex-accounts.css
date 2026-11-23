@@ -1,0 +1,7 @@
+.codex-accounts input[type=checkbox]{width:16px;height:16px;accent-color:#f97316;cursor:pointer}
+.codex-accounts__plan{display:inline-block;padding:4px 9px;border-radius:6px;background:#e6f5ed;color:#247b54;font-size:12px;font-weight:650}
+.codex-accounts__plan--pro{background:#ece8fc;color:#7155b6}
+.codex-accounts__login{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:10px 12px;margin-bottom:12px;border:1px solid #e3e6ed;border-radius:8px;background:#f8f9fc}
+.codex-accounts__login small{width:100%;color:#858b9b}
+.codex-accounts .codex-accounts__warning{color:#a45a18;white-space:normal;max-width:260px;line-height:1.5}
+.codex-accounts .stock-watchlist__controls{align-items:center}

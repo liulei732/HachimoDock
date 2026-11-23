@@ -21,13 +21,13 @@ export default function KeyboardConfiguration({ usb, wifi, boardDeviceId, childr
         {label}
       </button>)}
     </div>
-    <div role="tabpanel" id={`${id}-panel-buttons`} aria-labelledby={`${id}-tab-buttons`}
+    <div className="keyboard-configuration-panel" role="tabpanel" id={`${id}-panel-buttons`} aria-labelledby={`${id}-tab-buttons`}
       hidden={tab !== "buttons"}>
       {children ?? <Card title="按钮配置"><p>连接设备后配置实体按键和摇杆。</p></Card>}
     </div>
-    <div role="tabpanel" id={`${id}-panel-bluetooth`} aria-labelledby={`${id}-tab-bluetooth`}
+    <div className="keyboard-configuration-panel" role="tabpanel" id={`${id}-panel-bluetooth`} aria-labelledby={`${id}-tab-bluetooth`}
       hidden={tab !== "bluetooth"}>
-      <BluetoothShortcutPanel key={JSON.stringify([board, wired, wired ? usb.connectionId : wifi?.bootId])}
+      <BluetoothShortcutPanel key={JSON.stringify([board, wired, wired ? usb.connectionId : null, wired ? usb.bootId : wifi?.bootId])}
         usb={usb} wifi={wifi} board={board} active={tab === "bluetooth"} />
     </div>
   </PageShell>;

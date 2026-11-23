@@ -1,0 +1,7 @@
+{
+  "id": "local-notebook",
+  "name": "Pocket notebook",
+  "version": "1.0.0",
+  "kind": "tool",
+  "description": "Edit short private notes with the on-device keyboard."
+}

@@ -33,7 +33,7 @@ function installStorage(initial = {}) {
   return values;
 }
 
-test("the fixed Agent order starts with WorkBuddy and ends with Devin", () => {
+test("the fixed Agent order preserves WorkBuddy as default and puts Antigravity after MiMo", () => {
   assert.equal(DEFAULT_AGENT_ID, "workbuddy");
   assert.deepEqual(
     FIXED_AGENT_OPTIONS.map((agent) => agent.id),
@@ -42,6 +42,7 @@ test("the fixed Agent order starts with WorkBuddy and ends with Devin", () => {
       "codex",
       "deepseek-harness",
       "mimocode",
+      "antigravity",
       "claude-code",
       "openclaw",
       "hermes",
@@ -52,7 +53,7 @@ test("the fixed Agent order starts with WorkBuddy and ends with Devin", () => {
     FIXED_AGENT_OPTIONS.map((agent) => agent.label),
     [
       "WorkBuddy", "ChatGPT（Codex）", "DeepSeek Harness", "MiMo Desktop / MiMoCode",
-      "Claude", "OpenClaw", "Hermes Agent", "Devin",
+      "Antigravity", "Claude", "OpenClaw", "Hermes Agent", "Devin",
     ],
   );
   assert.equal(
@@ -186,4 +187,13 @@ test("pickFirstDetectedAgentId falls back to first detected when followed agent 
   assert.equal(pickFirstDetectedAgentId(agents, "claude-code"), "codex");
   assert.equal(pickFirstDetectedAgentId(agents), "codex");
   assert.equal(pickFirstDetectedAgentId([]), "");
+});
+
+test("Antigravity is available for explicit follow after detection", () => {
+  const agents = normalizeDetectedAgents([{ id: "antigravity", detected: true }]);
+  assert.equal(pickFirstDetectedAgentId(agents), "");
+  assert.equal(pickFirstDetectedAgentId(agents, "antigravity"), "antigravity");
+  assert.equal(pickFirstDetectedAgentId(normalizeDetectedAgents(), "antigravity"), "");
+  assert.deepEqual(assignedAgentIds({}, "workbuddy"), ["workbuddy"]);
+  assert.equal(activeDesktopAssignment({ antigravity: "fixture" }).agentId, "");
 });

@@ -4,6 +4,7 @@ import {initialApp,appDashboard} from './app-runtime.js';
 import {COMPONENT_AUTHORS} from './component-authors.js';
 import {sortComponentsByDefaultOrder} from './library-order.js';
 import {keyframeImageEntries} from './keyframe-background.js';
+import {builtinFeatureManifest} from './feature-manifest.js';
 const manifests=import.meta.glob('../../builtin-clawpkgs/*/component.json',{eager:true,import:'default'});
 const runtimes=import.meta.glob('../../builtin-clawpkgs/*/runtime/widget.json',{eager:true,import:'default'});
 const bindings=import.meta.glob('../../builtin-clawpkgs/*/buttons.json',{eager:true,import:'default'});
@@ -19,6 +20,7 @@ export function latestBuiltinPreview(component){
   if(!manifest||!runtime)return component;
   const declarations=runtime.surface?.images||runtime.scene?.sprites||[];
   return {...component,
+    featureManifest:builtinFeatureManifest(component.id,runtime,applications[`${root}/pc/application.json`],extensions[`${root}/pc/extension.json`]),
     builtin:true,author:COMPONENT_AUTHORS[component.id]||manifest.author||'哈基米',
     wasmPreview:runtime.hachiWasm?{
       sha256:runtime.hachiWasm,canvas:runtime.hachiCanvas,host:runtime.hachiHost,

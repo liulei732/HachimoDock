@@ -61,7 +61,7 @@
     "headline": {
       "switch_state": {
         "ready": "陪小狗，跳过下一朵云",
-        "playing": "松开，出发！",
+        "playing": {"var":"charge"},
         "paused": "歇一下，云朵会等你",
         "result": "没关系，再跳一次"
       }
@@ -353,7 +353,45 @@
         "color": 18918,
         "font_size": 24,
         "line_height": 31,
-        "bind": "headline"
+        "bind": "headline",
+        "state_mask": 13
+      },
+      {
+        "type": "text",
+        "x": 26,
+        "y": 64,
+        "w": 64,
+        "h": 38,
+        "color": 18918,
+        "font_size": 24,
+        "line_height": 31,
+        "text": "蓄力",
+        "state_mask": 2
+      },
+      {
+        "type": "text",
+        "x": 92,
+        "y": 64,
+        "w": 58,
+        "h": 38,
+        "color": 18918,
+        "font_size": 24,
+        "line_height": 31,
+        "bind": "headline",
+        "align": "right",
+        "state_mask": 2
+      },
+      {
+        "type": "text",
+        "x": 154,
+        "y": 64,
+        "w": 42,
+        "h": 38,
+        "color": 18918,
+        "font_size": 24,
+        "line_height": 31,
+        "text": "%",
+        "state_mask": 2
       },
       {
         "type": "text",
@@ -445,9 +483,10 @@
         "icon_size": 20,
         "action": "session.pause",
         "bind": "metricUnit",
-        "icon": "pause"
+        "icon": "pause",
+        "state_mask": 6
       },
-      {"type":"button","x":474,"y":387,"w":142,"h":48,"color":65501,"foreground":18918,"radius":16,"font_size":20,"padding":14,"action":"session.restart","text":"重开"},
+      {"type":"button","x":474,"y":387,"w":142,"h":48,"color":65501,"foreground":18918,"radius":16,"font_size":20,"padding":14,"gap":8,"icon_size":20,"action":"session.restart","text":"重开"},
       {
         "type": "panel",
         "x": 0,
@@ -511,7 +550,7 @@
         "line_height": 17,
         "text": "暂停 / 继续"
       },
-      {"type":"button","x":395,"y":454,"w":54,"h":20,"color":65501,"foreground":18918,"radius":4,"font_size":11,"padding":0,"text":"中按","key_for":"session.restart"},
+      {"type":"button","x":395,"y":454,"w":54,"h":20,"color":65501,"foreground":18918,"radius":4,"font_size":11,"padding":0,"gap":8,"icon_size":20,"text":"中按","key_for":"session.restart"},
       {"type":"text","x":455,"y":453,"w":46,"h":22,"color":18918,"font_size":13,"line_height":17,"text":"重开"},
       {
         "type": "text",

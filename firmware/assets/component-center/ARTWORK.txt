@@ -3,4 +3,9 @@ Prompt: 4:3 refined desktop-pet launcher background; warm sandstone, muted apric
 soft paper and ceramic texture, quiet center, gentle corner illumination; no text,
 buttons, panels, icons, logos or objects. Downsampled to the native 640 x 480 canvas.
 Thumbnails: deterministic encodings of the referenced built-in component artwork.
-Original component notices remain in each package. No UI text is baked into images.
+Original component notices remain in each package. Each PC cover can include the component’s own interface.
+
+The device catalog uses each factory package's pc/cover.png. Each 64×48 tile has
+a 16-entry RGB565 palette and its own zlib stream. Offsets in catalog.h allow
+one visible card to be read without inflating the entire atlas. Source cover
+SHA-256 values are recorded in comments for the factory catalog regression.

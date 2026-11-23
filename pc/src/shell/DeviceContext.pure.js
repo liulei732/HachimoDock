@@ -5,11 +5,16 @@
  * [Sync] If this file changes, update `pc/src/shell/.folder.md`.
  */
 
+import {wifiComponentTarget} from "../lib/wifi-device-control.js";
 import {
   activeDesktopAssignment,
   appearanceById,
   channelLabelForId,
 } from "../lib/agent-appearance-config.js";
+
+export function deviceDisplayId(boardDeviceId) {
+  return String(boardDeviceId || "").slice(-6);
+}
 
 export function deriveCurrentDisplay(agentAppearanceMap, enabledAgents, appearances, agentOptions) {
   const active = activeDesktopAssignment(agentAppearanceMap, enabledAgents);
@@ -118,14 +123,21 @@ export function pairedWifiTarget(status) {
     bundledFirmwareVersion: status.bundledFirmwareVersion || "",
     bundledFirmwareRollbackBlocked: status.bundledFirmwareRollbackBlocked === true,
     wifiConnected: true,
+    // Older LAN status versions default an absent vault flag to false.
+    widgetCredentialStorageReady: status.widgetCredentialStorageReady === true,
     clockSynchronized: status.clockSynchronized === true,
     rebootSupported: status.rebootSupported === true,
     trustedVolume: status.trustedVolume === true,
+    globalAudioCues: status.globalAudioCues === true,
     controlTrusted: status.controlTrusted === true,
     wirelessOta: status.wirelessOta === true,
     wirelessRealtime: status.wirelessRealtime === true,
     wirelessVoiceInput: status.wirelessVoiceInput === true,
     componentDelivery: status.componentDelivery === true,
+    componentBundle: status.componentBundle === true,
+    componentTarget: wifiComponentTarget(status),
+    componentTargetError: status.componentTargetError || null,
+    centerThumb: status.centerThumb === true && status.componentBundle === true,
     appearanceCapacity: Number.isSafeInteger(status.appearanceCapacity) && status.appearanceCapacity > 0
       ? status.appearanceCapacity : 0,
     inputDoublePress: status.inputDoublePress === true,
@@ -136,7 +148,8 @@ export function pairedWifiTarget(status) {
 
 export function pairedWifiTargetsEqual(left, right) {
   if (left === right) return true;
-  return Boolean(left && right && Object.entries(right).every(([key, value]) => left[key] === value));
+  return Boolean(left && right && Object.entries(right).every(([key, value]) =>
+    key === "componentTarget" ? JSON.stringify(left[key]) === JSON.stringify(value) : left[key] === value));
 }
 
 export function deriveDeviceReachability({ usb, wifi }) {

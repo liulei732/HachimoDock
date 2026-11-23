@@ -23,16 +23,22 @@ export default function StockWatchlist({ usb }) {
   const requestEpoch = useRef(0);
   useEffect(() => {
     let stopped = false;
+    let timer;
     async function poll() {
       const epoch = requestEpoch.current;
       try {
         const next = await invoke("stock_watchlist_status");
         if (!stopped && !editing.current && epoch === requestEpoch.current) {setStatus(next);setPollError('');}
       } catch (e) { if (!stopped&&epoch===requestEpoch.current) setPollError(String(e)); }
-      finally { if (!stopped) setLoading(false); }
+      finally {
+        if (!stopped) {
+          setLoading(false);
+          timer = setTimeout(poll, 2000);
+        }
+      }
     }
-    poll(); const timer = setInterval(poll, 2000);
-    return () => { stopped = true; clearInterval(timer); };
+    poll();
+    return () => { stopped = true; clearTimeout(timer); };
   }, []);
   const symbols = status?.settings?.symbols || [];
   useEffect(() => {
@@ -60,6 +66,7 @@ export default function StockWatchlist({ usb }) {
     setStatus(await invoke("stock_watchlist_save", { input: { symbols: next } }));
   }
   function addSymbol(symbol) {
+    if (!status || !symbol || symbols.length >= 20) return;
     action(async () => {
       const quote = await invoke("stock_quote_lookup", { symbol });
       if (symbols.includes(quote.symbol)) throw new Error("这只股票已经在自选股中");
@@ -75,9 +82,9 @@ export default function StockWatchlist({ usb }) {
     action(() => save(next));
   }
   return <details className="stock-watchlist" open>
-    <summary>自选股行情 <span className="muted small">{symbols.length}/20 · 腾讯行情</span></summary>
+    <summary>自选股行情 <span className="muted small">{status ? symbols.length : "—"}/20 · 腾讯行情</span></summary>
     <div className="stock-watchlist__body">
-      <p className="muted small">添加股票后，打开设备上的「自选股行情」组件查看。PC 每 2 秒批量更新，请保持 Pet Manager 运行并连接 USB；各市场可能有行情延迟，以显示的行情时间为准。</p>
+      <p className="muted small">在这里管理自选名单。支持设备行情的 WiFi6 固件同步名单后可联网自行更新。电脑供数时请保持 Pet Manager 运行，通过 USB 或受信 Wi-Fi 同步。各市场可能延迟，请核对行情时间。</p>
       {usb?.connected && usb?.capabilities?.widgetData !== "p4-data-list-v1" && <p className="stock-watchlist__notice">当前设备固件尚不支持实时数据组件，请先升级固件。</p>}
       <form className="stock-watchlist__add" onSubmit={add}>
         <select aria-label="股票市场" value={market} onChange={(e) => setMarket(e.target.value)} disabled={busy}>
@@ -103,7 +110,7 @@ export default function StockWatchlist({ usb }) {
         </button>)}
       </div>}
       {(error || pollError || status?.error) && <p className="stock-watchlist__notice" role="alert">{error || pollError || status.error}</p>}
-      {!symbols.length && <p className="muted small">{loading ? "读取自选股…" : "还没有自选股。输入中文名称检索，或选择市场并输入代码添加，列表和顺序会自动保存。"}</p>}
+      {!symbols.length && (loading || status) && <p className="muted small">{loading ? "读取自选股…" : "还没有自选股。输入中文名称检索，或选择市场并输入代码添加，列表和顺序会自动保存。"}</p>}
       {!!symbols.length && <div className="stock-watchlist__table"><table>
         <thead><tr><th>股票</th><th>最新价</th><th>涨跌幅</th><th>行情时间</th><th>管理</th></tr></thead>
         <tbody>{symbols.map((symbol, index) => {

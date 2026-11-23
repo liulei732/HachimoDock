@@ -16,13 +16,15 @@ import { personaSummaryLabel } from "../lib/persona-voice.js";
 import { realtimeReadiness } from "../lib/usage-help.js";
 import { API_CONFIGURATION_UPDATED_EVENT } from "../lib/api-configuration.js";
 import UsageHelp from "../UsageHelp.jsx";
-import { isRecoveringAsr } from "../lib/realtime-feedback.js";
+import { formatModelIssue } from "../lib/model-issue.js";
+import { isRecoveringAsr, realtimeErrorMessage, speechModelMessage } from "../lib/realtime-feedback.js";
 
 export const REALTIME_STATE_LABELS = Object.freeze({
   idle: "未开始",
   preparing: "准备中",
   listening: "在听",
   thinking: "在想",
+  synthesizing: "正在合成语音",
   speaking: "在说",
   ended: "已结束",
 });
@@ -39,7 +41,7 @@ export default function RealtimeChatPanel({ keyBound = false, onOpenApiSettings,
   const personaReady = Boolean(appearance?.personaVoice?.configured);
   const active = Boolean(realtimeChat?.active);
   const state = active ? realtimeChat.state : "idle";
-  const error = localError || realtimeChat?.error || "";
+  const error = localError || realtimeErrorMessage(realtimeChat);
   const recovering = !localError && isRecoveringAsr(realtimeChat);
   const [check, setCheck] = useState({ loading: true });
   const [checkRevision, setCheckRevision] = useState(0);
@@ -53,8 +55,8 @@ export default function RealtimeChatPanel({ keyBound = false, onOpenApiSettings,
       try {
         const [settings, speech] = await Promise.all([invoke("load_voice_chat_settings"), invoke("load_device_asr_settings")]);
         if (!cancelled && request === sequence) setCheck({ loading: false, settings: { ...settings, asrConfigured: speech?.configured === true } });
-      } catch {
-        if (!cancelled && request === sequence) setCheck({ loading: false, failed: true });
+      } catch (error) {
+        if (!cancelled && request === sequence) setCheck({ loading: false, failed: true, readError: formatModelIssue("storage", "本机对话配置", error) });
       }
     };
     load();
@@ -74,7 +76,7 @@ export default function RealtimeChatPanel({ keyBound = false, onOpenApiSettings,
     try {
       await startRealtimeChat();
     } catch (err) {
-      setLocalError(err?.message || String(err));
+      setLocalError(speechModelMessage(err));
     } finally {
       setBusy(false);
     }
@@ -85,7 +87,7 @@ export default function RealtimeChatPanel({ keyBound = false, onOpenApiSettings,
     try {
       await stopRealtimeChat("ui");
     } catch (err) {
-      setLocalError(err?.message || String(err));
+      setLocalError(speechModelMessage(err));
     } finally {
       setBusy(false);
     }
@@ -98,7 +100,7 @@ export default function RealtimeChatPanel({ keyBound = false, onOpenApiSettings,
           <Mic size={14} />
           <strong>{appearance ? appearance.name : "设备上还没有形象"}</strong>
           <span className={"muted small" + (personaReady ? "" : " realtime-chat-panel__warn")}>
-            {appearance ? personaSummaryLabel(appearance.personaVoice) : "先在画廊里应用一个形象"}
+            {appearance ? personaSummaryLabel(appearance.personaVoice, check.loading ? null : check.settings) : "先在画廊里应用一个形象"}
           </span>
         </div>
         <span className={`realtime-chat-panel__state is-${state}`}>
@@ -109,7 +111,7 @@ export default function RealtimeChatPanel({ keyBound = false, onOpenApiSettings,
       <UsageHelp onOpenApiSettings={onOpenApiSettings} />
       {!keyBound && <p className="muted small">未绑定设备快捷键时，也可以点击下方「开始聊天」。</p>}
       {!active && readiness && <div className="usage-help" role="status">
-        <p>{readiness.message}</p>
+        <p>{readiness.message} {readiness.action === "retry" && check.readError}</p>
         {nextAction && <button type="button" className="btn-secondary btn-sm" onClick={nextAction}>
           {readiness.action === "persona" ? "设置人设与声音" : readiness.action === "appearance" ? "去形象画廊" : readiness.action === "retry" ? "重新检查" : "去配置"}
         </button>}
@@ -122,7 +124,7 @@ export default function RealtimeChatPanel({ keyBound = false, onOpenApiSettings,
         </div>
       )}
       {realtimeChat?.searchState === "searching" && <p className="muted small" role="status">正在联网检索…</p>}
-      {realtimeChat?.searchState === "failed" && <p className="muted small" role="status">{realtimeChat.searchError}</p>}
+      {realtimeChat?.searchState === "failed" && realtimeChat.searchError !== realtimeChat.error && <p className="muted small" role="status">{realtimeChat.searchError}</p>}
       {realtimeChat?.searchSources?.length > 0 && (
         <details className="usage-help">
           <summary>联网来源（{realtimeChat.searchSources.length}）{realtimeChat.searchProvider && ` · ${realtimeChat.searchProvider}`}</summary>

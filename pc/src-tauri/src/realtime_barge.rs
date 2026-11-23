@@ -29,7 +29,7 @@ impl Confirmation {
         } else if text != self.previous { self.revisions += 1; }
         self.previous = text;
         if terminal { return voiced_frames >= 8; }
-        let stable_ms = if phase == "thinking" { 250 } else { 180 };
+        let stable_ms = if matches!(phase, "thinking" | "synthesizing") { 250 } else { 180 };
         voiced_frames >= 12 && self.revisions >= 2 && ms.saturating_sub(self.first_ms.unwrap_or(ms)) >= stable_ms
     }
 }

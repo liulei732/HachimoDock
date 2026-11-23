@@ -103,6 +103,13 @@ static void stage_commit(void) {
   char error[128]; uint8_t data[64] = {0x45};
   assert(pet_p4_raw_assets_prepare(8192,error,sizeof(error)));
   assert(pet_p4_raw_assets_write_chunk("p4/a.h264","0",data,sizeof(data),error,sizeof(error)));
+  unsigned long long original_size = g_transfer.file_size;
+  unsigned original_cursor = g_transfer.cursor;
+  assert(pet_p4_raw_assets_write_chunk("p4/a.h264","0",data,sizeof(data),error,sizeof(error)));
+  assert(g_transfer.file_size == original_size && g_transfer.cursor == original_cursor);
+  data[0] ^= 1;
+  assert(!pet_p4_raw_assets_write_chunk("p4/a.h264","0",data,sizeof(data),error,sizeof(error)));
+  assert(g_transfer.file_size == original_size && g_transfer.cursor == original_cursor);
   assert(pet_p4_raw_assets_finish_file("p4/a.h264",sizeof(data),NULL,error,sizeof(error)));
 }
 static void *mutate_header(void *arg) {
@@ -154,8 +161,16 @@ int main(void) {
   assert(reads==before);
   assert(pet_p4_raw_assets_read_range(1,8192,64,32,out,32));
   invalidate_cache_for_test(1); fail_read=true;
-  assert(!pet_p4_raw_assets_locate(1,"p4/a.h264",64,&offset)); fail_read=false;
-  assert(!pet_p4_raw_assets_locate(1,"p4/a.h264",64,&offset)); /* Bounded negative cache. */
+  assert(!pet_p4_raw_assets_committed_pack_id_for_slot(1,pack,sizeof(pack)) && errno==EAGAIN);
+  fail_read=false;
+  assert(pet_p4_raw_assets_committed_pack_id_for_slot(1,pack,sizeof(pack)) && pack[0]=='b');
+  /* A successfully read empty header, unlike IO failure, is safe to cache. */
+  memset(flash_bytes[1],255,4096);
+  invalidate_cache_for_test(1);
+  assert(!pet_p4_raw_assets_committed_pack_id_for_slot(1,pack,sizeof(pack)) && errno==ENOENT);
+  before=reads;
+  assert(!pet_p4_raw_assets_locate(1,"p4/a.h264",64,&offset) && reads==before);
+  header(1,8192,'b');
   invalidate_cache_for_test(1); fail_alloc=true;
   assert(!pet_p4_raw_assets_locate(1,"p4/a.h264",64,&offset)); fail_alloc=false;
   assert(!g_cache_loading[1] && !g_caches[1].attempted);

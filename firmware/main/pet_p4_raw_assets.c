@@ -540,10 +540,11 @@ static bool load_cache(int slot) {
   _Static_assert(sizeof(pet_p4_raw_cache_t) <= 1024, "raw cache snapshot is bounded");
   cache = calloc(1, sizeof(*cache) + PET_P4_RAW_HEADER_BYTES);
   if (!cache) goto complete;
-  cache->attempted = true;
   header = (unsigned char *) (cache + 1);
-  if (esp_partition_read(partition, 0, header, PET_P4_RAW_HEADER_BYTES) != ESP_OK
-      || memcmp(header, PET_P4_RAW_MAGIC, sizeof(PET_P4_RAW_MAGIC)) != 0
+  if (esp_partition_read(partition, 0, header, PET_P4_RAW_HEADER_BYTES) != ESP_OK) goto complete;
+  /* Only bytes actually read from flash can establish an invalid slot. */
+  cache->attempted = true;
+  if (memcmp(header, PET_P4_RAW_MAGIC, sizeof(PET_P4_RAW_MAGIC)) != 0
       || get_u32(header + 8U) != PET_P4_RAW_HEADER_VERSION) {
     goto complete;
   }
@@ -602,11 +603,17 @@ bool pet_p4_raw_assets_committed_pack_id_for_slot(
   char *out,
   size_t out_size
 ) {
-  if (!out || out_size < PET_P4_RAW_PACK_ID_BYTES + 1U || !load_cache(slot)) return false;
+  if (!out || out_size < PET_P4_RAW_PACK_ID_BYTES + 1U || slot < 0 || slot >= PET_P4_RAW_SLOT_COUNT) {
+    errno = EINVAL;
+    return false;
+  }
+  (void)load_cache(slot);
   portENTER_CRITICAL(&g_raw_cache_mux);
-  bool valid = g_caches[slot].valid;
+  bool known = g_caches[slot].attempted && !g_cache_mutating[slot];
+  bool valid = known && g_caches[slot].valid;
   if (valid) memcpy(out, g_caches[slot].pack_id, PET_P4_RAW_PACK_ID_BYTES + 1U);
   portEXIT_CRITICAL(&g_raw_cache_mux);
+  if (!valid) errno = known ? ENOENT : EAGAIN;
   return valid;
 }
 

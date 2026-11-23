@@ -124,12 +124,23 @@ bool pet_local_action(const pet_local_config_t *c,pet_local_state_t *s,int32_t v
     if(s->phase==1&&op!=PET_LOCAL_CLOSE)return false;
     if(op==PET_LOCAL_PREVIOUS||op==PET_LOCAL_NEXT){v[0]=wrap(at+(op==PET_LOCAL_NEXT?1:-1),c->count);s->phase=0;return true;}
     if(op==PET_LOCAL_CLOSE){s->phase=0;s->pending=-1;return true;}
-    if(op==PET_LOCAL_RESET){deck_clear(c,v,(unsigned)at);s->phase=0;return true;}
+    if(op==PET_LOCAL_RESET){deck_clear(c,v,(unsigned)at);s->revealed[at]=0;s->phase=0;return true;}
     if(op==PET_LOCAL_EXCLUDE){if(s->phase!=2||v[b]<0)return false;deck_exclude(v,(unsigned)at,(unsigned)v[b]);s->phase=0;}
     if(op==PET_LOCAL_DRAW||op==PET_LOCAL_EXCLUDE){
-      int candidates[PET_LOCAL_ITEMS],n=0;for(int i=0;i<g->count;i++)if(!deck_excluded(v,(unsigned)at,(unsigned)i))candidates[n++]=i;
+      uint8_t candidates[PET_LOCAL_ITEMS];
+      unsigned n = 0;
+      uint64_t available = 0;
+      for (unsigned i = 0; i < g->count; i++)
+        if (!deck_excluded(v, (unsigned)at, i)) available |= UINT64_C(1) << i;
+      uint64_t next = available & ~s->revealed[at];
+      if (!next) {
+        next = available;
+        s->revealed[at] = 0;
+      }
+      for (unsigned i = 0; i < g->count; i++)
+        if (next & (UINT64_C(1) << i)) candidates[n++] = (uint8_t)i;
       if(!n){s->phase=4;s->pending=-1;return true;}
-      if(n>1)for(int i=0;i<n;i++)if(candidates[i]==v[b]){candidates[i]=candidates[--n];break;}
+      if(n>1)for(unsigned i=0;i<n;i++)if(candidates[i]==v[b]){candidates[i]=candidates[--n];break;}
       /* Multiply-high maps the supplied full-width entropy to a bounded index. */
       s->pending=candidates[((uint64_t)random*(unsigned)n)>>32];s->reveal_at=ms+c->reveal_ms;s->phase=1;return true;
     }return false;
@@ -159,8 +170,25 @@ bool pet_local_action(const pet_local_config_t *c,pet_local_state_t *s,int32_t v
 }
 bool pet_local_tick(const pet_local_config_t *c,pet_local_state_t *s,int32_t v[],uint64_t ms,int64_t now){
   if(!c->enabled)return false;repair(c,v);
-  if(!c->countdown&&s->phase==1&&ms>=s->reveal_at){v[2+2*v[0]]=s->pending;s->phase=2;s->pending=-1;return true;}
-  if(c->countdown&&(now!=s->last_second||(s->phase==5&&now>=0))){s->last_second=now;if(s->phase==5&&now>=0)s->phase=0;return true;}
+  if (!c->countdown && s->phase == 1 && ms >= s->reveal_at) {
+    v[2+2*v[0]] = s->pending;
+    s->revealed[v[0]] |= UINT64_C(1) << s->pending;
+    s->phase = 2;
+    s->pending = -1;
+    return true;
+  }
+  if (c->countdown && (now != s->last_second || (s->phase == 5 && now >= 0))) {
+    const int64_t previous = s->last_second;
+    s->last_second = now;
+    if (s->phase == 5 && now >= 0) { s->phase = 0; return true; }
+    if (s->phase == 3) return false; /* Editing only changes in response to input. */
+    if (previous < 0 || now < previous || now / 86400 != previous / 86400) return true;
+    const int group = v[0], slot = 1 + 2 * group;
+    const int64_t target = pet_local_target(c->groups[group].kind, v[slot], v[slot+1], now);
+    if (target <= previous) return false;
+    const int64_t left = target - now;
+    return left < 86400 || (left + 86399) / 86400 != (target - previous + 86399) / 86400;
+  }
   if(!c->countdown&&(s->last_second==-2||(s->phase==1&&s->last_second!=(int64_t)(ms/50)))){s->last_second=ms/50;return true;}
   return false;
 }
@@ -195,7 +223,7 @@ void pet_local_view(const pet_local_config_t *c,const pet_local_state_t *s,const
     else snprintf(o->note,sizeof(o->note),"目标时间  %02d:%02d",minute/60,minute%60);
     snprintf(o->label,sizeof(o->label),"左右选项，上下调整");return;
   }
-  if(now<0){o->phase=5;snprintf(o->headline,sizeof(o->headline),"等待时间校准");snprintf(o->note,sizeof(o->note),"连接新版 Pet Manager 校准时间后可离线使用。");snprintf(o->metric,sizeof(o->metric),"—");return;}
+  if(now<0){o->phase=5;snprintf(o->headline,sizeof(o->headline),"等待时间校准");snprintf(o->note,sizeof(o->note),"Wi-Fi 机型联网校时，也可连接电脑客户端校时。");snprintf(o->metric,sizeof(o->metric),"—");return;}
   int64_t target=pet_local_target(g->kind,day,minute,now);
   if(target<0){snprintf(o->headline,sizeof(o->headline),"给期待定个日子");snprintf(o->metric,sizeof(o->metric),"—");snprintf(o->note,sizeof(o->note),"点设置时间，保存属于你的小期待。");return;}
   int64_t left=target-now;

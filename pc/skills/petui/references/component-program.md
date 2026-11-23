@@ -2,6 +2,8 @@
 
 ## 创作与同步入口
 
+数字签到簿可以生成有界事务程序。文字笔记本使用原生键盘表单和组件私有存档，支持多条 UTF-8 文本及同 ID 扩容。示例和生成命令见[设备本地记录](local-records.md)。
+
 先读取目标设备真实 hello：`widgetProgram` 或 `widgetPrograms` 必须明确声明包使用的
 `p4-component-program-v1/v2`，再交叉核验 `widgetProgramMaxCells`、
 `widgetProgramMaxCode`、`widgetProgramMaxFuel` 与 `widgetProgramQuantum`。
@@ -20,7 +22,12 @@ v2 设备可同时明确兼容 v1；未知版本、缺失能力或超出任一�
 主动停止不因显隐恢复，更新/删除先静止并缓存最新提交；没有包内自启动、开机任务
 恢复或服务/外设混用。小型组件已通过静默设备生命周期、跨启动旧 bootId 拒绝、
 保存恢复与主动停止锁存；不代表最大负载、任意组合、声音或 AEC 已验收。
-不能据此生成 background 字段。
+设备另行报告 `widgetLocalProgramResume=p4-local-program-v1` 后，可在已验证的
+`runtime.program` 中声明 `"background": true` 并提供至少一个合法 timer。
+用户在组件的「后台设置」页单独授权。设备保存组件 ID 和已安装内容标识，冷启动
+等到时间有效且有空闲 PROGRAM 租约后，从检查点恢复；定时器从本次启动调度，
+关机期间的程序事件不补发。提醒、静默计数和后台程序分别控制。更新或删除会
+撤销该组件的授权，保留存档的卸载也一样。
 
 另一个默认关闭的 `widgetProgramParent=p4-program-parent-v1` 候选把前台设备程序
 接到同一个原生后台 scheduler，每个主循环合计一次 64 指令调度，而不是每个子任务

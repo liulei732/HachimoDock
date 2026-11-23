@@ -51,8 +51,8 @@ import { listen } from "@tauri-apps/api/event";
 import { watch } from "@tauri-apps/plugin-fs";
 import { centerTitleForSync } from "./lib/component-center-text.js";
 import { useExitProtection } from "./lib/exit-protection.js";
-import {syncAudioPreflight,deviceDeletePolicy,componentTransferError,componentCommitOutcomeUnknown} from './component-center/component-transfer-policy.js';
-import { componentRequiresPc } from "./component-center/catalog-state.js";
+import {canRepairThumbnail,syncAudioPreflight,deviceDeletePolicy,componentTransferError,componentCommitOutcomeUnknown,verifyWifiInstall} from './component-center/component-transfer-policy.js';
+import { componentFeatures, featureTarget } from "./component-center/component-features.js";
 import { BUILTIN_COMPONENT_CENTER } from "./fixtures";
 import {
   activeComponentTargetKey,
@@ -77,7 +77,7 @@ import {useDialogFocus} from './component-center/use-dialog-focus.js';
 import './component-center/center-workflow.css';
 import {devicePackageState, readCenterPreference, saveCenterPreference} from './component-center/catalog-state.js';
 import { isRoutedWidgetBinding } from "./component-center/binding-labels.js";
-import { componentUsbInstallBlockedReason, isComponentVisible, legacyAudioInstallBlockedReason, mergeComponentCatalog, sortComponentsByCreatedAt } from "./component-center/library-order.js";
+import { componentInstallBlockedReason, isComponentVisible, legacyAudioInstallBlockedReason, mergeComponentCatalog, sortComponentsByCreatedAt } from "./component-center/library-order.js";
 import {
   COMPONENT_CONTROL_OPTIONS,
   componentInputEventSlots,
@@ -101,6 +101,9 @@ const PROMOTED_BUILTIN_SOURCE_HASHES = new Set([
   "e445d1af162d2470",
   "e725dd72d4a5bea1",
   "b8d4bb1230e6f3d7",
+  "a5a7f34add2ee500", // hope-train
+  "d8d67f1550a87bd4", // answer-book
+  "16c242ad4c1f982d", // decision-capsule
 ]);
 // View remounts reuse the last successful snapshot; refresh never clears cards.
 let lastLibrarySnapshot = null;
@@ -294,7 +297,7 @@ function inventoryFailure(error, target) {
 
 function inventoryTargetKey(target) {
   const identity = activeComponentTargetKey(target);
-  return target?.transport === "wifi" && identity ? `wifi:${identity}:${target.bootId}` : identity;
+  return target?.transport === "wifi" && identity ? `wifi:${identity}:${target.bootId}${target.association ? ":" + target.association : ""}` : identity;
 }
 
 function readSessionDeviceInventory(target) {
@@ -404,23 +407,25 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
     wifi,
     currentComponent: deviceCurrentComponent,
   } = useDeviceContext();
+  const capabilityTarget = useMemo(()=>featureTarget(usb,wifi),[usb,wifi]);
   const configuredSshHost = readConfiguredComponentSshHost();
-  const wirelessInventoryReady = wifiDeviceControlReady(wifi) && wifi?.componentDelivery === true;
+  const wirelessInventoryReady = wifiDeviceControlReady(wifi) && wifi?.wifiConnected === true && wifi?.componentDelivery === true;
   const wifiBoardDeviceId = wifi?.boardDeviceId;
   const wifiBootId = wifi?.bootId;
+  const association = wifi?.componentTarget?.association;
   const liveInventoryTarget = useMemo(() => {
     const boardDeviceId = String(usb.boardDeviceId || "").trim();
     if (usb.connected && boardDeviceId) {
       return { transport: "usb", boardDeviceId };
     }
     if (!usb.connected && wirelessInventoryReady && wifiBoardDeviceId && wifiBootId) {
-      return { transport: "wifi", boardDeviceId: wifiBoardDeviceId, bootId: wifiBootId,
+      return { transport: "wifi", boardDeviceId: wifiBoardDeviceId, bootId: wifiBootId, association,
         controlTrusted: true, panelControl: true };
     }
     return configuredSshHost
       ? { transport: "ssh", sshHost: configuredSshHost }
       : null;
-  }, [configuredSshHost, usb.boardDeviceId, usb.connected, wirelessInventoryReady, wifiBoardDeviceId, wifiBootId]);
+  }, [configuredSshHost, usb.boardDeviceId, usb.connected, wirelessInventoryReady, wifiBoardDeviceId, wifiBootId, association]);
   const deviceConnected = Boolean(liveInventoryTarget);
   const readsGlobalButtons = liveInventoryTarget?.transport === "wifi"
     || (liveInventoryTarget?.transport === "usb" && usb.runtime === "esp-p4");
@@ -498,6 +503,7 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
   const componentActionCancelRef = useRef(null);
   const componentActionReturnFocusRef = useRef(null);
   /* USB OTA install flow modal: idle | checking-usb | waiting-usb | installing | success | error */
+  const [repairingThumb, setRepairingThumb] = useState(false);
   const [otaPhase, setOtaPhase] = useState("idle");
   useExitProtection(otaPhase === "installing" || projectBuilding || componentActionPending ? "组件安装或更新尚未完成" : "");
   const [otaProgress, setOtaProgress] = useState(null);
@@ -620,7 +626,7 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
         push({
           tone: "warning",
           title: "尚未连接目标设备",
-          message: "连接 USB 板端或配置 SSH 主机后再同步组件。",
+          message: "请连接 USB 或已授权的在线 Wi-Fi 设备，再同步组件。",
         });
       }
       return EMPTY_DEVICE_INVENTORY;
@@ -701,6 +707,7 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
       wasmPreview: entry.wasmPreview || null,
       gameType: entry.gameType || "",
       runtimeEngine: entry.runtimeEngine || "",
+      featureManifest: entry.featureManifest,
       dataSource: entry.dataSource || "",
       mediaSource: entry.mediaSource || "",
       syncRequirements: entry.syncRequirements || null,
@@ -800,7 +807,7 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
   }, [catalogItems, deviceInventory.freshness, deviceInventory.items]);
 
   /* A successful live inventory is the device truth. Reconcile the small
-     target-scoped local record so ContextRail and the library marker follow
+     target-scoped local record so the library marker follows
      what the board actually reports, while preserving an exact local source
      when the active id has not changed. */
   useEffect(() => {
@@ -851,10 +858,11 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
       const kind = resolveComponentKind(item.kind, item.gameType);
       const state=devicePackageState(item,deviceInventory);
       const query=String(libraryQuery).trim().toLowerCase();
-      const matchesStatus=libraryStatus==='all'||(libraryStatus==='installed'&&installedIds.has(item.id)&&deviceInventory.freshness==='live')||(libraryStatus==='update'&&state.key==='update')||(libraryStatus==='pc'&&componentRequiresPc(item))||(libraryStatus==='offline'&&!componentRequiresPc(item));
+      const modes=componentFeatures(item,capabilityTarget).modes;
+      const matchesStatus=libraryStatus==='all'||(libraryStatus==='installed'&&installedIds.has(item.id)&&deviceInventory.freshness==='live')||(libraryStatus==='update'&&state.key==='update')||modes.includes(libraryStatus)||(libraryStatus==='mixed'&&modes.length>1);
       return (libraryKind === "all" || kind === libraryKind)&&matchesStatus&&(!query||`${item.name} ${item.id} ${item.author||''}`.toLowerCase().includes(query));
     }),
-    [libraryItems, libraryKind,libraryQuery,libraryStatus,deviceInventory,installedIds],
+    [libraryItems, libraryKind,libraryQuery,libraryStatus,deviceInventory,installedIds,capabilityTarget],
   );
 
   const librarySectionRef = useRef(null);
@@ -914,6 +922,26 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
     await refresh;
   }
 
+  async function repairThumbnail(component) {
+    const target = liveInventoryTarget;
+    if (transferInFlight.current || syncInFlight.current || !target || !component.libraryPath) return;
+    transferInFlight.current = true;
+    setRepairingThumb(true);
+    try {
+      await invoke("repair_component_thumbnail", {
+        path: component.libraryPath, id: component.id, expectedVersionHash: component.versionHash,
+        expectedBoardDeviceId: target.boardDeviceId,
+        expectedBootId: target.transport === "wifi" ? target.bootId : null,
+      });
+      push({tone:"success",title:"设备封面已补齐",message:component.name});
+    } catch (error) {
+      push({tone:"error",title:"补封面未确认",message:componentTransferError(error)});
+    } finally {
+      transferInFlight.current = false;
+      setRepairingThumb(false);
+    }
+  }
+
   async function syncSelectedComponent(component, allowDowngrade=false, {freshImport=false}={}) {
     if (!component?.id || component.isDeviceOnly || syncInFlight.current || transferInFlight.current) return;
     const conflict=bindingConflictForComponent(component);
@@ -927,7 +955,7 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
       });
       return;
     }
-    const firmwareError = componentUsbInstallBlockedReason(component, usb);
+    const firmwareError = componentInstallBlockedReason(component, usb, wifi, liveInventoryTarget);
     if (firmwareError) {
       push({
         tone: "error",
@@ -940,7 +968,7 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
       push({
         tone: "warning",
         title: "尚未连接目标设备",
-        message: "连接 USB 板端或配置 SSH 主机后再同步组件。",
+        message: "请连接 USB 或已授权的在线 Wi-Fi 设备，再同步组件。",
       });
       return;
     }
@@ -1365,6 +1393,7 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
        remembered SSH host, preventing stale LAN settings from silently writing
        another device. SSH remains the offline-board transport. */
     const sshHost = readConfiguredComponentSshHost();
+    let wifiCheck;
     let componentPackageInstalled = false;
     let attemptedSsh = false;
     const useWifi = options.target?.transport === "wifi";
@@ -1396,10 +1425,12 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
         const inspected = await invoke("inspect_clawpkg", { path: clawpkgPath }).catch(() => null);
         const centerTitle = centerTitleForSync(inspected?.deviceCenterTitle);
         if (options.epoch !== undefined && options.epoch !== installEpoch.current) return false;
+        wifiCheck = { scope: inventoryTargetKey(installTarget), id: preview.id, version: preview.version, previousVersion: installed?.version };
         result = await invoke("lan_component_install", {
-          path: clawpkgPath, ...preview,
+          path: clawpkgPath, id: preview.id, digest: preview.digest,
           expectedBoardDeviceId: installTarget.boardDeviceId,
           expectedBootId: installTarget.bootId,
+          expectedAssociation: installTarget.association,
           expectedInstalledVersion: installed?.version,
           centerTitle,
           expectedVersionHash: component?.versionHash || undefined,
@@ -1473,7 +1504,8 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
       return true;
     } catch (err) {
       const msg = componentTransferError(err);
-      const commitUnconfirmed = !componentPackageInstalled && !attemptedSsh && !useWifi && componentCommitOutcomeUnknown(err);
+      const commitUnconfirmed = !componentPackageInstalled && !attemptedSsh && (!useWifi || wifiCheck) && componentCommitOutcomeUnknown(err);
+      if (commitUnconfirmed && wifiCheck) setOtaPendingOptions(current => ({ ...current, wifiCheck }));
       if (
         !componentPackageInstalled
         && !attemptedSsh
@@ -1534,6 +1566,27 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [otaPhase, otaPendingPath]);
 
+  async function checkUnconfirmedInstall() {
+    const { wifiCheck, epoch } = otaPendingOptions;
+    if (!wifiCheck) {
+      dismissOtaModal();
+      await refreshDeviceInventory({ announce: true });
+      return;
+    }
+    try {
+      await verifyWifiInstall(wifiCheck, () => inventoryTargetKey(targetRef.current), () => {
+        // An in-flight poll may have started before commit.
+        SESSION_DEVICE_INVENTORY_REQUESTS.delete(wifiCheck.scope);
+        return refreshDeviceInventory();
+      });
+      if (epoch !== installEpoch.current) return;
+      setOtaResult({ verifiedVersion: wifiCheck.version });
+      setOtaPhase("success");
+    } catch (error) {
+      if (epoch === installEpoch.current) setOtaError(error.message);
+    }
+  }
+
   function dismissOtaModal() {
     installEpoch.current++;
     setOtaPhase("idle");
@@ -1587,10 +1640,10 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
   }
 
   return (
-    <ProgramBackgroundProvider usb={usb} active={active}>
+    <ProgramBackgroundProvider usb={usb} wifi={wifi} active={active}>
     <PageShell
       title="组件中心"
-      subtitle="发现、创作与分享属于你的桌面玩法"
+      subtitle="预览和管理设备组件，也可以从社区发现新玩法。"
       help={onboarding.show}
       actions={[
         <button
@@ -1621,7 +1674,7 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
               if (typeof path !== "string") return;
               const entry = await invoke("import_hachiapp", { path });
               await refreshComponentLibrary();
-              const unavailable = legacyAudioInstallBlockedReason(entry) || componentUsbInstallBlockedReason(entry, usb);
+              const unavailable = legacyAudioInstallBlockedReason(entry) || componentInstallBlockedReason(entry, usb, wifi, liveInventoryTarget);
               if (unavailable) push({ tone: "warning", title: `已导入「${entry.name}」，暂不可同步`, message: unavailable });
             } catch (error) {
               push({ tone: "error", title: "导入组件失败", message: String(error) });
@@ -1646,7 +1699,7 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
         open={onboarding.open}
         onClose={onboarding.dismiss}
         title="添加或创建小组件，只要三步"
-        description="组件库卡片会直接显示设备同步状态，不再需要单独管理板端列表。"
+        description="组件卡片会显示安装状态。选中组件即可预览、配置或同步到设备。"
         steps={[
           {
             title: "浏览或创建",
@@ -1685,6 +1738,7 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
         tab={centerTab}
         onTabChange={setCenterTab}
         refreshKey={communityRefreshKey}
+        capabilityTarget={capabilityTarget}
         localItems={libraryItems}
         inventory={deviceInventory}
         onOpenLocal={openComponent}
@@ -1694,7 +1748,7 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
           ? inventoryTargetKey(liveInventoryTarget) : ""}
         onImported={handleCommunityImport}
       >
-      {componentLibraryError&&<div role="alert" className="community-error">本机组件库读取失败，保留上次列表。{componentLibraryError}<button onClick={refreshComponentLibrary}>重试</button></div>}
+      {componentLibraryError&&<div role="alert" className="community-error">本机组件库暂未刷新。<button onClick={refreshComponentLibrary}>重新读取</button><details><summary>查看详情</summary>{componentLibraryError}</details></div>}
       {deviceInventory.freshness !== 'live' && <p role="status">{deviceConnected
         ? '设备清单待核对；安装状态暂不确定。'
         : wifi ? '此固件暂未提供 Wi-Fi 组件清单。'
@@ -1710,7 +1764,7 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
           <button className="btn-secondary btn-sm" onClick={()=>setTrashOpen(true)}><Trash2 size={14}/>回收站</button>
           <input aria-label="搜索我的组件" placeholder="搜索名称、作者" value={libraryQuery} onChange={e=>setLibraryQuery(e.target.value)}/>
           <select aria-label="组件状态筛选" value={libraryStatus} onChange={e=>setLibraryStatus(e.target.value)}>
-            <option value="all">所有状态</option><option value="installed">已安装</option><option value="update">可更新</option><option value="pc">需要 PC</option><option value="offline">可离线运行</option>
+            <option value="all">所有状态</option><option value="installed">已安装</option><option value="update">可更新</option><option value="pc">含 PC 功能</option><option value="offline">含离线功能</option><option value="network">含设备联网功能</option><option value="mixed">混合来源</option>
           </select>
           <div className="component-library-filters" aria-label="按组件类型筛选">
             {[
@@ -1752,6 +1806,7 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
                 isLocal={item.isLocal}
                 isInstalled={isInstalled}
                 isEnabled={isEnabled}
+                featureTarget={capabilityTarget}
                 deviceState={devicePackageState(item,deviceInventory)}
                 unavailableReason={legacyAudioInstallBlockedReason(item)}
                 onClick={() => openComponent(item)}
@@ -1785,9 +1840,11 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
       {previewComponent && isComponentVisible(previewComponent) && (
         <Suspense fallback={<ComponentPreviewLoading onClose={closeComponent} />}>
           <ComponentPreviewModal
+            capabilityTarget={capabilityTarget}
             active={active}
             component={previewComponent}
             onSourceChange={openComponent}
+            onEditionImported={refreshComponentLibrary}
             usb={usb}
             kind={resolveComponentKind(previewComponent.kind, previewComponent.gameType)}
             isLocal={previewComponent.isLocal}
@@ -1796,7 +1853,9 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
             isCurrent={previewIsCurrent}
             singleSlotReplacement={previewReplacesSingleSlot}
             deviceConnected={deviceConnected}
-            installing={otaPhase === "installing"}
+            installing={otaPhase === "installing" || repairingThumb}
+            onRepairThumbnail={canRepairThumbnail(previewComponent,deviceInventory,inventoryTargetKey(liveInventoryTarget),liveInventoryTarget,usb,wifi)
+              ? () => repairThumbnail(previewComponent) : undefined}
             bindings={resolveComponentBindings(previewComponent)}
             bindingConflict={bindingConflictForComponent(previewComponent)}
             reservedEvents={reservedEvents}
@@ -1817,7 +1876,7 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
               previewComponent.isDeviceOnly
                 ? "本机没有这个组件的安装源；可以继续保留，或从当前卡片移除。"
                 : localInstallBlockedReason(previewComponent)
-                  || componentUsbInstallBlockedReason(previewComponent, usb)
+                  || componentInstallBlockedReason(previewComponent, usb, wifi, liveInventoryTarget)
             }
             onInstall={
               previewComponent.isDeviceOnly
@@ -1865,7 +1924,8 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
                 <p>只有设备确认提交成功后才会显示安装完成。</p>
               </>
             )}
-            {otaPhase === "success" && otaResult && (
+            {otaPhase === "success" && otaResult?.verifiedVersion && <p>已从原设备的最新清单确认安装版本 {otaResult.verifiedVersion}。</p>}
+            {otaPhase === "success" && otaResult && !otaResult.verifiedVersion && (
               <p>
                 已推送 <strong>{otaResult.transferredBytes}</strong> bytes 到设备负一屏。
                 {otaResult.manifest?.name && ` 屏幕应已切到 "${otaResult.manifest.name}"。`}
@@ -1884,10 +1944,8 @@ export default function ComponentCenter({ active = true, onOpenWirelessMaintenan
                 <button
                   className="btn-primary"
                   type="button"
-                  onClick={() => {
-                    dismissOtaModal();
-                    refreshDeviceInventory({ announce: true });
-                  }}
+                  disabled={inventoryLoading}
+                  onClick={checkUnconfirmedInstall}
                 >
                   刷新设备组件清单
                 </button>
@@ -2107,6 +2165,7 @@ function CreateComponentDrawer({
     "请使用 PetUI（支持技能指令时用 $petui）制作一个桌搭子组件：<用一句话描述用途或玩法>。",
     "先给我看 640×480 UI，确认后再实现。简单组件展示首屏和主操作，复杂组件按需补关键状态。构建后试玩主操作，按需检查实际键位、动效和依赖真机的功能。",
     "控件写动作名，键位提示跟随实际绑定。用真实运行画面做最终封面，交付 .hachiapp，用 petui publish 发布到本地组件库，并说明怎么用。",
+    "发布前检查是否需要配套音效：需要时先让我用一句话说明风格和触发场景，再生成并配上音效；内置配套音效合计不超过30KB。适合联网播放的音频也可使用URL。",
     `PetUI Skill：${authoring.skillPath || "用户目录下的 .agents/skills/petui"}`,
     `使用 Pet Manager 提供的命令构建，工具入口：${authoring.command || "用户目录下的 .claw-pet/authoring/petui（Windows 使用 petui.cmd）"}`,
   ].join("\n");

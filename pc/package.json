@@ -1,7 +1,7 @@
 {
   "name": "pet-manager-client",
   "private": true,
-  "version": "0.1.245",
+  "version": "0.1.260",
   "author": "Yizheng Wang",
   "license": "SEE LICENSE IN ../LICENSE",
   "type": "module",

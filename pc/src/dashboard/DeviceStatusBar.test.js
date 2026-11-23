@@ -32,7 +32,7 @@ test("DeviceStatusBar exposes a manual USB serial rescan button", () => {
 });
 
 test("DeviceStatusBar renders USB, paired Wi-Fi, and offline states in priority order", () => {
-  assert.match(source, /usb\.connected \? "已USB连接" : wifi \? "已WIFI连接" : "未连接客户端"/);
+  assert.match(source, /usb\.connected \? "USB 已连接" : wifi \? "Wi-Fi 已连接" : "设备离线"/);
   assert.match(source, /当前 Wi-Fi 配对设备/);
   assert.match(source, /onClick=\{onOpenDeviceSettings\}/);
   assert.match(source, /dashboard-status-bar__chips/);

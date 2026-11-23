@@ -118,16 +118,29 @@ static bool started, dual_band, verified;
 static struct { unsigned radio_version; int band_mode_error; bool dual_band; } link_status;
 static unsigned detected, band_calls;
 static int band_result;
-static int esp_netif_init(void) {return ESP_OK;}
-static int esp_event_loop_create_default(void) {return ESP_OK;}
-static bool esp_netif_create_default_wifi_sta(void) {return true;}
-static int esp_hosted_init(void) {return ESP_OK;}
+static struct { int status; } view;
+enum { PET_WIFI_IDLE, PET_WIFI_INIT_RETRY, PET_WIFI_UNAVAILABLE, PET_WIFI_REBOOT_REQUIRED };
+static int fail_netif, fail_loop, fail_hosted, sta_calls, handler_calls;
+static int esp_netif_init(void) {return fail_netif ? -1 : ESP_ERR_INVALID_STATE;}
+static int esp_event_loop_create_default(void) {return fail_loop ? -1 : ESP_ERR_INVALID_STATE;}
+typedef int esp_netif_t;
+typedef int esp_netif_config_t;
+#define ESP_NETIF_DEFAULT_WIFI_STA() 7
+static int fail_sta_alloc, fail_attach, fail_default_handlers, attach_calls;
+static esp_netif_t *esp_netif_new(const esp_netif_config_t *config) {
+    assert(*config==7); ++sta_calls; return fail_sta_alloc ? NULL : &sta_calls;
+}
+static int esp_netif_attach_wifi_station(esp_netif_t *sta) {
+    assert(sta==&sta_calls); ++attach_calls; return fail_attach ? -1 : ESP_OK;
+}
+static int esp_wifi_set_default_wifi_sta_handlers(void) {return fail_default_handlers ? -1 : ESP_OK;}
+static int esp_hosted_init(void) {return fail_hosted ? -1 : ESP_OK;}
 static int esp_wifi_init(const wifi_init_config_t *p) {assert(!p->nvs_enable);return ESP_OK;}
 static int esp_wifi_set_storage(int n) {assert(n==WIFI_STORAGE_RAM);return ESP_OK;}
 static int esp_wifi_set_mode(int n) {assert(n==WIFI_MODE_STA);return ESP_OK;}
 static void wifi_event(void) {}
 static int esp_event_handler_register(int base, int id, void (*event)(void), void *arg) {
-    (void)base; (void)id; (void)event; (void)arg; return ESP_OK;
+    (void)base; (void)id; (void)event; (void)arg; ++handler_calls; return ESP_OK;
 }
 static unsigned pet_p4_hosted_radio_chip_id(void) {return detected;}
 static int esp_wifi_set_band_mode(int mode) {assert(mode==WIFI_BAND_MODE_AUTO);band_calls++;return band_result;}
@@ -143,7 +156,20 @@ int main(int argc, char **argv) {
     assert(argc==3);
     detected=(unsigned)strtoul(argv[1],NULL,0);
     band_result=atoi(argv[2]);
-    assert(start_radio() && started && verified);
+    fail_netif=1; assert(!start_radio() && view.status==PET_WIFI_INIT_RETRY);
+    fail_netif=0; fail_loop=1;
+    assert(!start_radio() && view.status==PET_WIFI_INIT_RETRY);
+    fail_loop=0; fail_sta_alloc=1;
+    assert(!start_radio() && view.status==PET_WIFI_UNAVAILABLE && !attach_calls);
+    fail_sta_alloc=0;
+    if (detected>=0xfd) {
+        fail_attach=detected==0xfd; fail_default_handlers=detected==0xfe; fail_hosted=detected==0xff;
+        assert(!start_radio() && view.status==PET_WIFI_REBOOT_REQUIRED);
+        assert(!start_radio() && sta_calls==2 && attach_calls==1 && !handler_calls);
+        return 0;
+    }
+    assert(start_radio() && started && verified && view.status==PET_WIFI_IDLE);
+    assert(start_radio() && sta_calls==2 && attach_calls==1 && handler_calls==4);
     assert(band_calls==(detected==HOSTED_CHIP_ESP32C5));
     assert(link_status.dual_band==(detected==HOSTED_CHIP_ESP32C5 && !band_result));
     assert(link_status.band_mode_error==(detected==HOSTED_CHIP_ESP32C5 ? band_result : 0));
@@ -154,5 +180,5 @@ int main(int argc, char **argv) {
     src.write_text(harness)
     binary = tmp_path / 'band'
     subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', str(src), '-o', str(binary)], check=True)
-    for chip, result in [('0x0d', '0'), ('0x17', '0'), ('0x17', '12')]:
+    for chip, result in [('0x0d', '0'), ('0x17', '0'), ('0x17', '12'), ('0xfd','0'), ('0xfe','0'), ('0xff','0')]:
         subprocess.run([str(binary), chip, result], check=True)

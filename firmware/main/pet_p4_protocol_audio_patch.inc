@@ -16,17 +16,9 @@ static bool audio_patch_bound(const pet_p4_runtime_state_t *state,const cJSON *p
   if(!state||strcmp(json_string(p,"boardDeviceId"),state->board_device_id)
       ||!pet_p4_boot_identity()[0]||strcmp(json_string(p,"bootId"),pet_p4_boot_identity())
       )return false;
-  const cJSON *v=cJSON_GetObjectItemCaseSensitive(p,"slot");
-  if(!cJSON_IsNumber(v)||v->valuedouble<0||v->valuedouble>1||floor(v->valuedouble)!=v->valuedouble)return false;
-  n=(uint32_t)v->valuedouble;*slot=(int)n;
-  const char *pack=json_string(p,"packId");if(strlen(pack)!=64)return false;
-  for(unsigned i=0;i<64;i++)if(!((pack[i]>='0'&&pack[i]<='9')||(pack[i]>='a'&&pack[i]<='f')))return false;
+  if(!pet_audio_patch_number(p,"slot",1,&n)||!pet_audio_patch_hex(json_string(p,"packId"),64))return false;
+  *slot=(int)n;
   return slot_is_valid(*slot)&&*slot==pet_p4_asset_active_slot();
-}
-static bool audio_patch_number(const cJSON *p,const char *key,uint32_t maximum,uint32_t *out){
-  const cJSON *v=cJSON_GetObjectItemCaseSensitive(p,key);
-  if(!cJSON_IsNumber(v)||!isfinite(v->valuedouble)||v->valuedouble<0||v->valuedouble>maximum||floor(v->valuedouble)!=v->valuedouble)return false;
-  *out=(uint32_t)v->valuedouble;return true;
 }
 static bool audio_patch_families_allowed(const cJSON *files,bool global){
   if(!cJSON_IsArray(files)||cJSON_GetArraySize(files)<0||cJSON_GetArraySize(files)>(int)PET_AUDIO_PATCH_MAX_FILES)return false;
@@ -61,6 +53,9 @@ static void audio_patch_retire(pet_p4_runtime_state_t *state){
   (void)pet_p4_appearance_end(g_audio_patch_protocol.sender,g_audio_patch_protocol.route,g_audio_patch_protocol.id,PET_APPEARANCE_SERIAL);
   memset(&g_audio_patch_protocol,0,sizeof(g_audio_patch_protocol));pet_audio_patch_retire();state->asset_transfer_active=false;
 }
+static bool audio_patch_owner_current(void){
+  return asset_phase_send_current(g_audio_patch_protocol.sender,g_audio_patch_protocol.route);
+}
 static void handle_audio_patch_topic(pet_p4_runtime_state_t *state,const char *topic,const cJSON *p,pet_p4_send_line_fn send,void *route){
   const char *id=json_string(p,"transferId"),*path=json_string(p,"path"),*pack=json_string(p,"packId"),*phase=topic+6;
   const bool begin=!strcmp(topic,"asset/audio-begin"),chunk=!strcmp(topic,"asset/audio-chunk"),commit=!strcmp(topic,"asset/audio-commit"),abort=!strcmp(topic,"asset/audio-abort");
@@ -73,11 +68,11 @@ static void handle_audio_patch_topic(pet_p4_runtime_state_t *state,const char *t
     &&(begin||chunk||commit||abort)&&audio_patch_bound(state,p,&slot)&&!pet_p4_appearance_mutation_blocked();
   if(begin)admitted=admitted&&!pet_p4_appearance_active()&&!g_asset_chunk_file&&!g_raw_asset_chunk.active&&g_asset_transfer_slot<0
     &&!pet_p4_diagnostics_reboot_pending()&&!pet_p4_ota_transfer_active()
-    &&audio_patch_number(p,"totalBytes",PET_AUDIO_PATCH_MAX_BYTES,&total);
+    &&pet_audio_patch_number(p,"totalBytes",PET_AUDIO_PATCH_MAX_BYTES,&total);
   else admitted=admitted&&g_audio_patch_protocol.global==global&&g_audio_patch_protocol.active&&g_audio_patch_protocol.slot==slot
     &&!strcmp(g_audio_patch_protocol.pack,pack)&&pet_p4_appearance_owned(send,route,id,PET_APPEARANCE_SERIAL)
     &&g_audio_patch_protocol.sender==send&&g_audio_patch_protocol.route==route&&!strcmp(g_audio_patch_protocol.id,id);
-  if(chunk)admitted=admitted&&audio_patch_number(p,"index",UINT32_MAX-1U,&index)&&audio_patch_number(p,"offset",PET_AUDIO_PATCH_MAX_FILE,&offset);
+  if(chunk)admitted=admitted&&pet_audio_patch_number(p,"index",UINT32_MAX-1U,&index)&&pet_audio_patch_number(p,"offset",PET_AUDIO_PATCH_MAX_FILE,&offset);
   if(!admitted){
     if(io.begin&&io.end)audio_patch_reply(&io,send,route,id,phase,path,slot,pack,board,boot,PET_APPEARANCE_COMMIT_FAILED,index,0,0);
     return;
@@ -99,7 +94,7 @@ static void handle_audio_patch_topic(pet_p4_runtime_state_t *state,const char *t
   }
   /* State lock is borrowed here; decode/FS/metadata work owns STORAGE_WORK. */
   bool attempted=false,ok=false;uint32_t generation=0,received=0,next_index=0;char actual_pack[65];
-  bool same=read_ready_slot_pack_id(slot,actual_pack,sizeof(actual_pack))&&!strcmp(actual_pack,pack);
+  bool same=read_ready_slot_pack_id(slot,actual_pack,sizeof(actual_pack))&&!strcmp(actual_pack,pack)&&audio_patch_owner_current();
   if(same&&begin)ok=audio_patch_families_allowed(cJSON_GetObjectItemCaseSensitive(p,"files"),global)
     &&pet_audio_patch_begin(global?PET_AUDIO_PATCH_GLOBAL_SLOT:slot,global?PET_AUDIO_PATCH_GLOBAL_PACK:pack,cJSON_GetObjectItemCaseSensitive(p,"files"),total,&attempted);
   else if(same&&chunk){
@@ -108,7 +103,7 @@ static void handle_audio_patch_topic(pet_p4_runtime_state_t *state,const char *t
       &&mbedtls_base64_decode(g_audio_patch_decode,sizeof(g_audio_patch_decode),&decoded,(const unsigned char*)data->valuestring,strlen(data->valuestring))==0
       &&pet_audio_patch_chunk(path,index,offset,g_audio_patch_decode,decoded,&attempted);
     if(ok)ok=pet_audio_patch_progress(path,&next_index,&received)&&next_index==index+1U;
-  }else if(same&&commit)ok=pet_audio_patch_commit(&attempted,&generation);
+  }else if(same&&commit)ok=pet_audio_patch_commit(&attempted,&generation,audio_patch_owner_current);
   else if(same&&abort)ok=pet_audio_patch_abort(&attempted);
   pet_appearance_commit_result_t result=pet_p4_appearance_phase_end(&operation,state,slot,ok,attempted);
   if(result==PET_APPEARANCE_COMMIT_OK)g_audio_patch_protocol.last_ms=(uint64_t)esp_timer_get_time()/1000ULL;

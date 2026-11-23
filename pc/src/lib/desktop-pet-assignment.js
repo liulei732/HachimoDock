@@ -113,7 +113,7 @@ export const APPEARANCE_SYNC_STAGE_TEXT = {
   comparing_assets: "正在对比设备已有素材…",
   preparing_slot: "正在准备设备形象存储槽…",
   preparing_storage: "设备正在擦除旧素材、准备存储空间…",
-  transferring: "开始通过 USB 传输素材…",
+  transferring: "正在等待设备确认素材分块…",
 };
 
 export function formatBytes(bytes) {
@@ -222,9 +222,9 @@ export async function applyDesktopPetAssignment({
         const totalFiles = Number(progress.totalFiles || 0);
         const bytesSent = Number(progress.bytesSent || 0);
         const bytesTotal = Number(progress.bytesTotal || 0);
-        const percent = bytesTotal > 0
-          ? Math.round((bytesSent / bytesTotal) * 100)
-          : 0;
+        if (!Number.isSafeInteger(bytesSent) || !Number.isSafeInteger(bytesTotal)
+            || bytesSent <= 0 || bytesSent > bytesTotal) return;
+        const percent = Math.round((bytesSent / bytesTotal) * 100);
         onProgress?.({
           type: "info",
           text: `USB 传输中… ${currentFile}/${totalFiles} 个素材 (${formatBytes(bytesSent)}/${formatBytes(bytesTotal)}) ${percent}%`,
@@ -340,7 +340,7 @@ export async function applyDesktopPetAssignment({
   return { nextMap, notice };
 }
 
-function readActiveAppearanceId() {
+export function readActiveAppearanceId() {
   try {
     return localStorage.getItem(ACTIVE_APPEARANCE_KEY) || "";
   } catch {

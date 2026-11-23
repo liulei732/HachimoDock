@@ -1,35 +1,42 @@
 /** [Input] API configuration and video overrides. [Output] Refreshable catalog, latest Fast default for empty selection, and editable generation parameters.
  * [Sync] Keep pc/src/.folder.md and catalog regression tests aligned. */
+import { formatModelIssue } from "./lib/model-issue.js";
+import { useModelCatalog } from "./lib/use-model-catalog.js";
 import React, { useEffect, useState } from "react";
 import { RefreshCw } from "lucide-react";
 import { listVideoModels, selectDefaultVideoModel } from "./lib/avatar-pipeline/video-models.js";
 import { resolveGenerationSpeedConfig } from "./lib/avatar-pipeline/pipeline-defaults.js";
 import { VIDEO_MODEL_ACCESS_CHANGED, clearVolcanoModelRejections } from "./lib/avatar-pipeline/providers/volcano.js";
 
-export function VideoModelSelect({ apiKey, baseUrl, model, onModel, onReady, autoSelectDefault = true }) {
-  const [revision, setRevision] = useState(0);
+export function VideoModelSelect({ apiKey, baseUrl, model, onModel, onReady, autoSelectDefault = true, autoLoad = true }) {
+  const { requested, revision, refresh } = useModelCatalog(autoLoad, "video", baseUrl, apiKey);
   const [manual, setManual] = useState(false);
   const [state, setState] = useState({ models: [], loading: true, error: "" });
   useEffect(() => {
-    const refresh = () => setRevision((value) => value + 1);
-    window.addEventListener(VIDEO_MODEL_ACCESS_CHANGED, refresh);
-    window.addEventListener("focus", refresh);
+    if (!autoLoad) return;
+    const onRefresh = () => refresh();
+    window.addEventListener(VIDEO_MODEL_ACCESS_CHANGED, onRefresh);
+    window.addEventListener("focus", onRefresh);
     return () => {
-      window.removeEventListener(VIDEO_MODEL_ACCESS_CHANGED, refresh);
-      window.removeEventListener("focus", refresh);
+      window.removeEventListener(VIDEO_MODEL_ACCESS_CHANGED, onRefresh);
+      window.removeEventListener("focus", onRefresh);
     };
-  }, []);
+  }, [autoLoad, refresh]);
   useEffect(() => {
     const controller = new AbortController();
+    if (!requested || !apiKey?.trim()) {
+      setState({ models: [], loading: false, error: "" });
+      return;
+    }
     setState({ models: [], loading: true, error: "" });
     listVideoModels({ apiKey, baseUrl, signal: controller.signal }).then((models) => {
       if (controller.signal.aborted) return;
       setState({ models, apiKey, baseUrl, loading: false, error: models.length ? "" : "当前 Key 未返回可用的视频模型。" });
     }).catch((error) => {
-      if (!controller.signal.aborted) setState({ models: [], loading: false, error: error.message });
+      if (!controller.signal.aborted) setState({ models: [], loading: false, error: formatModelIssue("catalog", "火山方舟", error) });
     });
     return () => controller.abort();
-  }, [apiKey, baseUrl, revision]);
+  }, [apiKey, baseUrl, revision, requested]);
   useEffect(() => {
     if (!autoSelectDefault || state.loading || state.error || state.apiKey !== apiKey || state.baseUrl !== baseUrl) return;
     const next = selectDefaultVideoModel(state.models, model, manual);
@@ -52,7 +59,7 @@ export function VideoModelSelect({ apiKey, baseUrl, model, onModel, onReady, aut
       <button type="button" className="btn-ghost" title="刷新可用模型" aria-label="刷新可用模型"
         disabled={state.loading} onClick={() => {
           clearVolcanoModelRejections(apiKey);
-          setRevision((value) => value + 1);
+          refresh();
         }}><RefreshCw size={18} /></button>
     </div>
     <label className="field-helper"><input type="checkbox" checked={manual}
@@ -62,7 +69,7 @@ export function VideoModelSelect({ apiKey, baseUrl, model, onModel, onReady, aut
     <div className="field-helper">{autoSelectDefault ? "首次默认选择列表中最新的 Fast 模型，也可自行更换。"
       : "默认自动选择，无需另行保存；主动指定模型后才需要保存。"}实际调用权限以平台响应为准；列表不可用时可手动填写。</div>
     {state.error && <div role="alert" className="field-helper">{state.error}</div>}
-    {!manual && !state.loading && !state.error && model && !valid && <div role="alert" className="field-helper">列表中没有之前选择的模型，请重新选择或手动确认模型 ID。</div>}
+    {!manual && requested && !state.loading && !state.error && model && !valid && <div role="alert" className="field-helper">列表中没有之前选择的模型，请重新选择或手动确认模型 ID。</div>}
   </>;
 }
 

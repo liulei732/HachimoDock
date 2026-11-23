@@ -30,20 +30,21 @@ try{
    const name=prefix+e.name;
    if(e.isSymbolicLink())throw Error('No symlinks');
    if(e.isDirectory()){walk(path.join(root,e.name),name+'/');continue;}
-   if(!/^(?:component\.json|buttons\.json|negative-screen\.json|share\.json|runtime\/widget\.json|pc\/application\.json|LICENSE\.txt|THIRD_PARTY_NOTICES\.txt|assets\/[\w-]+\.png|licenses\/[\w.-]+\.(?:txt|md))$/.test(name))throw Error('Unexpected file: '+name);
+   if(!/^(?:hachiapp\.json|pc\/cover\.png|component\.json|buttons\.json|negative-screen\.json|share\.json|runtime\/widget\.json|pc\/application\.json|LICENSE\.txt|THIRD_PARTY_NOTICES\.txt|assets\/[\w-]+\.png|licenses\/[\w.-]+\.(?:txt|md))$/.test(name))throw Error('Unexpected file: '+name);
    files.push(name);
   }}walk(dir);
   const screen=page.locator(`[data-id="${id}"] .screen`);
   await screen.scrollIntoViewIfNeeded();await page.waitForTimeout(100);
-  const cover=await screen.screenshot({path:path.join(out,id+'.png')});
+  await screen.screenshot({path:path.join(out,id+'.png')});
+  const cover=fs.readFileSync(path.join(dir,'pc/cover.png'));
   if(errors.length)throw Error(errors.join('; '));
   const zip=path.join(out,id+'.clawpkg');
   // zipfile's CLI strips parent directories from individual paths. Supply
   // validated top-level entries so runtime/assets/licenses keep their paths.
   execFileSync('python3',['-m','zipfile','-c',zip,...fs.readdirSync(dir).sort()],{cwd:dir});
   const data=fs.readFileSync(zip),pending=id==='hachimi-notes';
-  batch.push({approve:!pending,publication:{requestId:'hachimi-'+createHash('sha256').update(data).update(cover).digest('hex').slice(0,48),rightsConfirmed:true,privacyConfirmed:true,package:data.toString('base64'),covers:[cover.toString('base64')],metadata:{author:'哈基米桌搭',summary:manifest.description.slice(0,160),description:manifest.description+'\n640×480 统一 PetUI 资源包；截图是资源包的默认运行预览。需要支持应用界面、触屏交互和存档的新固件；宿主服务需要新版 Pet Manager 保持连接。'+(pending?'\n录音转写实测延后，本条保留待审核，不作完整验收通过发布。':''),category:'hachimi',license:'MIT；字体 OFL（见包内声明）',sourceUrl:'https://github.com/YizhengWw/HachimoDock',releaseNotes:'应用级界面、图标按钮与触屏操作；完善本地状态、存档及受控宿主服务。'}}});
-  reports.push({id,version:manifest.version,bytes:data.length,coverResolution:[640,480],status:pending?'pending':'approval-requested'});
+  batch.push({approve:!pending,publication:{requestId:'hachimi-'+createHash('sha256').update(data).update(cover).digest('hex').slice(0,48),rightsConfirmed:true,privacyConfirmed:true,package:data.toString('base64'),covers:[],metadata:{author:'哈基米桌搭',summary:manifest.description.slice(0,160),description:manifest.description+'\n640×480 统一 PetUI 资源包；截图是资源包的默认运行预览。需要支持应用界面、触屏交互和存档的新固件；宿主服务需要新版 Pet Manager 保持连接。'+(pending?'\n录音转写实测延后，本条保留待审核，不作完整验收通过发布。':''),category:'hachimi',license:'MIT；字体 OFL（见包内声明）',sourceUrl:'https://github.com/YizhengWw/HachimoDock',releaseNotes:'应用级界面、图标按钮与触屏操作；完善本地状态、存档及受控宿主服务。'}}});
+  reports.push({id,version:manifest.version,bytes:data.length,coverResolution:[cover.readUInt32BE(16),cover.readUInt32BE(20)],status:pending?'pending':'approval-requested'});
  }
  fs.writeFileSync(path.join(out,'batch.json'),JSON.stringify(batch),{mode:0o600});
  fs.writeFileSync(path.join(out,'manifest.json'),JSON.stringify(reports,null,2)+'\n',{mode:0o600});

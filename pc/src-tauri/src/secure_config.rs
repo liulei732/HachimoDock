@@ -12,6 +12,7 @@ use std::{fs, io::Write, path::Path, sync::Mutex};
 static KEY: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 static PROVIDERS: Mutex<()> = Mutex::new(());
 static FILES: Mutex<()> = Mutex::new(());
+const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const FORMAT: &str = "pet-manager-aes256gcm-v1";
 #[cfg(any(target_os = "macos", test))]
 #[path = "secure_config_local.rs"]
@@ -142,6 +143,7 @@ pub fn write(path: &Path, purpose: &str, raw: &[u8]) -> Result<(), String> {
 fn write_unlocked(path: &Path, purpose: &str, raw: &[u8]) -> Result<(), String> {
     let parent = path.parent().ok_or("配置目录无效")?;
     let encrypted = seal(raw, purpose, &config_key(path, true)?)?;
+    if encrypted.len() > MAX_CONFIG_BYTES { return Err("加密配置超过大小上限；原配置保留".into()); }
     fs::create_dir_all(parent).map_err(|_| "无法创建配置目录")?;
     let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|_| "无法创建配置临时文件")?;
     temp.write_all(&encrypted)
@@ -153,7 +155,7 @@ fn write_unlocked(path: &Path, purpose: &str, raw: &[u8]) -> Result<(), String> 
 pub fn read(path: &Path, purpose: &str) -> Result<Option<String>, String> {
     let _guard = FILES.lock().map_err(|_| "配置文件繁忙")?;
     match fs::symlink_metadata(path) {
-        Ok(meta) if !meta.is_file() || meta.len() > 1024 * 1024 => {
+        Ok(meta) if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES as u64 => {
             return Err("配置路径或大小不受支持；原文件未修改".into())
         }
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err("无法检查配置文件".into()),
@@ -191,7 +193,7 @@ pub fn load_providers(dir: &Path) -> Result<serde_json::Value, String> {
     .map(|raw| serde_json::from_str(&raw).map_err(|_| "生成配置无效".into()))
     .unwrap_or_else(|| Ok(serde_json::json!({})))
 }
-pub fn save_provider(dir: &Path, id: &str, config: serde_json::Value) -> Result<(), String> {
+pub fn save_provider(dir: &Path, id: &str, mut config: serde_json::Value) -> Result<(), String> {
     if !matches!(id, "volcengine" | "kling" | "custom") || !config.is_object() {
         return Err("服务配置无效".into());
     }
@@ -205,6 +207,21 @@ pub fn save_provider(dir: &Path, id: &str, config: serde_json::Value) -> Result<
     if !all.is_object() {
         return Err("生成配置无效；原文件未修改".into());
     }
+    let sent = config["apiKey"].as_str().unwrap_or("").trim();
+    if sent.is_empty() || crate::voice_chat_settings::credential_placeholder(sent) {
+        let previous = &all[id];
+        let endpoint = |value: &serde_json::Value| value["baseUrl"].as_str()
+            .unwrap_or("").trim().trim_end_matches('/').to_owned();
+        if let Some(key) = previous["apiKey"].as_str().filter(|key| !key.trim().is_empty()
+            && !crate::voice_chat_settings::credential_placeholder(key)) {
+            if id == "custom" && endpoint(previous) != endpoint(&config) {
+                return Err("请填写新接口地址的 API Key".into());
+            }
+            config["apiKey"] = key.into();
+        } else if !sent.is_empty() {
+            return Err("请填写此服务的 API Key".into());
+        }
+    }
     all[id] = config;
     let raw = serde_json::to_vec(&all).map_err(|_| "生成配置编码失败")?;
     if raw.len() > 256 * 1024 {
@@ -216,6 +233,22 @@ pub fn save_provider(dir: &Path, id: &str, config: serde_json::Value) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generation_mask_preserves_only_the_same_provider_and_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        for id in ["volcengine","kling","custom"] {
+            let write = |key: &str, url: &str| save_provider(dir.path(), id,
+                serde_json::json!({"apiKey":key, "baseUrl":url, "model":"fixture-model"}));
+            assert!(write("••••","https://one.invalid").is_err());
+            let key = format!("fixture-{id}-secret");
+            write(&key,"https://one.invalid").unwrap();
+            write("fix…cret","https://one.invalid/").unwrap();
+            write("","https://one.invalid").unwrap();
+            if id == "custom" { assert!(write("••••","https://two.invalid").is_err()); }
+            assert_eq!(load_providers(dir.path()).unwrap()[id]["apiKey"], key);
+        }
+    }
+
     #[test]
     fn fresh_install_saves_all_api_configs_and_reads_them_after_restart() {
         let dir = tempfile::Builder::new()

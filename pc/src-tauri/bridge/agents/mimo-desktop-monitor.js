@@ -4,7 +4,8 @@ const { statSync } = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const POLL_MS = 250;
+const ACTIVE_POLL_MS = 250;
+const IDLE_POLL_MS = 1000;
 // A short turn still needs to survive the device forwarder's 800 ms poll.
 const PHASE_MS = 1000;
 const HEARTBEAT_MS = 20000;
@@ -21,7 +22,7 @@ function databasePath(env = process.env) {
 // The Desktop inbox records the current answer and its outcome. Select only
 // lifecycle metadata; assistant text is checked for presence inside SQLite.
 const READ_TURNS = `
-  SELECT i.id, i.receiver_session_id AS sessionId, i.state, i.outcome,
+  SELECT i.id, i.receiver_session_id AS sessionId, i.state, i.outcome, i.time_updated AS updatedAt,
     EXISTS (
       SELECT 1 FROM message AS m
       JOIN part AS p ON p.message_id = m.id
@@ -44,6 +45,12 @@ function startMimoDesktopMonitor({ onState, filename = databasePath(), onUnavail
   let db;
   let identity;
   let readTurns;
+  let readVersion;
+  let lastVersion;
+  let rows = [];
+  let expiresAt = 0;
+  let timer;
+  let stopped = false;
   let warned = false;
   let startedAt = Date.now();
   const reported = new Map();
@@ -52,6 +59,9 @@ function startMimoDesktopMonitor({ onState, filename = databasePath(), onUnavail
     db?.close();
     db = null;
     readTurns = null;
+    readVersion = null;
+    lastVersion = undefined;
+    rows = [];
   }
 
   function poll() {
@@ -79,8 +89,16 @@ function startMimoDesktopMonitor({ onState, filename = databasePath(), onUnavail
       readTurns ??= db.prepare(READ_TURNS);
 
       const now = Date.now();
+      readVersion ??= db.prepare("PRAGMA data_version");
+      const version = readVersion.get().data_version;
+      if (version !== lastVersion || now >= expiresAt) {
+        rows = readTurns.all(now - RECENT_MS, startedAt);
+        lastVersion = version;
+        expiresAt = rows.reduce((earliest, row) =>
+          Math.min(earliest, Number(row.updatedAt) + RECENT_MS + 1), Infinity);
+      }
       const seenSessions = new Set();
-      for (const turn of readTurns.all(now - RECENT_MS, startedAt)) {
+      for (const turn of rows) {
         if (seenSessions.has(turn.sessionId)) continue;
         seenSessions.add(turn.sessionId);
         const previous = reported.get(turn.sessionId);
@@ -122,10 +140,15 @@ function startMimoDesktopMonitor({ onState, filename = databasePath(), onUnavail
     }
   }
 
-  poll();
-  const timer = setInterval(poll, POLL_MS);
-  timer.unref();
-  return { stop() { clearInterval(timer); close(); } };
+  function tick() {
+    poll();
+    if (stopped) return;
+    const active = Array.from(reported.values()).some(turn => !turn.terminal);
+    timer = setTimeout(tick, active ? ACTIVE_POLL_MS : IDLE_POLL_MS);
+    timer.unref();
+  }
+  tick();
+  return { stop() { stopped = true; clearTimeout(timer); close(); } };
 }
 
 module.exports = { databasePath, startMimoDesktopMonitor };

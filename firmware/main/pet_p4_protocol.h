@@ -17,6 +17,7 @@
 #include "pet_p4_query_reply.h"
 #include "pet_p4_appearance_session.h"
 #include "pet_p4_resources.h"
+#include "pet_p4_voice_feedback.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -62,6 +63,8 @@ typedef struct {
 } pet_p4_conversation_cue_t;
 
 struct cJSON;
+void pet_p4_add_bundle_capabilities(struct cJSON *capabilities);
+void pet_p4_add_component_capabilities(struct cJSON *capabilities);
 typedef void (*pet_p4_send_line_fn)(const char *line, void *ctx);
 /* Boot-configured paired callbacks. begin admits only the current locked
  * protocol command; on success the slot-query owns an unlocked read/TX window
@@ -99,6 +102,7 @@ typedef struct {
   pet_p4_session_queue_item_t session_queue_staging[PET_P4_SESSION_QUEUE_MAX];
   unsigned int session_queue_count;
   bool session_voice_active;
+  pet_voice_feedback_t voice_feedback;
 #if PET_P4_SYSTEM_WIFI
   uint8_t session_voice_lan_button;
 #endif
@@ -318,6 +322,13 @@ bool pet_p4_handle_storage_query(pet_p4_runtime_state_t *state,
 void pet_p4_protocol_set_deferred_reply(pet_p4_query_reply_t *reply);
 #endif
 
+bool pet_p4_lan_trust_wired(pet_p4_send_line_fn send, void *route);
+struct cJSON *pet_p4_background_program_reply(pet_p4_runtime_state_t *state,const char *topic,const struct cJSON *request,
+    bool (*start_program)(const char *,const uint32_t *,uint64_t *,char *,size_t));
+struct cJSON *pet_p4_test_message(pet_p4_runtime_state_t *state, const struct cJSON *request,
+    uint64_t route, bool admitted);
+void pet_p4_test_message_check_view(const pet_p4_runtime_state_t *state);
+bool pet_p4_test_message_visible(const pet_p4_runtime_state_t *state, unsigned long long now);
 struct cJSON *pet_p4_widget_inventory(const pet_p4_runtime_state_t *state, const char *request_id);
 
 #ifdef __cplusplus
