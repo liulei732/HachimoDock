@@ -14,9 +14,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from validate_generated_widget import load_capabilities, validate_widget
+from validate_generated_widget import CLAWPKG_MAX_ENTRIES, load_capabilities, validate_package_files, validate_widget
 from smoke_test_widget_game import smoke_test_game
-from pack_hachiapp import COVER, COVER_MAX, FORMAT, json_bytes, validate_cover
+from pack_hachiapp import COVER, COVER_MAX, FORMAT, json_bytes, package_entries, publication_cover
 
 
 def utc_now() -> str:
@@ -40,7 +40,7 @@ def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
 
 def package_files(root: Path) -> list[Path]:
     return sorted(
-        (path for path in root.rglob("*") if path.is_file()),
+        (path for path in package_entries(root, CLAWPKG_MAX_ENTRIES) if path.is_file()),
         key=lambda path: path.relative_to(root).as_posix(),
     )
 
@@ -83,10 +83,10 @@ def ensure_hachiapp_manifest(package: Path, component_id: str) -> None:
         if not isinstance(value, dict) or any(value.get(k) != v for k, v in expected.items()):
             raise ValueError(".hachiapp 清单与组件 ID 或格式不符")
     if not cover.exists():
-        return
+        raise ValueError("交付包缺少封面 pc/cover.png，请添加实际组件画面")
     if not cover.is_file() or cover.stat().st_size > COVER_MAX:
         raise ValueError("封面必须是 PNG 且不超过 256 KiB")
-    validate_cover(cover.read_bytes())
+    publication_cover(cover.read_bytes())
     if not marker.exists():
         with marker.open("xb") as handle:
             handle.write(json_bytes(expected))
@@ -136,7 +136,17 @@ def publish_widget(
             raise ValueError("拒绝从正式 library 内重新发布；请使用独立工作目录")
         if source == job_root or is_relative_to(job_root, source):
             raise ValueError("组件工作目录不能包含发布 staging 根目录")
-        shutil.copytree(source, staged_package, symlinks=True)
+        inventory_errors: list[str] = []
+        entries = validate_package_files(source, inventory_errors)
+        if inventory_errors or entries is None:
+            raise ValueError("组件校验失败: " + "；".join(inventory_errors))
+        staged_package.mkdir(parents=True)
+        for path in entries:
+            target = staged_package / path.relative_to(source)
+            if path.is_dir():
+                target.mkdir(exist_ok=True)
+            else:
+                shutil.copy2(path, target, follow_symlinks=False)
         job.update(status="validating", updatedAt=utc_now(), stagingPath=str(staged_package))
         atomic_write_json(log_path, job)
         errors = validate_widget(staged_package, capabilities)

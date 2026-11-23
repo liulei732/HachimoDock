@@ -20,9 +20,10 @@ def test_production_snapshot_captures_media_generation_before_unlock(tmp_path):
 typedef struct{bool enabled;}data_t;
 typedef struct{bool active,app_surface,instrument,slicing,media;unsigned surface_page,revision;char data_source[48];int data_page;data_t data;}view_t;
 typedef struct{bool app;unsigned count;}surface_t;
-typedef struct{view_t view;surface_t surface;int scene,art;bool surface_active,side_active,images_changed,confirmation_active;char media_source[48],confirmation_prompt[121];uint32_t image_revision,media_generation,wasm_revision;}pet_p4_miniapp_render_snapshot_t;
+typedef struct{view_t view;surface_t surface;int scene,art;bool surface_active,side_active,images_changed,confirmation_active;char media_source[48],confirmation_prompt[121];int8_t mic_mode;uint32_t hardware_owner,image_revision,media_generation,wasm_revision;}pet_p4_miniapp_render_snapshot_t;
 typedef struct{int unused;}pet_p4_miniapp_sprite_pack_t;
-static struct{view_t view;bool active,app_host,side_enabled,media;surface_t surface;struct{unsigned wasm_size;}sprites;int side,side_art;char media_source[48],widget_id[48];struct{uint32_t media_generation;}cext;}g_runtime;
+static uint32_t g_hw_owner=12;
+static struct{view_t view;int8_t mic_mode;bool active,app_host,side_enabled,media;surface_t surface;struct{unsigned wasm_size;}sprites;int side,side_art;char media_source[48],widget_id[48];struct{uint32_t media_generation;}cext;}g_runtime;
 static int g_render_host,depth;static uint32_t g_image_revision=17;
 static void miniapp_runtime_lock(void){assert(!depth);depth=1;}
 static void miniapp_runtime_unlock(void){assert(depth);depth=0;g_runtime.cext.media_generation=99;g_runtime.view.revision=99;g_image_revision=99;g_runtime.sprites.wasm_size=0;}
@@ -35,8 +36,8 @@ static bool surface_images_locked(pet_p4_miniapp_sprite_pack_t*s,uint32_t*r){(vo
 static void pet_p4_widget_data_view(const char*src,int page,uint64_t now,data_t*out){(void)src;(void)page;(void)now;(void)out;assert(!depth);}
 '''+function(text,'pet_p4_miniapp_render_snapshot')+r'''
 int main(void){pet_p4_miniapp_render_snapshot_t out={0};pet_p4_miniapp_sprite_pack_t images={0};uint32_t rev=0;
- g_runtime.active=true;g_runtime.view.active=true;g_runtime.view.revision=17;g_runtime.cext.media_generation=17;g_runtime.surface.app=true;g_runtime.sprites.wasm_size=128;
- assert(pet_p4_miniapp_render_snapshot(&out,&images,&rev));assert(out.media_generation==17&&out.view.revision==17&&out.wasm_revision==18&&out.surface_active);
+ g_runtime.active=true;g_runtime.mic_mode=20;g_runtime.view.active=true;g_runtime.view.revision=17;g_runtime.cext.media_generation=17;g_runtime.surface.app=true;g_runtime.sprites.wasm_size=128;
+ assert(pet_p4_miniapp_render_snapshot(&out,&images,&rev));assert(out.hardware_owner==12&&out.mic_mode==20);assert(out.media_generation==17&&out.view.revision==17&&out.wasm_revision==18&&out.surface_active);
  assert(g_runtime.cext.media_generation==99&&g_runtime.view.revision==99&&!depth);
  assert(!pet_p4_miniapp_render_snapshot(NULL,&images,&rev));return 0;}
 '''
@@ -101,13 +102,18 @@ def test_real_install_delete_abort_before_catalog_and_stop_on_publish_failure(tm
     original=Path.write_text
     def write(path,source,*args,**kwargs):
         if path.name=='mutation.c':
-            source='#define PET_P4_EVENTS 1\n'+source
+            source='#define PET_P4_EVENTS 1\n#define PET_P4_SEQUENCE 1\n'+source
             source=source.replace('int counter,button_count;','int cext;int counter,button_count;')
             source=source.replace('assert(held&&!critical);critical=1;','assert(!critical);critical=1;')
             marker='static void widget_install_stage_reset('
             at=source.index(marker)
             adapters=r'''
 typedef struct{miniapp_runtime_t *next;bool prepared;}pet_cext_publish_ticket_t;
+static bool local_alarm_retire(unsigned slot,const char *id,const miniapp_catalog_item_t *replacement){
+ assert(!held && !critical && g_storage_lane.occupied && id && id[0]);
+ if(replacement) assert(replacement->slot==slot && !strcmp(replacement->widget_id,id));
+ return true; /* This media fixture has no scheduled alarms. */
+}
 static void pet_cmedia_stage_reset(void) {}
 static bool media_fail_prepare,media_fail_commit;static unsigned media_prepares,media_commits,media_aborts,media_removed;static pet_cext_publish_ticket_t *pending;
 static bool pet_cmedia_stage_matches(const int*r,char*error,size_t n){(void)r;(void)error;(void)n;return true;}
@@ -179,6 +185,7 @@ static bool restore_component_runtime(miniapp_runtime_t*n){(void)n;return true;}
 static bool miniapp_ext_prepare(miniapp_runtime_t*n,size_t s,uint8_t g,pet_cext_publish_ticket_t*t){(void)s;(void)g;if(fail_prepare)return false;t->next=n;t->ready=true;return true;}
 static bool miniapp_ext_commit(pet_cext_publish_ticket_t*t){assert(t->ready&&g_runtime.version==1);if(fail_commit)return false;t->ready=false;published++;return true;}
 static bool miniapp_ext_abort(pet_cext_publish_ticket_t*t){assert(t->ready);t->ready=false;aborted++;return true;}
+static void hardware_leave_locked(void){assert(g_runtime.version==1);}
 static void miniapp_runtime_lock(void){}
 static void miniapp_runtime_unlock(void){}
 '''+function(text,'activate_catalog_index_in_memory')+r'''
@@ -276,7 +283,10 @@ static unsigned elapsed_us_clamped(int64_t a,int64_t b){return b-a;}
 #define render_miniapp_page(...) ((void)0)
 static bool render_asset_pet_frame(const pet_p4_runtime_state_t*s,const pet_p4_view_model_t*v,uint64_t n,int*frame,bool*tail){(void)s;(void)v;(void)n;(void)tail;assert(worker_idle);*frame=decoder_starts++;return true;}
 static void pet_p4_behavior_presented_video_frame(int*behavior,int frame,uint64_t ms){(void)ms;assert(behavior==&g_behavior&&frame>=0&&!lcd_fail);frames_presented++;}
-#define draw_standalone_voice_overlay(...) ((void)0)
+static bool g_voice_bar_drawn, g_voice_draft_drawn;
+static unsigned voice_draws, voice_clears;
+#define draw_standalone_voice_overlay(...) (g_voice_bar_drawn=true, voice_draws++, (void)0)
+#define clear_standalone_voice_overlay(...) (voice_clears++, (void)0)
 #define pet_compact_underlay_forget(...) ((void)0)
 #define main_compact_underlay_prepare(...) ((void)0)
 #define draw_bubble(...) ((void)0)
@@ -304,7 +314,13 @@ int main(void){pet_p4_runtime_state_t s={0};pet_p4_view_model_t v={.page="main"}
  worker_idle=true;assert(pet_p4_renderer_render(&s,&v,12)==0&&retire_polls==7&&decoder_starts==1&&!g_asset_cache_pending&&frames_presented==1);
  lcd_fail=true;assert(pet_p4_renderer_render(&s,&v,13)==9&&retire_polls==8&&decoder_starts==2&&frames_presented==1);
  lcd_fail=false;v.page="components";worker_idle=false;
- assert(pet_p4_renderer_render(&s,&v,14)==0&&retire_polls==9&&decoder_starts==2&&frames_presented==1);return 0;}
+ assert(pet_p4_renderer_render(&s,&v,14)==0&&retire_polls==9&&decoder_starts==2&&frames_presented==1);
+ v.page="main";worker_idle=true;v.show_voice_overlay=true;
+ assert(pet_p4_renderer_render(&s,&v,15)==0&&voice_draws==1&&!voice_clears);
+ worker_idle=false;v.show_voice_overlay=false;
+ assert(pet_p4_renderer_render(&s,&v,16)==0&&voice_draws==1&&voice_clears==1);
+ assert(pet_p4_renderer_render(&s,&v,17)==0&&voice_clears==1);
+ return 0;}
 '''
     run(tmp_path,code,'render-entry')
 

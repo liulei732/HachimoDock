@@ -53,18 +53,32 @@ struct Counters {
     wifi_count: u32,
 }
 
+pub(super) fn device_headlines(runtime: &Value) -> bool {
+    runtime["vars"].get("petui.wifi_data").is_some()
+        && crate::component_news::validate_device_headlines(runtime).is_ok()
+}
+
+pub(super) fn has_pc_list_provider(source: &str) -> bool {
+    matches!(
+        source,
+        "computer.status" | "todos.upcoming" | "location.current" | "github.me"
+    )
+}
+
+pub(super) fn feed_protocol(runtime: &Value) -> &'static str {
+    match runtime["data"]["connection"]["type"].as_str() {
+        Some("mqtt" | "mqtt-public" | "mqtt-publish") => "mqtt-tls",
+        _ => "https",
+    }
+}
+
 fn declared_source(runtime: &Value) -> Result<&str, &'static str> {
     if runtime["engine"] != "p4-bounded-runtime-v4" {
         return Err("data-link 需要 p4-bounded-runtime-v4 声明");
     }
     let source = match runtime.get("data") {
         Some(data) => data["source"].as_str(),
-        None if runtime["host"] == true
-            && runtime["vars"]["petui.wifi_data"]["type"] == "string"
-            && runtime["vars"]["petui.wifi_data"]["init"] == "news.hn" =>
-        {
-            Some("news.hn")
-        }
+        None if device_headlines(runtime) => Some("news.hn"),
         None => None,
     };
     source
@@ -81,21 +95,37 @@ fn declared_source(runtime: &Value) -> Result<&str, &'static str> {
 fn inspect(runtime: &Value, report: &Value, scope: Scope<'_>) -> Result<Value, &'static str> {
     let source = declared_source(runtime)?;
     let declared_route = match source {
-        "wifi.feed" | "news.hn" => "device-https",
+        "wifi.feed" if matches!(runtime["data"]["connection"]["type"].as_str(), Some("https-submit" | "mqtt-publish")) => "device-scoped-write",
+        "wifi.feed" if feed_protocol(runtime) == "mqtt-tls" => "device-mqtt-tls",
+        "wifi.feed" => "device-https",
+        "news.hn" if device_headlines(runtime) => "device-https",
         "stocks.watchlist" => "pc-snapshot-or-device-https",
-        _ => "pc-snapshot",
+        s if has_pc_list_provider(s) || s.starts_with("fetch.") => "pc-snapshot",
+        "codex.usage" => "provider-unavailable",
+        _ => "check-provider",
     };
     let mut answer = json!({
         "source": source, "declaredRoute": declared_route, "status": "unknown",
         "received": null, "fresh": null, "usbCount": null, "wifiCount": null,
     });
-    if declared_route != "pc-snapshot" {
+    if declared_route == "device-mqtt-tls" {
+        answer["deviceMqtt"] = "unknown".into();
+    } else if matches!(
+        declared_route,
+        "device-https" | "pc-snapshot-or-device-https"
+    ) {
         answer["deviceHttps"] = "unknown".into();
     }
     let unknown = if !scope.matches(report) {
         "scope_mismatch"
     } else if !report.is_object() || report.get("ok").is_some_and(|ok| ok != true) {
         "invalid_report"
+    } else if matches!(declared_route, "provider-unavailable" | "check-provider") {
+        "provider_unconfirmed"
+    } else if declared_route == "device-scoped-write" {
+        "check-native-submission-result"
+    } else if declared_route == "device-mqtt-tls" {
+        "device_mqtt_not_counted"
     } else if declared_route == "device-https" {
         "device_https_not_counted"
     } else if let Some(entry) = report["widgetData"].get(source) {
@@ -238,8 +268,27 @@ mod tests {
         assert_eq!(feed["declaredRoute"], "device-https");
         assert_eq!(feed["reason"], "device_https_not_counted");
         assert!(feed["wifiCount"].is_null());
-        let news = json!({"engine":"p4-bounded-runtime-v4","host":true,
-            "vars":{"petui.wifi_data":{"type":"string","init":"news.hn"}}});
+        for kind in ["mqtt", "mqtt-public"] {
+            let mut mqtt = runtime("wifi.feed");
+            mqtt["data"]["connection"] = json!({"type":kind});
+            let result = inspect(&mqtt, &captured, Scope::default()).unwrap();
+            assert_eq!(result["declaredRoute"], "device-mqtt-tls");
+            assert_eq!(result["deviceMqtt"], "unknown");
+            assert!(result["wifiCount"].is_null() && result.get("deviceHttps").is_none());
+        }
+        for (name, route) in [
+            ("news.hn", "check-provider"),
+            ("codex.usage", "provider-unavailable"),
+        ] {
+            captured["widgetData"][name] = captured["widgetData"]["computer.status"].clone();
+            let result = inspect(&runtime(name), &captured, Scope::default()).unwrap();
+            assert_eq!(result["declaredRoute"], route);
+            assert!(result["received"].is_null());
+        }
+        let news: Value = serde_json::from_str(include_str!(
+            "../../optional-clawpkgs/daily-news/runtime/widget.json"
+        ))
+        .unwrap();
         assert_eq!(
             inspect(&news, &captured, Scope::default()).unwrap()["source"],
             "news.hn"

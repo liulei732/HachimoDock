@@ -11,7 +11,12 @@ static WARM:Mutex<Warm>=Mutex::new(Warm{key:String::new(),running:false,next:Non
 pub(super) fn configure(root:PathBuf){let _=ROOT.set(root);}
 fn voice_key(cfg:&crate::doubao_tts::DoubaoTtsConfig)->String{
     // Credential rotation must not invalidate identical public voice audio.
-    format!("news-pcm16-v1|{}|{}|{}|{}|{}",cfg.ws_url,cfg.resource_id,cfg.model,cfg.speaker,cfg.speed.to_bits())
+    // v1 could not distinguish custom PCM from Volcengine PCM at the same text.
+    if crate::voice_chat_settings::buffered_speech(&cfg.tts_provider) {
+        return json!(["news-pcm16-v2", cfg.tts_provider, cfg.tts_base_url, cfg.tts_model, cfg.tts_voice]).to_string();
+    }
+    json!(["news-pcm16-v2", cfg.tts_provider, cfg.ws_url, cfg.resource_id,
+        cfg.model, cfg.speaker, cfg.speed.to_bits()]).to_string()
 }
 fn key(cfg:&crate::doubao_tts::DoubaoTtsConfig,text:&str)->String{format!("{:x}",Sha256::digest(format!("{}|{text}",voice_key(cfg))))}
 fn load_at(root:&Path,key:&str)->Option<Vec<u8>>{
@@ -119,6 +124,50 @@ pub(super) fn prepare(id:&str,board:&str,cfg:crate::doubao_tts::DoubaoTtsConfig,
         std::fs::write(output.join("acceptance.json"),serde_json::to_vec_pretty(&json!({"items":9,"parts":hits,"preparedMs":started.elapsed().as_millis(),"cacheReadMs":read_started.elapsed().as_millis(),"usbSession":false,"microphone":false,"playback":false})).unwrap()).unwrap();
     }
     fn cfg()->crate::doubao_tts::DoubaoTtsConfig{crate::doubao_tts::DoubaoTtsConfig::new("test-secret","speaker","",1.0,"")}
+    #[test]
+    fn speech_cache_separates_mimo_custom_and_volcengine() {
+        let mut c = cfg();
+        let builtin = key(&c, "测试");
+        c.tts_provider = "mimo".into();
+        c.tts_base_url = crate::voice_chat_settings::MIMO_ROOT.into();
+        c.tts_model = "mimo-v2.5-tts".into();
+        c.tts_voice = "mimo_default".into();
+        let mimo = key(&c, "测试");
+        assert_ne!(mimo, builtin);
+        let mut edited = c.clone();
+        edited.tts_model = "fixture-edited-tts".into();
+        assert_ne!(mimo, key(&edited, "测试"));
+        edited = c.clone();
+        edited.tts_voice = "茉莉".into();
+        assert_ne!(mimo, key(&edited, "测试"));
+        c.api_key = "rotated-test-key".into();
+        assert_eq!(key(&c, "测试"), mimo);
+        c.tts_provider = "openai".into();
+        let custom = key(&c, "测试");
+        assert_ne!(custom, mimo);
+        c.tts_base_url = "https://custom.invalid/v1".into();
+        assert_ne!(key(&c, "测试"), custom);
+    }
+    #[test]
+    fn switching_appearance_reuses_only_pcm_for_the_effective_voice() {
+        let dir = tempfile::tempdir().unwrap();
+        let slots: crate::persona_tts::VoiceOverrides = serde_json::from_value(json!({
+            "mimo":{"model":"design","voice":"pet-specific"}
+        })).unwrap();
+        let mut global = cfg();
+        global.tts_provider = "mimo".into();
+        global.tts_base_url = crate::voice_chat_settings::MIMO_ROOT.into();
+        global.tts_model = "design".into();
+        global.tts_voice = "global".into();
+        let mut pet = global.clone();
+        slots.apply(&mut pet).unwrap();
+        let cache = |cfg| key(cfg, "同一句资讯");
+        store_at(dir.path(), &cache(&pet), &[1, 0]).unwrap();
+        assert!(load_at(dir.path(), &cache(&global)).is_none());
+        store_at(dir.path(), &cache(&global), &[2, 0]).unwrap();
+        assert_eq!(load_at(dir.path(), &cache(&pet)).unwrap(), [1, 0]);
+        assert_eq!(load_at(dir.path(), &cache(&global)).unwrap(), [2, 0]);
+    }
     #[test]fn cache_keys_follow_text_voice_rate_model_but_never_credentials(){let a=cfg();let k=key(&a,"公开资讯");let mut b=a.clone();b.api_key="other".into();assert_eq!(k,key(&b,"公开资讯"));b.speed=1.1;assert_ne!(k,key(&b,"公开资讯"));b=a.clone();b.speaker="different".into();assert_ne!(k,key(&b,"公开资讯"));b=a.clone();b.model="new-model".into();assert_ne!(k,key(&b,"公开资讯"));assert_ne!(k,key(&a,"另一条"));}
     #[test]fn pcm_is_atomic_bounded_and_corruption_never_plays(){let temp=tempfile::tempdir().unwrap();let k=key(&cfg(),"资讯");let pcm=vec![0,0,1,0];store_at(temp.path(),&k,&pcm).unwrap();assert_eq!(load_at(temp.path(),&k),Some(pcm.clone()));assert!(store_at(temp.path(),&k,&[1]).is_err());assert_eq!(load_at(temp.path(),&k),Some(pcm));std::fs::write(temp.path().join(format!("{k}.pcm")),b"NEWSPCM1bad").unwrap();assert!(load_at(temp.path(),&k).is_none());}
 }

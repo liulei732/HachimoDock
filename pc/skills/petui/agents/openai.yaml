@@ -1,7 +1,7 @@
 interface:
   display_name: "petui"
   short_description: "创作、验证并发布 P4 .hachiapp 组件"
-  default_prompt: "Use $petui to generate, validate, test, and publish a P4 .hachiapp component, checking actual device capabilities for touch slicing and available PC sources for live data."
+  default_prompt: "Use $petui to generate, validate, test, and publish a P4 .hachiapp component. Report featureManifest production routes and target evidence per feature. Check actual device capabilities for touch slicing and WiFi6 HTTPS/MQTT feeds. Use PC providers for desktop data and controlled Python plugins. Before final packaging, ask for a brief sound-effects description when appropriate; generate and test effects totaling at most 30,000 bytes, or use an actually supported URL audio host."
 
 policy:
   allow_implicit_invocation: true

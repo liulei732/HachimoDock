@@ -31,24 +31,45 @@ pub(crate) const LEGACY_AUDIO_SYNC_BLOCK: &str =
 pub struct ComponentSyncRequirements {
     pub(crate) blocked_reason: Option<&'static str>,
     usb_capabilities: BTreeMap<&'static str, &'static str>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    minimum_limits: BTreeMap<&'static str, usize>,
 }
 
 impl ComponentSyncRequirements {
     pub(crate) fn from_runtime(runtime: &serde_json::Value) -> Self {
         let mut result = Self::default();
+        if runtime.get("accessory").is_some() {
+            result.usb_capabilities.insert("widgetBleAccessory", "p4-ble-read-v1");
+        }
+        if runtime.get("hardware").is_some() {
+            result.usb_capabilities.insert("widgetMicLevel", "microphone-level-v1");
+        }
         if runtime["media"]["source"] == "audio.player" {
             result.blocked_reason = Some(LEGACY_AUDIO_SYNC_BLOCK);
         }
+        if runtime.get("hachiNetwork").is_some() {
+            result.usb_capabilities.insert("widgetWasmNetwork", crate::component_network::PROFILE);
+            if runtime["hachiNetwork"].get("credentials").is_some() {
+                result.usb_capabilities.insert("widgetComponentCredentials", crate::component_network::CREDENTIAL_PROFILE);
+            }
+        }
         if runtime.get("hachiWasm").is_some() {result.usb_capabilities.insert("widgetWasm","hachi-wasm-v1");}
         if runtime["hachiCanvas"] == HACHI_NATIVE_CANVAS {result.usb_capabilities.insert("widgetWasmCanvas",HACHI_NATIVE_CANVAS);}
+        if runtime["hachiAudio"] == crate::wasm_audio::PROFILE {
+            result.usb_capabilities.insert("widgetWasmAudio", crate::wasm_audio::PROFILE);
+        }
         if runtime["hachiHost"] == HACHI_HOST_PROFILE {result.usb_capabilities.insert("widgetWasmHost",HACHI_HOST_PROFILE);}
         if runtime["data"]["source"] == "wifi.feed" {
             result.usb_capabilities.insert("widgetWifiFeed", "p4-wifi-feed-v1");
             if runtime["data"].get("connection").is_some() {
-                if runtime["data"]["connection"]["type"] == "mqtt-public" {
-                    result.usb_capabilities.insert("widgetPublicMqtt", "p4-public-mqtt-v1");
-                } else {
+                let kind = runtime["data"]["connection"]["type"].as_str();
+                if kind != Some("mqtt-public") {
                     result.usb_capabilities.insert("widgetPrivateFeed", private_feed::CAPABILITY);
+                }
+                if matches!(kind, Some("https-submit" | "mqtt-publish")) {
+                    result.usb_capabilities.insert("widgetScopedWrite", "p4-scoped-write-v1");
+                } else if kind == Some("mqtt-public") {
+                    result.usb_capabilities.insert("widgetPublicMqtt", "p4-public-mqtt-v1");
                 }
             }
             if runtime["data"].get("response_map").is_some() {
@@ -83,6 +104,13 @@ impl ComponentSyncRequirements {
         if let Some(reason) = self.blocked_reason {
             return Err(reason.into());
         }
+        for (&key, &needed) in &self.minimum_limits {
+            if let Some(limit) = capabilities.get(key) {
+                if limit.as_u64().unwrap_or(0) < needed as u64 {
+                    return Err(format!("组件需要 {key} 至少为 {needed}，当前设备报告 {limit}。"));
+                }
+            }
+        }
         let missing = self.usb_capabilities.iter()
             .filter_map(|(&key, &version)| {
                 (capabilities[key].as_str() != Some(version)).then(|| format!("{key}={version}"))
@@ -91,7 +119,7 @@ impl ComponentSyncRequirements {
         if missing.is_empty() {
             Ok(())
         } else {
-            Err(format!("当前 USB 设备未声明组件所需能力：{}。请检查实际固件版本和设备握手。", missing.join("、")))
+            Err(format!("当前设备未声明组件所需能力：{}。请检查实际固件版本和设备握手。", missing.join("、")))
         }
     }
 
@@ -549,12 +577,57 @@ pub(crate) fn complete_p4_runtime_containers(
     }
 }
 
+/// Only synthesize the static preview of a named-binding host surface. Its
+/// dynamic display belongs to the surface and is never saved in an archive.
+pub(crate) fn initial_host_preview(
+    widget: &serde_json::Value, existing: Option<&[u8]>,
+) -> Result<Option<Vec<u8>>, String> {
+    use serde_json::{json, Value};
+    if widget["host"] != true || widget["surface"]["engine"] != "p4-app-surface-v1"
+        || widget["surface"]["bindings"] != "p4-variable-bindings-v1"
+        || widget.get("hachiWasm").is_some()
+    {
+        return Ok(None);
+    }
+    let dashboard = &widget["dashboard"];
+    if !dashboard.as_object().is_some_and(|values| !values.is_empty() && values.values().all(Value::is_string)) {
+        return Ok(None);
+    }
+    let mut preview = existing.map(serde_json::from_slice::<Value>).transpose()
+        .map_err(|_| "negative-screen.json 不是有效 JSON")?.unwrap_or_else(|| json!({}));
+    let preview = preview.as_object_mut().ok_or("negative-screen.json 必须是对象")?;
+    if preview.get("dashboard") == Some(dashboard) {
+        return Ok(None);
+    }
+    preview.insert("dashboard".into(), dashboard.clone());
+    serde_json::to_vec(preview).map(Some).map_err(|error| error.to_string())
+}
+
 pub(crate) fn validate_p4_runtime_shell(widget: &serde_json::Value) -> Result<(), String> {
     let invalid = |field: &str, requirement: &str| {
         format!("runtime/widget.json.{field} {requirement}")
     };
     if widget["schema_version"].as_f64() != Some(1.0) {
         return Err(invalid("schema_version", "必须为 1"));
+    }
+    if let Some(accessory) = widget.get("accessory") {
+        let shell = ["schema_version", "engine", "accessory", "vars", "states", "initial_state", "transitions", "tick", "dashboard"];
+        if widget["engine"] != "p4-bounded-runtime-v4"
+            || !matches!(accessory.as_str(), Some("battery-level" | "ambient-temperature"))
+            || !widget.as_object().is_some_and(|fields| object_has_only_keys(fields, &shell))
+            || widget.get("vars").is_some_and(|v| !v.as_object().is_some_and(|m| m.is_empty()))
+            || ["transitions", "tick"].iter().any(|key| widget.get(*key).is_some_and(|v| !v.as_array().is_some_and(|a| a.is_empty()))) {
+            return Err(invalid("accessory", "需要独立的前台蓝牙电量或温度面板"));
+        }
+    }
+    if let Some(hardware) = widget.get("hardware") {
+        let shell = ["schema_version", "engine", "hardware", "vars", "states", "initial_state", "transitions", "tick", "dashboard", "fetchers", "readers"];
+        if widget["engine"] != "p4-bounded-runtime-v4" || !widget.as_object().is_some_and(|m| object_has_only_keys(m, &shell))
+            || !hardware.as_object().is_some_and(|m| object_has_only_keys(m, &["service", "quiet_below"]))
+            || hardware["service"] != "microphone-level-v1"
+            || hardware.get("quiet_below").is_some_and(|v| !v.as_u64().is_some_and(|n| (1..=100).contains(&n))) {
+            return Err(invalid("hardware", "需要独立的 v4 前台麦克风电平声明，安静阈值取 1–100 整数"));
+        }
     }
     if !widget["dashboard"].is_object() {
         return Err(invalid("dashboard", "必须为对象"));
@@ -2001,7 +2074,12 @@ pub fn validate_clawpkg_bytes(bytes: &[u8]) -> Result<ValidateClawpkgResult, Str
         }
     }
 
-    validate_clawpkg_collected(files, |d| dir_seen.get(d).copied().unwrap_or(false))
+    // Files-only archives omit empty directories. The importer creates this
+    // root after extraction; referenced assets are still checked individually.
+    let implicit_assets = !files.contains_key("assets");
+    validate_clawpkg_collected(files, |d| {
+        (d == "assets/" && implicit_assets) || dir_seen.get(d).copied().unwrap_or(false)
+    })
 }
 
 /// Build the manifest preview from the collected file map. Mutates `errors` with
@@ -2043,6 +2121,7 @@ fn build_manifest_preview(
     validate_p4_runtime_dashboard_rules(files, errors);
     validate_widget_data(files, errors);
     validate_widget_media(files, errors);
+    let mut python_declared = false;
     if let Some(runtime)=files.get("runtime/widget.json").and_then(|b|serde_json::from_slice::<serde_json::Value>(b).ok()){
         // Track C extensions (sequence/samples/clip/big_images/events) are validated by their own
         // module; the unchanged validators see the base declaration.
@@ -2055,6 +2134,10 @@ fn build_manifest_preview(
         };
         if let Err(error) = shape {
             errors.push(error);
+        }
+        if runtime.get("accessory").is_some() && files.get("buttons.json").is_some_and(|bytes|
+            serde_json::from_slice::<serde_json::Value>(bytes).ok() != Some(serde_json::json!([]))) {
+            errors.push("蓝牙配件面板须使用空按键声明".into());
         }
         let source_runtime = runtime;
         let runtime=crate::component_capability_ext::strip(&source_runtime);
@@ -2069,14 +2152,14 @@ fn build_manifest_preview(
         }
         if runtime.get("host").is_some()||files.contains_key("pc/application.json"){
             match files.get("pc/application.json").ok_or("缺少 PC 应用声明".to_string()).and_then(|b|crate::app_services::parse(b,&runtime)){
-                Ok(_)=>{},Err(e)=>errors.push(e)
+                Ok(declaration)=>{python_declared=crate::component_composition::python_spec(&declaration).is_some();},Err(e)=>errors.push(e)
             }
             let mut images:HashSet<String>=runtime["surface"]["images"].as_array().into_iter().flatten().filter_map(|v|v["asset"].as_str().map(str::to_owned)).collect();
             if let (Some((frames,_)),Some(asset))=(crate::app_graphics::keyframes(&runtime["surface"]),runtime["surface"]["images"][0]["asset"].as_str()){for k in 2..=frames{images.insert(crate::app_graphics::keyframe_asset(asset,k));}}
             for path in files.keys(){
                 let notice=path=="LICENSE.txt"||path=="THIRD_PARTY_NOTICES.txt"||path.starts_with("licenses/");
                 let media=crate::component_capability_ext::media_assets(&source_runtime).iter().any(|(p,_)|p==path);
-                if !REQUIRED_FILES.contains(&path.as_str())&&!matches!(path.as_str(),"hachiapp.json"|HACHI_COVER_PATH|"pc/application.json"|"assets/.keep")&&!images.contains(path.as_str())&&!media&&!notice{errors.push("PC 应用包含额外文件".into());}
+                if !REQUIRED_FILES.contains(&path.as_str())&&!matches!(path.as_str(),"hachiapp.json"|HACHI_COVER_PATH|"pc/application.json"|"assets/.keep")&&!(python_declared&&path==crate::component_python::PATH)&&!images.contains(path.as_str())&&!media&&!notice{errors.push("PC 应用包含额外文件".into());}
             }
         }
         if runtime.get("surface").is_some()&&runtime.get("media").is_none(){
@@ -2103,15 +2186,25 @@ fn build_manifest_preview(
         let source=files.get("runtime/widget.json").and_then(|b|serde_json::from_slice::<serde_json::Value>(b).ok()).and_then(|v|v["media"]["source"].as_str().map(str::to_owned));
         if source.as_deref()!=Some(format!("pc.{id}").as_str()){errors.push("PC 扩展必须与组件 ID、媒体源绑定".into());}
         let runtime:serde_json::Value=files.get("runtime/widget.json").and_then(|b|serde_json::from_slice(b).ok()).unwrap_or_default();
-        let images=runtime["surface"]["images"].as_array();
-        let mut allowed=std::collections::HashSet::new();
-        for im in images.into_iter().flatten(){
-            if let Some(path)=im["asset"].as_str(){
-                allowed.insert(path);
-                match files.get(path){
-                    Some(bytes)=>{if let Err(e)=crate::component_extension::decode_surface_image(im,bytes){errors.push(e);}},
-                    None=>errors.push(format!("缺少图片: {path}"))
+        let surface = &runtime["surface"];
+        let mut allowed: HashSet<String> = crate::component_capability_ext::media_assets(&runtime)
+            .into_iter().map(|(path, _)| path).collect();
+        for (index, image) in surface["images"].as_array().into_iter().flatten().enumerate() {
+            let Some(asset) = image["asset"].as_str() else { continue };
+            let frames = if index == 0 {
+                crate::app_graphics::keyframes(surface).map_or(1, |(count, _)| count)
+            } else { 1 };
+            for frame in 1..=frames {
+                let path = crate::app_graphics::keyframe_asset(asset, frame);
+                match files.get(&path) {
+                    Some(bytes) => {
+                        if let Err(error) = crate::component_extension::decode_surface_image(image, bytes) {
+                            errors.push(error);
+                        }
+                    }
+                    None => errors.push(format!("缺少图片: {path}"))
                 }
+                allowed.insert(path);
             }
         }
         // Legal notices stay in the PC resource package; the USB transaction
@@ -2136,6 +2229,14 @@ fn build_manifest_preview(
     validate_p4_widget_sfx(files, errors);
     crate::component_capability_ext::validate(files, errors);
     validate_component_game(files, errors);
+    match (python_declared, files.get(crate::component_python::PATH)) {
+        (true, Some(source)) => {
+            if let Err(error) = crate::component_python::validate_source(source) { errors.push(error); }
+        }
+        (true, None) => errors.push("Python 声明缺少 pc/plugin.py".into()),
+        (false, Some(_)) => errors.push("pc/plugin.py 需要唯一的 Python 数据源声明".into()),
+        _ => (),
+    }
     /* Read dashboard. Most slots are flat strings; `progress` may be an object
     {value, label} which we flatten to "<value>:<label>" so it serializes as
     a normal slot for the device parser. */
@@ -2184,7 +2285,19 @@ fn build_manifest_preview(
             dashboard: dashboard_map,
             sync_requirements: files.get("runtime/widget.json")
                 .and_then(|bytes| serde_json::from_slice(bytes).ok())
-                .map(|runtime| ComponentSyncRequirements::from_runtime(&runtime))
+                .map(|runtime| {
+                    let mut requirements = ComponentSyncRequirements::from_runtime(&runtime);
+                    if let Some(module) = files.get("runtime/app.wasm") {
+                        requirements.minimum_limits.insert("widgetWasmMaxBytes", module.len());
+                        if let Some((_, _, pages, _, _)) = wasm_profile_details(module) {
+                            requirements.minimum_limits.insert("widgetWasmMemoryPages", usize::from(pages));
+                        }
+                    }
+                    if let Some(bank) = files.get(crate::wasm_audio::ASSET) {
+                        requirements.minimum_limits.insert("widgetWasmAudioMaxBytes", bank.len());
+                    }
+                    requirements
+                })
                 .unwrap_or_default(),
         })
     } else {
@@ -2201,17 +2314,19 @@ pub(crate) fn collect_clawpkg_directory_files(
     let mut expanded_bytes = 0u64;
 
     while let Some(directory) = pending.pop_front() {
+        let remaining = CLAWPKG_MAX_ENTRIES - entry_count;
         let mut entries = std::fs::read_dir(&directory)
             .map_err(|error| format!("read directory {}: {}", directory.display(), error))?
+            .take(remaining + 1)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("read directory {}: {}", directory.display(), error))?;
+        if entries.len() > remaining {
+            return Err(format!("clawpkg 文件数超过 {} 个上限", CLAWPKG_MAX_ENTRIES));
+        }
+        entry_count += entries.len();
         entries.sort_by_key(std::fs::DirEntry::file_name);
 
         for entry in entries {
-            entry_count += 1;
-            if entry_count > CLAWPKG_MAX_ENTRIES {
-                return Err(format!("clawpkg 文件数超过 {} 个上限", CLAWPKG_MAX_ENTRIES));
-            }
             let path = entry.path();
             let relative = path
                 .strip_prefix(root)
@@ -2400,13 +2515,13 @@ pub(crate) fn wasm_profile_details(bytes: &[u8]) -> Option<(bool, bool, u8, bool
             8 => return None,
             2 => {
                 let count = wasm_u32(&mut section)?;
-                 if saw_imports || count > 13 { return None; }
+                 if saw_imports || count > 17 { return None; }
                 saw_imports = true;
                 for _ in 0..count {
                     if wasm_name(&mut section)? != b"hachi" { return None; }
                     let name = wasm_name(&mut section)?;
                     if !matches!(name, b"canvas640" | b"text" | b"rect" | b"blit" | b"sprite" |
-                        b"tone" | b"load" | b"save" | b"media_cmd" | b"clock_read" | b"uv_read" | b"random_u32" | b"sample") || !imports.insert(name) {
+                        b"tone" | b"load" | b"save" | b"media_cmd" | b"clock_read" | b"uv_read" | b"random_u32" | b"sample" | b"service_submit" | b"service_poll" | b"service_read" | b"service_release") || !imports.insert(name) {
                         return None;
                     }
                     section = section.strip_prefix(&[0])?;
@@ -2431,17 +2546,56 @@ pub(crate) fn wasm_profile_details(bytes: &[u8]) -> Option<(bool, bool, u8, bool
     (native || !imports.contains(b"text".as_slice())).then_some((native, services, pages?, imports.contains(b"media_cmd".as_slice()), imports.contains(b"sample".as_slice())))
 }
 
+/// Parse import names after the ordinary profile validator has accepted the module.
+pub(crate) fn wasm_network_profile(bytes: &[u8]) -> Option<bool> {
+    wasm_profile_details(bytes)?;
+    let mut cursor = &bytes[8..];
+    while let Some((&id, rest)) = cursor.split_first() {
+        cursor = rest;
+        let size = wasm_u32(&mut cursor)? as usize;
+        let mut section = cursor.get(..size)?;
+        cursor = &cursor[size..];
+        if id == 2 {
+            for _ in 0..wasm_u32(&mut section)? {
+                wasm_name(&mut section)?;
+                let name = wasm_name(&mut section)?;
+                section = section.strip_prefix(&[0])?;
+                wasm_u32(&mut section)?;
+                if matches!(name, b"service_submit" | b"service_poll" | b"service_read" | b"service_release") { return Some(true); }
+            }
+        }
+    }
+    Some(false)
+}
+
+pub(crate) fn validate_network_declaration(widget: &serde_json::Value, module: Option<&[u8]>) -> Result<(), String> {
+    let used = module.and_then(wasm_network_profile).unwrap_or(false);
+    match (used, widget.get("hachiNetwork")) {
+        (false, None) => Ok(()),
+        (true, Some(policy)) => crate::component_network::validate(policy),
+        _ => Err("WASM 网络能力声明与模块不匹配".into()),
+    }
+}
+
 pub(crate) const HACHI_COVER_PATH: &str = "pc/cover.png";
 pub(crate) const HACHI_COVER_MAX: u64 = 256 * 1024;
 
-fn valid_hachi_cover(bytes: &[u8]) -> bool {
+fn decode_hachi_cover(bytes: &[u8]) -> Option<image::DynamicImage> {
     use image::ImageDecoder;
-    if bytes.len() as u64 > HACHI_COVER_MAX { return false; }
-    let Ok(decoder) = image::codecs::png::PngDecoder::new(std::io::Cursor::new(bytes)) else {
-        return false;
-    };
-    matches!(decoder.dimensions(), (320, 240) | (640, 480))
-        && image::DynamicImage::from_decoder(decoder).is_ok()
+    if bytes.len() as u64 > HACHI_COVER_MAX { return None; }
+    let decoder = image::codecs::png::PngDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+    if !matches!(decoder.dimensions(), (320, 240) | (640, 480)) { return None; }
+    image::DynamicImage::from_decoder(decoder).ok()
+}
+
+pub(crate) fn require_publication_cover(bytes: Option<&[u8]>) -> Result<(), String> {
+    let image = decode_hachi_cover(bytes.ok_or("交付包缺少封面 pc/cover.png，请添加实际组件画面")?)
+        .ok_or("封面需为可解码的 320×240 或 640×480 PNG，且不超过 256 KiB")?;
+    let tile = crate::usb_serial::center_thumb::encode(&image);
+    let color = |index:u8| &tile[usize::from(index)*2..usize::from(index)*2+2];
+    let first = color(tile[32] >> 4);
+    if tile[32..].iter().any(|pair| color(pair >> 4) != first || color(pair & 15) != first) { return Ok(()); }
+    Err("封面缩至 64×48 后为空白或纯色，请截取有代表性的组件画面".into())
 }
 
 fn validate_hachiapp_files(files: &HashMap<String, Vec<u8>>, errors: &mut Vec<String>) {
@@ -2456,7 +2610,7 @@ fn validate_hachiapp_files(files: &HashMap<String, Vec<u8>>, errors: &mut Vec<St
         errors.push(".hachiapp 清单或组件 ID 无效".into());
     }
     if let Some(cover) = files.get(HACHI_COVER_PATH) {
-        if !valid_manifest || !valid_hachi_cover(cover) {
+        if !valid_manifest || decode_hachi_cover(cover).is_none() {
             errors.push("封面必须是 .hachiapp 的 320×240 或 640×480 PNG，且不超过 256 KiB".into());
         }
     }
@@ -2488,6 +2642,9 @@ fn validate_hachiapp_files(files: &HashMap<String, Vec<u8>>, errors: &mut Vec<St
                 errors.push("WASM 文件格式、固定内存或导入接口无效，请用当前 PetUI 工具重新构建".into());
             }
         },
+    }
+    if let Err(error) = validate_network_declaration(&widget, files.get("runtime/app.wasm").map(Vec::as_slice)) {
+        errors.push(error);
     }
     use crate::wasm_audio;
     let uses_audio = files.get("runtime/app.wasm").and_then(|b| wasm_profile_details(b)).is_some_and(|p| p.4);
@@ -2547,6 +2704,24 @@ pub fn render_component_dashboard_payload(dashboard: &HashMap<String, String>) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn accessory_panels_require_individual_device_capability() {
+        use serde_json::json;
+        for example in [
+            include_str!("../../skills/petui/examples/ble-accessory-battery/runtime/widget.json"),
+            include_str!("../../skills/petui/examples/ble-room-temperature/runtime/widget.json"),
+        ] {
+            let mut runtime: serde_json::Value = serde_json::from_str(example).unwrap();
+            super::validate_p4_runtime_shell(&runtime).unwrap();
+            let req = ComponentSyncRequirements::from_runtime(&runtime);
+            assert!(req.check_unnegotiated_transport().is_err());
+            assert!(req.check_usb(&json!({"bluetoothKeyboardConfig":true})).is_err());
+            req.check_usb(&json!({"widgetBleAccessory":"p4-ble-read-v1"})).unwrap();
+            runtime["peer"] = json!("package-selected");
+            assert!(super::validate_p4_runtime_shell(&runtime).is_err());
+        }
+    }
+
     #[test]
     fn wifi_feed_http_options_are_bounded_and_negotiated() {
         use serde_json::json;
@@ -2878,6 +3053,19 @@ mod tests {
         let options = zip::write::SimpleFileOptions::default();
         archive.start_file("component.json", options).unwrap();
         assert!(archive.start_file("component.json", options).is_err());
+    }
+
+    #[test]
+    fn directory_entry_budget_includes_empty_directories_across_levels() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        for i in 1..CLAWPKG_MAX_ENTRIES {
+            std::fs::write(root.path().join(format!("{i}.txt")), []).unwrap();
+        }
+        assert_eq!(collect_clawpkg_directory_files(root.path()).unwrap().len(), CLAWPKG_MAX_ENTRIES-1);
+        std::fs::create_dir(nested.join("overflow")).unwrap();
+        assert!(collect_clawpkg_directory_files(root.path()).unwrap_err().contains("文件数超过"));
     }
 
     #[test]

@@ -1,28 +1,36 @@
 /** Shared selectable text/vision catalog with an explicit manual-ID escape hatch.
  * Refresh never changes an existing choice or persists credentials. */
+import { formatModelIssue } from "./lib/model-issue.js";
+import { useModelCatalog } from "./lib/use-model-catalog.js";
+import { LLM_PRESETS, mimoConnection } from "./lib/api-configuration.js";
 import React, { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { DOUBAO_TEXT_MODELS, DEFAULT_LITE_MODEL, latestLiteModel, listThinkingModels, normalizeTextModels } from "./lib/text-models.js";
 
 export default function TextModelSelect({ value, onChange, provider = "doubao", baseUrl, apiKey = "", configured = false,
-  vision = false, disabled = false, label = "对话模型" }) {
-  const [revision, setRevision] = useState(0);
+  vision = false, autoLoad = true, disabled = false, label = "对话模型" }) {
+  const { requested, revision, refresh } = useModelCatalog(autoLoad, provider, baseUrl, apiKey);
   const [manual, setManual] = useState(false);
   const [state, setState] = useState({ models: [], loading: false, error: "" });
   useEffect(() => {
     let cancelled = false;
     const controller = new AbortController();
+    if (!requested) {
+      setState({ models: [], loading: false, error: "" });
+      return;
+    }
     setState({ models: [], loading: Boolean(apiKey.trim() || configured), error: "" });
     const timer = setTimeout(() => { if (apiKey.trim() || configured) {
       const request = vision ? listThinkingModels({ apiKey, baseUrl, signal: controller.signal })
         : invoke("list_voice_chat_models", { input: { llmProvider: provider,
           llmBaseUrl: provider === "custom" ? baseUrl : null, llmApiKey: apiKey.trim() || null } });
       request.then(models => { if (!cancelled) setState({ models: normalizeTextModels(models), loading: false, error: "" }); })
-        .catch(() => { if (!cancelled) setState({ models: [], loading: false,
-          error: "模型列表暂不可用，可刷新或手动填写；不会替换已选模型。" }); });
+        .catch(error => { if (!cancelled) setState({ models: [], loading: false,
+          error: formatModelIssue("catalog", vision ? "火山方舟" :
+            LLM_PRESETS.find(item => item.id === provider)?.label || (mimoConnection(provider)?.label === "Token Plan" ? "MiMo Token Plan" : "自定义"), error) + " 可刷新或手动填写，保留已选模型。" }); });
     } }, 600);
     return () => { cancelled = true; clearTimeout(timer); controller.abort(); };
-  }, [provider, baseUrl, apiKey, configured, vision, revision]);
+  }, [provider, baseUrl, apiKey, configured, vision, revision, requested]);
   const models = [...new Set([...(provider === "doubao" ? DOUBAO_TEXT_MODELS : []), ...state.models, ...(value ? [value] : [])])];
   const latest = latestLiteModel(state.models) || DEFAULT_LITE_MODEL;
   return <div className="text-model-select">
@@ -33,7 +41,7 @@ export default function TextModelSelect({ value, onChange, provider = "doubao", 
         {models.map(id => <option key={id} value={id}>{id}{id === latest ? " · 推荐 Lite" : ""}</option>)}
       </select>
       <button type="button" className="btn-ghost btn-sm" disabled={disabled || state.loading || !(apiKey.trim() || configured)}
-        onClick={() => setRevision(n => n + 1)}>{state.loading ? "获取中…" : "刷新列表"}</button>
+        onClick={refresh}>{state.loading ? "获取中…" : "刷新列表"}</button>
     </div>
     {provider === "doubao" && <button type="button" className="btn-ghost btn-sm" disabled={disabled}
       onClick={() => onChange(latest)}>使用最新 Lite</button>}

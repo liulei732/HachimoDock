@@ -29,26 +29,23 @@ fn choose(s:&mut Reading,cards:&[Value]){
 /// Split by UTF-8 byte AND display-width budgets; concatenation is lossless.
 /// Two segments form one device page (note + footer). No firmware string growth.
 pub fn segments(text:&str)->Vec<String>{
-    let mut out=Vec::new();let mut part=String::new();let mut width=0;let mut count=0;
-    for ch in text.chars(){
-        let w=if ch.is_ascii(){1}else{2};
-        // Wide Latin capitals can be almost an em, not half an em. Also cap
-        // scalar count so mixed English names cannot overflow the third line.
-        if part.len()+ch.len_utf8()>144||width+w>94||count>=48{out.push(std::mem::take(&mut part));width=0;count=0;}
-        part.push(ch);width+=w;count+=1;
-    }
-    if !part.is_empty(){out.push(part);}
-    if out.is_empty(){out.push(String::new());}out
+    split_reading(text, false)
 }
 fn reading_segments(s:&Reading,text:&str)->Vec<String>{
-    if !s.include_all{return segments(text);}
-    // Books prefer sentence/clause boundaries between the two visible text
-    // blocks. Keep the existing byte/width ceilings and never discard a char.
+    split_reading(text, s.include_all)
+}
+fn split_reading(text:&str, prefer_clause:bool)->Vec<String>{
     let mut rest=text;let mut out=Vec::new();
     while !rest.is_empty(){
-        let hard=segments(rest).into_iter().next().unwrap();
-        let boundary=hard.char_indices().enumerate().filter(|(n,(_,ch))|*n>=22&&"。！？；，：!?;,".contains(*ch)).last().map(|(_, (i,ch))|i+ch.len_utf8());
-        let end=if hard.len()==rest.len(){hard.len()}else{boundary.unwrap_or(hard.len())};
+        let mut hard=0;let mut width=0;let mut boundary=None;
+        for (count,(offset,ch)) in rest.char_indices().enumerate(){
+            let end=offset+ch.len_utf8();
+            width+=if ch.is_ascii(){1}else{2};
+            if end>144||width>94||count==48{break;}
+            hard=end;
+            if prefer_clause&&count>=22&&"。！？；，：!?;,".contains(ch){boundary=Some(end);}
+        }
+        let end=if hard==rest.len(){hard}else{boundary.unwrap_or(hard)};
         out.push(rest[..end].to_owned());rest=&rest[end..];
     }
     if out.is_empty(){out.push(String::new());}out
@@ -76,7 +73,9 @@ pub fn apply(s:&mut Reading,cards:&[Value],op:&str){
 }
 pub fn info(s:&Reading,cards:&[Value])->Value{
     let cats=menu(s,cards);
-    json!({"categories":cats.iter().map(|name|json!({"name":name,"count":cards.iter().filter(|c|matches_category(s,c,name)).count()})).collect::<Vec<_>>(),
+    let mut counts=BTreeMap::new();
+    for card in cards { *counts.entry(card["category"].as_str().unwrap_or("")).or_insert(0usize)+=1; }
+    json!({"categories":cats.iter().map(|name|json!({"name":name,"count":if s.include_all&&name=="全部书籍"{cards.len()}else{counts[name.as_str()]}})).collect::<Vec<_>>(),
         "category":s.category,"choosing":s.choosing,"candidate":cats.get(s.candidate),"current":current(s,cards),
         "page":s.page,"pages":current(s,cards).map(|c|reading_segments(s,c["text"].as_str().unwrap_or("")).len().div_ceil(2)).unwrap_or(0),"total":cards.len()})
 }

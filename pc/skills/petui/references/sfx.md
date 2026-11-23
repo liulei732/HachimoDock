@@ -3,15 +3,17 @@
 让有界组件在按键、结算和场景事件上发出**短提示音**。它是六个固定合成预设的命名别名，
 不是采样播放、背景音乐、语音或任意音频引擎。
 
+创作收尾时按[配套音效流程](sound-effects.md)收集一句话需求，选择固定预设、设备合成或真实采样；自定义文件合计不超过30,000字节。给预设改名不会生成新的录音音色。
+
 ## 声明
 
 ```json
-"sfx": {"engine": "p4-sfx-v1", "volume": 60,
+"sfx": {"engine": "p4-sfx-v1", "volume": 80,
         "cues": [{"id": "meow", "preset": "chirp"}, {"id": "munch", "preset": "tap"}]}
 ```
 
 - 需要顶层 `engine: "p4-bounded-runtime-v4"`，设备能力 `widgetSfx = "p4-sfx-v1"`（`widgetLimits.v2.maxSfxCues = 8`）。
-- `volume` 0-100；`cues` 1-8 个，`id` 为 1-15 位 `A-Za-z0-9_.-` 且唯一；`preset` 只能是：
+- `volume` 0-100，新组件默认写80，用户明确指定时沿用指定值；`cues` 1-8 个，`id` 为 1-15 位 `A-Za-z0-9_.-` 且唯一；`preset` 只能是：
 
 | 预设 | 听感 | 时长 | 适合 |
 | --- | --- | --- | --- |

@@ -20,3 +20,19 @@ for(const count of [16,17,24,25,31,32,33,44,45,64])test(`local masks retain ever
  }
  console.log(`JS_BOUNDARY_OK ${count}`);
 });
+
+test("revealed cards cover the full deck before the next round, even with constant entropy", () => {
+  const runtime={local:{kind:"deck", groups:[{title:"deck",items:Array.from({length:16},(_,i)=>({title:String(i),note:"note"}))}],actions:{draw:"draw",close:"close"},reveal_ms:300}};
+  let s=localInitial({clock:0,vars:{local0:0,local1:0,local2:-1,local3:0,local4:-1,local5:0,local6:-1}},0);
+  let last=-1;
+  for(let round=0;round<3;round++){
+    const seen=new Set();
+    for(let card=0;card<16;card++){
+      s=localAction(runtime,s,"draw",0);
+      if(card===3){const pending=s.local.pending;s=localAction(runtime,s,"close",0);s=localAction(runtime,s,"draw",0);assert.equal(s.local.pending,pending);}
+      s.clock+=300;localAdvance(runtime,s);
+      assert.notEqual(s.vars.local2,last);last=s.vars.local2;seen.add(last);
+    }
+    assert.equal(seen.size,16);
+  }
+});

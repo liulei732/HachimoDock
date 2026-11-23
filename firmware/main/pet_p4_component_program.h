@@ -15,6 +15,7 @@ struct cJSON;
 #define PET_COMPONENT_PROGRAM_ACTIONS 24U
 typedef struct {
   bool enabled;
+  bool local_background; /* Explicit package request. The board owns consent. */
   bool v2; /* p4-component-program-v2 declared (PET_P4_PROGRAM_V2 builds only) */
 #if PET_COMPONENT_PROGRAM_ENABLED
   pet_program_image_t image;

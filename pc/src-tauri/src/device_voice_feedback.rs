@@ -1,102 +1,120 @@
-//! Bounded, ephemeral projection of PTT recognition and delivery onto the device.
-//! The single active capture owns one replaceable pending snapshot. Neither
-//! publication nor consumption performs IO while holding the metadata lock.
+//! Display-only projection of the existing USB push-to-talk round.
+
 use serde_json::{json, Value};
 use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
-pub const ENGINE: &str = "p4-voice-feedback-v1";
+pub(crate) const ENGINE: &str = "p4-voice-feedback-v2";
+pub(crate) const TOPIC: &str = "ui/voice-feedback";
+const INTERVAL: Duration = Duration::from_millis(150);
+const TEXT_BYTES: usize = 384;
 
-#[derive(Clone, Copy)]
-pub enum FailureStage {
-    Recognition,
-    Insertion,
-    Submission,
+// The device admits the physical press for 12 seconds after presentation.
+// Allow bounded transport/scanout latency, while rejecting a delayed replay.
+pub(crate) fn confirm_window_open(since_write: Duration) -> bool {
+    since_write < Duration::from_secs(13)
 }
 
-impl FailureStage {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Recognition => "recognition",
-            Self::Insertion => "insertion",
-            Self::Submission => "submission",
-        }
-    }
+pub(crate) fn supported(scope: &Value) -> bool {
+    scope["runtime"] == "esp-p4" && scope["voiceFeedback"] == ENGINE
 }
 
-pub struct Feedback<'a> {
-    /// The device's audio/begin.sessionId and the PTT confirmation owner.
-    pub device_session_id: &'a str,
-    pub board: &'a str,
-    pub boot: &'a str,
-    pub revision: u64,
-    pub phase: &'a str,
-    pub text: &'a str,
-    pub error: &'a str,
-    pub failure_stage: FailureStage,
-    /// Set only after the native writer's insertion acknowledgement.
-    pub draft_inserted: bool,
+pub(crate) fn token(value: &Value) -> u32 {
+    value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0)
+}
+
+pub(crate) fn confirms(
+    payload: &Value,
+    capture: &str,
+    token: u32,
+    board: &str,
+    boot: &str,
+    connection: &str,
+) -> bool {
+    let scope = &payload["_nativeUsbScope"];
+    token != 0
+        && !capture.is_empty()
+        && !board.is_empty()
+        && !boot.is_empty()
+        && !connection.is_empty()
+        && supported(scope)
+        && scope["boardDeviceId"] == board
+        && scope["bootId"] == boot
+        && scope["connectionId"] == connection
+        && payload["context"] == "main"
+        && payload["gesture"] == "short_press"
+        && payload["handledLocally"] == false
+        && payload["voiceDraftVisible"] == true
+        && payload["voiceUtteranceId"] == capture
+        && payload["voiceFeedbackToken"].as_u64() == Some(u64::from(token))
 }
 
 fn phase_rank(phase: &str) -> Option<u8> {
     Some(match phase {
-        "listening" | "partial" => 1,
-        "recognizing" | "finalizing" => 2,
-        "draft_ready" => 3,
-        "submitting" => 4,
-        "submitted" | "error" | "cancelled" | "submit_unknown" => 5,
+        "listening" => 1,
+        "partial" => 2,
+        "finalizing" => 3,
+        "draft_ready" => 4,
+        "submitting" => 5,
+        "submitted" | "queued" | "error" | "submit_unknown" | "cancelled" => 6,
         _ => return None,
     })
 }
 
-fn clipped(text: &str, limit: usize) -> &str {
-    let mut end = text.len().min(limit);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
+pub(crate) struct Projection<'a> {
+    pub board: &'a str,
+    pub boot: &'a str,
+    pub capture: &'a str,
+    pub token: u32,
+    pub phase: &'a str,
+    pub revision: u64,
+    pub text: &'a str,
+    pub inserted: bool,
 }
 
-pub fn payload(feedback: Feedback<'_>) -> Option<Value> {
-    let Feedback {
-        device_session_id,
-        board,
-        boot,
-        revision,
-        phase,
-        text,
-        error,
-        failure_stage,
-        draft_inserted,
-    } = feedback;
-    if [device_session_id, board, boot]
-        .iter()
-        .any(|s| s.is_empty() || s.len() >= 64)
-        || revision > 9_007_199_254_740_991
-        || phase_rank(phase).is_none()
-    {
-        return None;
+fn display_text(text: &str) -> String {
+    let mut result = String::new();
+    for ch in text.chars() {
+        // Keep the projection single-line and limit JSON escaping on the wire.
+        let ch = if ch.is_control() || ch.is_whitespace() {
+            ' '
+        } else {
+            ch
+        };
+        if result.len() + ch.len_utf8() > TEXT_BYTES {
+            break;
+        }
+        result.push(ch);
     }
-    // Provider/OS error strings can contain private data. Project fixed hints.
-    let hint = match phase {
-        "error" => match failure_stage {
-            FailureStage::Submission if draft_inserted => "发送失败，已写入的草稿请在电脑确认",
-            FailureStage::Submission => "发送失败，请查看电脑端",
-            FailureStage::Insertion if error.contains("多个") => "请保留目标主窗口",
-            FailureStage::Insertion => "写入失败，请查看电脑端",
-            FailureStage::Recognition => "识别失败，请重试或查看电脑端",
-        },
-        "cancelled" => "本次语音已取消，请查看电脑端",
-        "submit_unknown" => "发送结果未确认，请勿重复提交",
-        "draft_ready" if draft_inserted => "短按语音键 / 按下摇杆发送",
-        "draft_ready" => "草稿已就绪，等待确认",
-        _ => "",
-    };
-    Some(json!({
-        "captureId": device_session_id, "utteranceId": device_session_id, "boardDeviceId": board,
-        "bootId": boot, "revision": revision, "phase": phase,
-        "text": clipped(text, 511), "hint": hint, "draftInserted": draft_inserted,
-        "failureStage": if phase == "error" { failure_stage.as_str() } else { "" },
-    }))
+    result
+}
+
+impl Projection<'_> {
+    pub(crate) fn payload(self) -> Option<Value> {
+        if self.board.is_empty()
+            || self.boot.is_empty()
+            || self.capture.is_empty()
+            || self.capture.len() >= 64
+            || self.token == 0
+            || self.revision > u64::from(u32::MAX)
+        {
+            return None;
+        }
+        phase_rank(self.phase)?;
+        Some(json!({
+            "boardDeviceId": self.board,
+            "bootId": self.boot,
+            "captureId": self.capture,
+            "token": self.token,
+            "revision": self.revision,
+            "phase": self.phase,
+            "text": display_text(self.text),
+            "draftInserted": self.inserted,
+        }))
+    }
 }
 
 struct Pending<T> {
@@ -104,55 +122,40 @@ struct Pending<T> {
     revision: u64,
     rank: u8,
     message: Option<T>,
+    next: Instant,
 }
 
-/// One active physical capture, one pending snapshot, one writer. New captures
-/// retire old callbacks even if they arrive after a newer capture's terminal.
-/// The watermark survives consumption so stale events cannot reopen a result.
-pub struct Mailbox<T> {
+pub(crate) struct Mailbox<T> {
     pending: Mutex<Pending<T>>,
-    ready: Condvar,
-}
-
-impl<T> Default for Mailbox<T> {
-    fn default() -> Self {
-        Self::new()
-    }
+    changed: Condvar,
 }
 
 impl<T> Mailbox<T> {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pending: Mutex::new(Pending {
                 epoch: 0,
                 revision: 0,
                 rank: 0,
                 message: None,
+                next: Instant::now(),
             }),
-            ready: Condvar::new(),
+            changed: Condvar::new(),
         }
     }
 
-    /// Called once when publishing a new capture, never from an ASR callback.
-    pub fn begin_capture(&self) -> u64 {
+    pub(crate) fn begin(&self) -> u64 {
         let Ok(mut pending) = self.pending.lock() else {
             return 0;
         };
-        let Some(epoch) = pending.epoch.checked_add(1) else {
-            return 0;
-        };
-        *pending = Pending {
-            epoch,
-            revision: 0,
-            rank: 0,
-            message: None,
-        };
-        epoch
+        pending.epoch = pending.epoch.wrapping_add(1).max(1);
+        pending.revision = 0;
+        pending.rank = 0;
+        pending.message = None;
+        pending.epoch
     }
 
-    /// Replace superseded partials rather than dropping a terminal on overflow.
-    /// The only wait is a short metadata lock, never the serial writer or IO.
-    pub fn publish(&self, epoch: u64, revision: u64, phase: &str, message: T) -> bool {
+    pub(crate) fn publish(&self, epoch: u64, revision: u64, phase: &str, message: T) -> bool {
         let Some(rank) = phase_rank(phase) else {
             return false;
         };
@@ -161,26 +164,33 @@ impl<T> Mailbox<T> {
         };
         if epoch == 0
             || pending.epoch != epoch
-            || revision < pending.revision
+            || pending.rank == 6
             || rank < pending.rank
-            || pending.rank == 5
+            || revision < pending.revision
+            || (rank == pending.rank && revision == pending.revision)
         {
             return false;
         }
-        pending.revision = revision;
         pending.rank = rank;
+        pending.revision = revision;
         pending.message = Some(message);
-        self.ready.notify_one();
+        self.changed.notify_one();
         true
     }
 
-    pub fn receive(&self) -> Option<T> {
+    pub(crate) fn receive(&self) -> Option<T> {
         let mut pending = self.pending.lock().ok()?;
         loop {
-            if let Some(message) = pending.message.take() {
-                return Some(message);
+            if pending.message.is_none() {
+                pending = self.changed.wait(pending).ok()?;
+            } else {
+                let remaining = pending.next.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    pending.next = Instant::now() + INTERVAL;
+                    return pending.message.take();
+                }
+                pending = self.changed.wait_timeout(pending, remaining).ok()?.0;
             }
-            pending = self.ready.wait(pending).ok()?;
         }
     }
 }
@@ -189,148 +199,125 @@ impl<T> Mailbox<T> {
 mod tests {
     use super::*;
 
-    fn feedback<'a>(phase: &'a str, text: &'a str) -> Feedback<'a> {
-        Feedback {
-            device_session_id: "p4-audio-123456-7",
+    #[test]
+    fn only_visible_physical_confirm_from_the_exact_peer_and_capture_is_admitted() {
+        let valid = json!({
+            "_nativeUsbScope": {
+                "boardDeviceId": "board", "bootId": "boot", "connectionId": "42",
+                "runtime": "esp-p4", "voiceFeedback": ENGINE
+            },
+            "context": "main", "gesture": "short_press", "handledLocally": false,
+            "voiceDraftVisible": true, "voiceUtteranceId": "p4-audio-123-4",
+            "voiceFeedbackToken": 9,
+        });
+        let admits = |input: &Value| confirms(input, "p4-audio-123-4", 9, "board", "boot", "42");
+        assert!(admits(&valid));
+        for (key, stale) in [
+            ("bootId", "previous-boot"),
+            ("connectionId", "41"),
+            ("boardDeviceId", "another-board"),
+            ("voiceFeedback", "p4-voice-feedback-v1"),
+            ("runtime", "linux"),
+        ] {
+            let mut input = valid.clone();
+            input["_nativeUsbScope"][key] = json!(stale);
+            assert!(!admits(&input));
+        }
+        for (key, value) in [
+            ("voiceDraftVisible", json!(false)),
+            ("voiceUtteranceId", json!("p4-audio-older")),
+            ("voiceFeedbackToken", json!(8)),
+            ("handledLocally", json!(true)),
+            ("gesture", json!("long_press")),
+            ("context", json!("app")),
+            ("_nativeUsbScope", Value::Null),
+        ] {
+            let mut input = valid.clone();
+            input[key] = value;
+            assert!(!admits(&input));
+        }
+        assert!(!supported(&json!({"runtime": "esp-p4"})));
+        assert_eq!(token(&json!(u64::MAX)), 0);
+        assert!(confirm_window_open(Duration::from_secs(12)));
+        assert!(!confirm_window_open(Duration::from_secs(13)));
+    }
+
+    #[test]
+    fn payload_keeps_the_firmware_id_and_caps_unicode_without_splitting_it() {
+        let payload = Projection {
             board: "board",
             boot: "boot",
-            revision: 1,
-            phase,
-            text,
-            error: "",
-            failure_stage: FailureStage::Recognition,
-            draft_inserted: false,
+            capture: "p4-audio-123-4",
+            token: 7,
+            phase: "draft_ready",
+            revision: 2,
+            text: &format!("台\n{}", "语".repeat(200)),
+            inserted: true,
         }
+        .payload()
+        .unwrap();
+        assert_eq!(payload["captureId"], "p4-audio-123-4");
+        assert_eq!(payload["draftInserted"], true);
+        let text = payload["text"].as_str().unwrap();
+        assert!(text.len() <= TEXT_BYTES && text.ends_with('语'));
+        assert!(text.starts_with("台 "));
     }
 
     #[test]
-    fn unicode_is_bounded_and_errors_do_not_disclose_secrets() {
-        let text = "语".repeat(300);
-        let mut f = feedback("error", &text);
-        f.error = "多个窗口 PRIVATE_KEY";
-        f.failure_stage = FailureStage::Insertion;
-        let p = payload(f).unwrap();
-        assert!(p["text"].as_str().unwrap().len() <= 511);
-        assert!(p["text"].as_str().unwrap().ends_with('语'));
-        assert_eq!(p["hint"], "请保留目标主窗口");
-        assert!(!p.to_string().contains("PRIVATE_KEY"));
-    }
-
-    #[test]
-    fn unsupported_and_unbound_messages_are_not_sent() {
-        let mut f = feedback("partial", "text");
-        f.device_session_id = "";
-        assert!(payload(f).is_none());
-        assert!(payload(feedback("invented", "text")).is_none());
-    }
-
-    #[test]
-    fn a_draft_requires_an_insertion_acknowledgement() {
-        assert_eq!(
-            payload(feedback("draft_ready", "text")).unwrap()["draftInserted"],
-            false
-        );
-        let mut f = feedback("draft_ready", "text");
-        f.draft_inserted = true;
-        assert_eq!(payload(f).unwrap()["draftInserted"], true);
-    }
-
-    #[test]
-    fn wire_feedback_uses_the_firmware_session_and_confirmation_owner() {
+    fn admitted_pcm_begin_keeps_its_board_capture_id_for_feedback() {
         use crate::usb_audio::UsbAudioRelay;
 
-        let mut relay = UsbAudioRelay::default();
-        let board = "p4-test";
-        let boot = "0123456789abcdef";
-        let connection = "42";
-        let mut f = feedback("draft_ready", "测试");
-        let session_id = f.device_session_id;
-        assert_eq!(relay.configure_scoped(true, 50001, false, board, connection, boot)["ok"], true);
+        let mut audio = UsbAudioRelay::default();
+        let (board, boot, connection) = ("test-board", "0123456789abcdef", "42");
         let begin = json!({
-            "sessionId": session_id, "boardDeviceId": board, "format": "pcm_s16le",
-            "sampleRate": 16000, "channels": 1, "bitsPerSample": 16,
+            "sessionId": "p4-audio-123-4", "boardDeviceId": board, "voiceFeedbackToken": 7,
+            "format": "pcm_s16le", "sampleRate": 16000, "channels": 1, "bitsPerSample": 16,
         });
-        let event = relay.handle_scoped("audio/begin", &begin, board, connection, boot).unwrap();
-        assert_eq!(event["ok"], true);
-        assert_ne!(event["captureId"], session_id);
-        f.device_session_id = event["sessionId"].as_str().unwrap();
-        f.board = board;
-        f.boot = boot;
-        f.draft_inserted = true;
-        let wire = payload(f).unwrap();
-        assert_eq!(wire["captureId"], begin["sessionId"]);
-        assert_eq!(wire["utteranceId"], event["utteranceId"]);
-        assert_ne!(wire["captureId"], event["captureId"]);
-        assert_eq!(wire["draftInserted"], true);
-    }
-
-    #[test]
-    fn submission_failure_preserves_the_insertion_receipt() {
-        let mut f = feedback("error", "draft already in the editor");
-        f.failure_stage = FailureStage::Submission;
-        f.draft_inserted = true;
-        let p = payload(f).unwrap();
-        assert_eq!(p["draftInserted"], true);
-        assert_eq!(p["failureStage"], "submission");
-        assert!(p["hint"].as_str().unwrap().contains("发送失败"));
-        assert!(!p["hint"].as_str().unwrap().contains("未写入"));
-    }
-
-    #[test]
-    fn partial_text_is_not_an_insertion_or_final_recognition_receipt() {
-        let p = payload(feedback("error", "unfinished recognition")).unwrap();
-        assert_eq!(p["failureStage"], "recognition");
-        assert!(p["hint"].as_str().unwrap().starts_with("识别失败"));
-    }
-
-    #[test]
-    fn slow_consumer_retains_terminal_after_a_burst() {
-        let mailbox = Mailbox::new();
-        let epoch = mailbox.begin_capture();
-        for revision in 0..1000 {
-            assert!(mailbox.publish(epoch, revision, "partial", "partial"));
-        }
-        assert!(mailbox.publish(epoch, 999, "submitted", "submitted"));
-        assert!(!mailbox.publish(epoch, 1000, "partial", "stale"));
-        assert_eq!(mailbox.receive(), Some("submitted"));
-        assert!(!mailbox.publish(epoch, 1001, "error", "late error"));
-    }
-
-    #[test]
-    fn retired_captures_and_revisions_cannot_replace_a_new_result() {
-        let mailbox = Mailbox::new();
-        let old = mailbox.begin_capture();
-        assert!(mailbox.publish(old, 10, "draft_ready", "old draft"));
-        let current = mailbox.begin_capture();
-        assert!(!mailbox.publish(old, 11, "error", "old failure"));
-        assert!(mailbox.publish(current, 2, "partial", "current partial"));
-        assert!(!mailbox.publish(current, 1, "partial", "old revision"));
-        assert!(mailbox.publish(current, 2, "draft_ready", "current draft"));
-        assert!(!mailbox.publish(current, 3, "listening", "late ready"));
-        assert_eq!(mailbox.receive(), Some("current draft"));
-    }
-
-    #[test]
-    fn writer_does_not_own_the_mailbox_during_io() {
-        let mailbox = std::sync::Arc::new(Mailbox::new());
-        let epoch = mailbox.begin_capture();
-        let (entered, waiting) = std::sync::mpsc::channel();
-        let (release, resumed) = std::sync::mpsc::channel();
-        let worker_mailbox = mailbox.clone();
-        let writer = std::thread::spawn(move || {
-            assert_eq!(worker_mailbox.receive(), Some("partial"));
-            entered.send(()).unwrap();
-            resumed
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .unwrap(); // Simulates slow IO outside the lock.
-            assert_eq!(worker_mailbox.receive(), Some("submitted"));
-        });
-        assert!(mailbox.publish(epoch, 1, "partial", "partial"));
-        waiting
-            .recv_timeout(std::time::Duration::from_secs(2))
+        assert_eq!(
+            audio.configure_scoped(true, 50001, false, board, connection, boot)["ok"],
+            true
+        );
+        assert!(audio
+            .handle_scoped("audio/begin", &begin, board, "41", boot)
+            .is_none());
+        let event = audio
+            .handle_scoped("audio/begin", &begin, board, connection, boot)
             .unwrap();
-        assert!(mailbox.publish(epoch, 1, "submitted", "submitted"));
-        release.send(()).unwrap();
-        writer.join().unwrap();
+        assert_eq!(event["ok"], true);
+        let wire = Projection {
+            board,
+            boot,
+            capture: begin["sessionId"].as_str().unwrap(),
+            token: token(&begin["voiceFeedbackToken"]),
+            phase: "partial",
+            revision: 1,
+            text: "你好",
+            inserted: false,
+        }
+        .payload()
+        .unwrap();
+        assert_eq!(wire["captureId"], event["utteranceId"]);
+        assert_ne!(wire["captureId"], event["captureId"]);
+        assert_eq!(wire["token"], 7);
+    }
+
+    #[test]
+    fn mailbox_bounds_and_paces_wire_work_while_retaining_latest_terminal() {
+        let mailbox = Mailbox::new();
+        let old = mailbox.begin();
+        assert!(mailbox.publish(old, 1, "partial", "first"));
+        assert_eq!(mailbox.receive(), Some("first"));
+        let first = Instant::now();
+        assert!(mailbox.publish(old, 2, "draft_ready", "retired"));
+        let current = mailbox.begin();
+        assert!(!mailbox.publish(old, 3, "error", "old"));
+        for revision in 0..1000 {
+            assert!(mailbox.publish(current, revision, "partial", "partial"));
+        }
+        assert!(mailbox.publish(current, 999, "draft_ready", "draft"));
+        assert!(mailbox.publish(current, 999, "submitted", "terminal"));
+        assert!(!mailbox.publish(current, 1000, "error", "late failure"));
+        assert_eq!(mailbox.receive(), Some("terminal"));
+        assert!(first.elapsed() >= Duration::from_millis(140));
     }
 }

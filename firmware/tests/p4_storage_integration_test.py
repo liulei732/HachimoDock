@@ -93,6 +93,13 @@ int main(void) {
 def test_command_scope_and_suspension_integration_leave_render_cadence_unchanged():
     main = (ROOT / "main/pet_p4_main.c").read_text()
     worker = main.split("static void protocol_worker_task(", 1)[1].split("static bool consume_byte(", 1)[0]
+    # Alarm maintenance temporarily owns the state mutex before dequeue. It
+    # releases the storage lane on admission and the state mutex even on refusal.
+    alarm = worker.split("if (pet_local_alarm_work())", 1)[1].split("if (xQueueReceive", 1)[0]
+    assert alarm.count("xSemaphoreTake(g_state_mutex") == alarm.count("xSemaphoreGive(g_state_mutex)") == 1
+    assert alarm.index("xSemaphoreTake(g_state_mutex") < alarm.index("pet_p4_miniapp_storage_lane_enter()") < alarm.index("pet_local_alarm_run();")
+    assert alarm.index("pet_local_alarm_run();") < alarm.index("pet_p4_miniapp_storage_lane_leave()") < alarm.index("xSemaphoreGive(g_state_mutex)")
+    worker = worker.split("if (!handled_debug) {", 1)[1]
     assert worker.index("xSemaphoreTake(g_state_mutex") < worker.index("pet_p4_miniapp_storage_lane_enter()")
     assert worker.index("pet_p4_miniapp_storage_lane_enter()") < worker.index("pet_p4_handle_line(")
     assert worker.index("pet_p4_handle_line(") < worker.index("pet_p4_miniapp_storage_lane_leave()")
@@ -110,3 +117,72 @@ def test_command_scope_and_suspension_integration_leave_render_cadence_unchanged
     # Storage need not stop rendering or reduce it to the transfer UI's 500ms.
     assert "bool transfer_active = g_state.asset_transfer_active || firmware_transfer_active;" in main
     assert "&g_protocol_task" in main
+
+
+def test_alarm_maintenance_releases_only_locks_it_acquired(tmp_path):
+    main = (ROOT / "main/pet_p4_main.c").read_text()
+    worker = function(main, "protocol_worker_task")
+    # Compile the production pre-dequeue slice, including its feature guards.
+    end = worker.index("    if (xQueueReceive(g_protocol_queue")
+    start = worker.rindex("#if PET_P4_EVENTS", 0, end)
+    maintenance = worker[start:end]
+    source = r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#define PET_P4_EVENTS 1
+#define PET_P4_GAP_PEAK_HOLDER 1
+#define pdTRUE 1
+#define configASSERT assert
+static struct { bool asset_transfer_active, approval_active; } g_state;
+static int g_state_mutex = 1;
+static bool work, idle, available, admitted, held, lane, timed, ota, conversation;
+static unsigned runs, takes, gives, entries, leaves, spans;
+static uint64_t now = 1000;
+static uint32_t g_worker_locked_topic_hash;
+static uint32_t pet_topic_hash(const char *topic, unsigned n) { assert(topic && n); return 7; }
+static uint64_t esp_timer_get_time(void) { return now * 1000; }
+static bool pet_local_alarm_work(void) { return work; }
+static bool volume_worker_idle(void) { return idle; }
+static bool pet_p4_ota_active(void) { return ota; }
+static bool pet_p4_conversation_active(void *state) { assert(state == &g_state); return conversation; }
+static int xSemaphoreTake(int m, int wait) {
+  assert(m == 1 && !wait && !held); if (!available) return 0; ++takes; return held = true;
+}
+static void xSemaphoreGive(int m) { assert(m == 1 && held && !lane && !timed); ++gives; held = false; }
+static bool pet_p4_miniapp_storage_lane_enter(void) {
+  assert(held && !lane); ++entries; return lane = admitted;
+}
+static bool pet_p4_miniapp_storage_lane_leave(void) {
+  assert(held && lane); ++leaves; lane = false; return true;
+}
+static void worker_locked_begin(void) { assert(held && !timed && g_worker_locked_topic_hash == 7); timed = true; }
+static void worker_locked_end(void) { assert(held && timed); ++spans; timed = false; }
+static void pet_local_alarm_run(void) { assert(held && lane && timed); ++runs; }
+static void maintain(void) {
+""" + maintenance + r"""
+}
+static void step(void) {
+  now += 1000; maintain(); assert(!held && !lane && !timed && !g_worker_locked_topic_hash);
+  assert(takes == gives && gives == spans);
+}
+int main(void) {
+  idle = available = admitted = true; step(); assert(!takes);
+  work = true; idle = false; step(); assert(!takes);
+  idle = true; available = false; step(); assert(!takes);
+  available = true; g_state.asset_transfer_active = true; step();
+  g_state.asset_transfer_active = false; ota = true; step();
+  ota = false; conversation = true; step();
+  conversation = false; g_state.approval_active = true; step();
+  assert(takes == 4 && !entries && !runs && !leaves);
+  g_state.approval_active = false; admitted = false; step();
+  assert(takes == 5 && entries == 1 && !runs && !leaves);
+  admitted = true; step(); assert(takes == 6 && entries == 2 && runs == 1 && leaves == 1);
+  maintain(); assert(takes == 6 && gives == 6 && runs == 1);
+}
+"""
+    fixture = tmp_path / "alarm_maintenance.c"
+    fixture.write_text(source)
+    binary = fixture.with_suffix("")
+    subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", str(fixture), "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)

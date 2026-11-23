@@ -352,41 +352,65 @@ static void conditional_http(void) {
   assert(!pet_wifi_http_valid_etag("*") && !pet_wifi_http_valid_etag("\"x\"\r\nHost: invalid"));
 }
 
-static char persisted_feed[4096];
-static size_t persisted_feed_size;
-
+/* Only committed slots survive a simulated restart. */
+static struct record { char bytes[4096]; size_t length; } slots[2], pending_slot;
+static unsigned pending_index, writes;
+static bool fail_commit, fail_read, lost_commit_result;
+static unsigned key_index(const char *key) {
+  if (!strcmp(key, "feed_v1")) return 0;
+  assert(!strcmp(key, "feed2_v1"));
+  return 1;
+}
 int nvs_open(const char *name, int mode, nvs_handle_t *handle) {
   assert(!strcmp(name, "pet_wifi_cache"));
   *handle = mode;
   return ESP_OK;
 }
 void nvs_close(nvs_handle_t handle) { (void)handle; }
-int nvs_commit(nvs_handle_t handle) { return handle == NVS_READWRITE ? ESP_OK : -1; }
+int nvs_commit(nvs_handle_t handle) {
+  assert(handle == NVS_READWRITE);
+  if (fail_commit) return -1;
+  slots[pending_index] = pending_slot;
+  writes++;
+  return lost_commit_result ? -1 : ESP_OK;
+}
 int nvs_get_blob(nvs_handle_t handle, const char *key, void *bytes, size_t *length) {
-  assert(handle == NVS_READONLY && !strcmp(key, "feed_v1"));
-  if (!persisted_feed_size || (bytes && *length < persisted_feed_size)) return -1;
-  *length = persisted_feed_size;
-  if (bytes) memcpy(bytes, persisted_feed, *length);
+  (void)handle;
+  const struct record *record = &slots[key_index(key)];
+  if (fail_read) return -1;
+  if (!record->length) return ESP_ERR_NVS_NOT_FOUND;
+  if (bytes && *length < record->length) return -1;
+  *length = record->length;
+  if (bytes) memcpy(bytes, record->bytes, *length);
   return ESP_OK;
 }
 int nvs_set_blob(nvs_handle_t handle, const char *key, const void *bytes, size_t length) {
-  assert(handle == NVS_READWRITE && !strcmp(key, "feed_v1") && length <= sizeof(persisted_feed));
-  memcpy(persisted_feed, bytes, length);
-  persisted_feed_size = length;
+  assert(handle == NVS_READWRITE && length <= sizeof(pending_slot.bytes));
+  pending_index = key_index(key);
+  memcpy(pending_slot.bytes, bytes, length);
+  pending_slot.length = length;
   return ESP_OK;
 }
 
 static void feed_offline_cache(void) {
   const char *first = PET_WIFI_DATA_FEED_PREFIX "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const char *second = PET_WIFI_DATA_FEED_PREFIX "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  pet_wifi_feed_cache_t cache = {0};
+  const uint64_t utc = 1794384000000ULL, interval = 900000;
+  const char *third = PET_WIFI_DATA_FEED_PREFIX "cccccccccccccccccccccccccccccccc";
   const char body[] = "{\"schema\":1,\"status\":\"ok\",\"message\":\"\",\"rows\":["
     "{\"id\":\"1\",\"label\":\"Reading\",\"value\":\"1\",\"detail\":\"\",\"meta\":\"\",\"tone\":0}]}";
   cJSON *a = pet_wifi_feed_snapshot(first, body, strlen(body), NULL);
   cJSON *b = pet_wifi_feed_snapshot(second, body, strlen(body), NULL);
-  assert(a && b && !pet_wifi_data_cache_save(first, NULL, a)); /* Legacy/feed without opt-in. */
+  assert(a && b && !pet_wifi_data_cache_save_feed(&cache, first, a, 1000, utc)); /* Legacy/feed without opt-in. */
   cJSON_DeleteItemFromObjectCaseSensitive(a, "clearOnExpire");
   cJSON_DeleteItemFromObjectCaseSensitive(b, "clearOnExpire");
-  assert(pet_wifi_data_cache_save(first, NULL, a));
+  assert(pet_wifi_data_snapshot_date(a, utc));
+  /* Previous firmware left plain JSON in feed_v1, with no reservation. */
+  assert(cJSON_PrintPreallocated(a, slots[0].bytes, sizeof(slots[0].bytes), false));
+  slots[0].length = strlen(slots[0].bytes) + 1;
+  assert(pet_wifi_data_cache_restore(first, NULL, 1, 0));
+  assert(pet_wifi_data_cache_save_feed(&cache, first, a, 1000, utc));
   assert(!pet_wifi_data_cache_restore(second, NULL, 800, 0));
   assert(pet_p4_widget_data_apply_local(b, 800, 0));
   assert(pet_wifi_data_cache_restore(first, NULL, 900, 0));
@@ -400,8 +424,43 @@ static void feed_offline_cache(void) {
   assert(pet_p4_widget_data_revalidate_feed(first, 121001));
   pet_p4_widget_data_view(first, 0, 121002, &view);
   assert(!view.stale && !view.restored && view.count == 1);
-  assert(pet_wifi_data_cache_save(second, NULL, b)); /* Single shared slot, exact identity. */
-  assert(!pet_wifi_data_cache_restore(first, NULL, 121002, 0));
+  assert(!pet_wifi_data_cache_save_feed(&cache, first, a, 1000, utc + 1)); /* Per source. */
+  assert(pet_wifi_data_cache_save_feed(&cache, second, b, 1000, utc + 1));
+  cJSON *c = pet_wifi_feed_snapshot(third, body, strlen(body), NULL);
+  assert(c);
+  cJSON_DeleteItemFromObjectCaseSensitive(c, "clearOnExpire");
+  cache = (pet_wifi_feed_cache_t){0}; /* Cold worker, committed NVS survives. */
+  assert(!pet_wifi_data_cache_save_feed(&cache, third, c, 1000, utc + 2)); /* Global burst exhausted. */
+  assert(writes == 2);
+  pet_p4_widget_data_clear_feed(first);
+  assert(pet_wifi_data_cache_restore(second, NULL, 1, 0));
+  assert(pet_wifi_data_cache_restore(first, NULL, 2, 0));
+  pet_p4_widget_data_view(first, 0, 2, &view);
+  assert(view.restored && view.stale && !strcmp(view.date, "2026-11-11"));
+  assert(!pet_wifi_data_cache_restore(third, NULL, 3, 0));
+  /* Retry after I/O failures without consuming a token or evicting A. */
+  fail_commit = true;
+  assert(!pet_wifi_data_cache_save_feed(&cache, third, c, 1000, utc + interval));
+  fail_commit = false;
+  assert(!pet_wifi_data_cache_save_feed(&cache, third, c, 30999, utc + interval)); /* Retry backoff. */
+  fail_read = true;
+  assert(!pet_wifi_data_cache_save_feed(&cache, third, c, 31000, utc + interval));
+  fail_read = false;
+  pet_p4_widget_data_clear_feed(first);
+  assert(pet_wifi_data_cache_restore(first, NULL, 4, 0));
+  assert(pet_wifi_data_cache_save_feed(&cache, third, c, 61000, utc + interval));
+  assert(!pet_wifi_data_cache_restore(first, NULL, 5, 0));
+  assert(pet_wifi_data_cache_restore(second, NULL, 6, 0));
+  assert(pet_wifi_data_cache_restore(third, NULL, 7, 0));
+  assert(writes == 3);
+  /* A durable record whose commit result was lost must consume its token. */
+  lost_commit_result = true;
+  assert(!pet_wifi_data_cache_save_feed(&cache, first, a, 62000, utc + 2 * interval));
+  lost_commit_result = false;
+  cache = (pet_wifi_feed_cache_t){0};
+  assert(!pet_wifi_data_cache_save_feed(&cache, second, b, 1, utc + 2 * interval + 1));
+  assert(writes == 4 && pet_wifi_data_cache_restore(first, NULL, 8, 0));
+  cJSON_Delete(c);
   cJSON_Delete(a);
   cJSON_Delete(b);
 }

@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "bsp/esp32_p4_wifi6_touch_lcd_4_3.h"
+#include "bsp/display.h"
 #include "cJSON.h"
 #include "driver/i2c_master.h"
 #include "esp_lcd_panel_io.h"
@@ -22,8 +23,10 @@
 #include "pet_p4_miniapp.h"
 #include "pet_p4_center_layout.h"
 #include "pet_p4_touch_core.h"
+#include "pet_p4_cst328.h"
 
 #define PET_P4_TOUCH_SAMPLE_MS 15
+#define PET_P4_CST328_SAMPLE_MS 2
 #define PET_P4_TOUCH_SWIPE_THRESHOLD 48
 #define PET_P4_TOUCH_LONG_PRESS_MS 700ULL
 #define PET_P4_TOUCH_QUEUE_LENGTH 32
@@ -44,8 +47,14 @@ static esp_err_t g_probe_15 = ESP_ERR_INVALID_STATE, g_probe_38 = ESP_ERR_INVALI
 static int g_address;
 static bool g_ft6336;
 static bool g_cst826;
+#if BSP_LCD_PANEL_AUTO
+static pet_cst328_info_t g_cst328_info;
+#endif
 static uint8_t g_chip_id, g_vendor_id;
 const char *pet_p4_touch_controller(void) {
+#if BSP_LCD_PANEL_AUTO
+  if (g_address == PET_CST328_ADDRESS) return "CST328";
+#endif
   return g_cst826 ? "CST826" : g_ft6336 ? "FT6336U" : g_touch ? "GT911" : "unidentified";
 }
 static atomic_uint g_samples, g_contacts, g_poll_errors, g_consecutive_errors;
@@ -71,7 +80,12 @@ void pet_p4_touch_health(pet_p4_touch_health_t *out) {
     .stage = g_init_stage, .error = g_init_error, .address = g_address,
     .primary_error = g_primary_error, .backup_error = g_backup_error,
     .probe_15 = g_probe_15, .probe_38 = g_probe_38, .probe_10 = g_probe_10, .probe_18 = g_probe_18,
+#if BSP_LCD_PANEL_AUTO
+    .chip_id = g_address == PET_CST328_ADDRESS ? g_cst328_info.chip_id : g_chip_id,
+    .vendor_id = g_address == PET_CST328_ADDRESS ? g_cst328_info.project_id : g_vendor_id,
+#else
     .chip_id = g_chip_id, .vendor_id = g_vendor_id,
+#endif
     .samples = atomic_load(&g_samples), .contacts = atomic_load(&g_contacts),
     .poll_errors = atomic_load(&g_poll_errors),
     .consecutive_errors = atomic_load(&g_consecutive_errors),
@@ -106,6 +120,13 @@ static void touch_task(void *arg) {
   int track_id = -1;
   TickType_t last_wake = xTaskGetTickCount();
   unsigned int consecutive_errors = 0;
+  TickType_t sample_period = pdMS_TO_TICKS(PET_P4_TOUCH_SAMPLE_MS);
+#if BSP_LCD_PANEL_AUTO
+  const bool nv3049 = g_address == PET_CST328_ADDRESS;
+  if (nv3049) sample_period = pdMS_TO_TICKS(PET_P4_CST328_SAMPLE_MS);
+  const uint64_t cst_release_timeout_ms = 100;
+  uint64_t cst_last_contact_ms = 0;
+#endif
   pet_p4_touch_decoder_init(&decoder, PET_P4_TOUCH_SWIPE_THRESHOLD, PET_P4_TOUCH_LONG_PRESS_MS);
 
   while (true) {
@@ -114,6 +135,35 @@ static void touch_task(void *arg) {
     bool contact_ambiguous = false;
     int ui_x = decoder.current_x;
     int ui_y = decoder.current_y;
+#if BSP_LCD_PANEL_AUTO
+    if (nv3049) {
+      pet_cst328_sample_t frame;
+      err = pet_cst328_read(&frame);
+      if (err == ESP_OK && !frame.fresh) {
+        // An ACK is not a finger-up. Cancel a stale stroke if the release was lost.
+        contact_ambiguous = pointer.down && monotonic_ms() - cst_last_contact_ms >= cst_release_timeout_ms;
+        if (!contact_ambiguous) {
+          atomic_fetch_add(&g_samples, 1);
+          consecutive_errors = 0;
+          atomic_store(&g_consecutive_errors, 0);
+          vTaskDelayUntil(&last_wake, sample_period);
+          continue;
+        }
+      }
+      if (err == ESP_OK && frame.fresh) {
+        contact_ambiguous = frame.count > 1;
+        pressed = frame.count == 1 && frame.down;
+        if (pressed) {
+          contact_ambiguous = pointer.down && track_id != frame.id;
+          track_id = frame.id;
+          cst_last_contact_ms = monotonic_ms();
+          if (!pet_p4_touch_cst328_to_ui(frame.x, frame.y, g_cst328_info.x_resolution,
+              g_cst328_info.y_resolution, &ui_x, &ui_y)) err = ESP_ERR_INVALID_RESPONSE;
+          atomic_store(&g_panel_x, frame.x); atomic_store(&g_panel_y, frame.y);
+        }
+      }
+    } else
+#endif
     if (g_ft6336 || g_cst826) {
       uint8_t raw[13]; pet_p4_ft6336_frame_t frame;
       err = esp_lcd_panel_io_rx_param(g_touch_io, 0x02, raw, sizeof(raw));
@@ -155,7 +205,7 @@ static void touch_task(void *arg) {
         ESP_LOGW(TAG, "%s poll failed count=%u error=%s",
                  pet_p4_touch_controller(), consecutive_errors, esp_err_to_name(err));
       }
-      vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(PET_P4_TOUCH_SAMPLE_MS));
+      vTaskDelayUntil(&last_wake, sample_period);
       continue;
     }
     consecutive_errors = 0;
@@ -171,7 +221,7 @@ static void touch_task(void *arg) {
     if (contact_ambiguous) {
       pet_p4_touch_decoder_init(&decoder, PET_P4_TOUCH_SWIPE_THRESHOLD, PET_P4_TOUCH_LONG_PRESS_MS);
       queue_sample(&sample, &decoder, &pointer);
-      vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(PET_P4_TOUCH_SAMPLE_MS));
+      vTaskDelayUntil(&last_wake, sample_period);
       continue;
     }
     if (sample.has_pointer && sample.pointer.kind == PET_P4_POINTER_CANCEL)
@@ -187,7 +237,7 @@ static void touch_task(void *arg) {
       sample.has_gesture = pet_p4_touch_decoder_update(&decoder, pressed, ui_x, ui_y, now, &sample.gesture);
     }
     queue_sample(&sample, &decoder, &pointer);
-    vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(PET_P4_TOUCH_SAMPLE_MS));
+    vTaskDelayUntil(&last_wake, sample_period);
   }
 }
 
@@ -220,19 +270,10 @@ static esp_err_t identify_register_touch(void) {
   return err;
 }
 
-#if PET_P4_COLD_INIT_SIZE && defined(__GNUC__) && !defined(__clang__)
-__attribute__((noinline, optimize("Oz")))
-#endif
-esp_err_t pet_p4_touch_init(void) {
-  if (g_ready) return ESP_OK;
+static esp_err_t configure_legacy_touch(i2c_master_bus_handle_t i2c_bus) {
+  esp_err_t err = ESP_OK;
   g_address = 0;
   g_cst826 = g_ft6336 = false;
-  g_init_stage = "i2c_init";
-  esp_err_t err = bsp_i2c_init();
-  if (err != ESP_OK) { g_init_error = err; return err; }
-  i2c_master_bus_handle_t i2c_bus = bsp_i2c_get_handle();
-  if (!i2c_bus) { g_init_error = ESP_ERR_INVALID_STATE; return g_init_error; }
-
   esp_lcd_panel_io_i2c_config_t io_config = ESP_LCD_TOUCH_IO_I2C_GT911_CONFIG();
   g_init_stage = "probe";
   g_primary_error = g_backup_error = ESP_ERR_NOT_FOUND;
@@ -305,24 +346,84 @@ esp_err_t pet_p4_touch_init(void) {
     g_init_error = err; return err;
   }
 
+  return ESP_OK;
+}
+
+#if BSP_LCD_PANEL_AUTO
+bool pet_p4_touch_try_nv3049(void) {
+  if (bsp_i2c_init() != ESP_OK) return false;
+  i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+  if (!bus || i2c_master_probe(bus, PET_CST328_ADDRESS, 20) != ESP_OK) return false;
+
+  // The legacy LCD path is independent of touch, including a stuck I2C bus.
+  // Only this address is probed early; no reset GPIO or bus recovery is driven.
+  esp_err_t err = pet_cst328_init(bus, &g_cst328_info);
+  if (err != ESP_OK) {
+    pet_cst328_deinit();
+    ESP_LOGW(TAG, "No verified NV3049F touch identity: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  g_address = PET_CST328_ADDRESS;
+  ESP_LOGI(TAG, "Panel NV3049F identified via CST328 chip=0x%04x project=0x%04x",
+           g_cst328_info.chip_id, g_cst328_info.project_id);
+  return true;
+}
+#endif
+
+#if PET_P4_COLD_INIT_SIZE && defined(__GNUC__) && !defined(__clang__)
+__attribute__((noinline, optimize("Oz")))
+#endif
+esp_err_t pet_p4_touch_init(void) {
+  if (g_ready) return ESP_OK;
+#if BSP_LCD_PANEL_AUTO
+  if (g_address != PET_CST328_ADDRESS)
+#endif
+  {
+    g_init_stage = "i2c_init";
+    esp_err_t err = bsp_i2c_init();
+    if (err != ESP_OK) return g_init_error = err;
+    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+    if (!bus) return g_init_error = ESP_ERR_INVALID_STATE;
+    err = configure_legacy_touch(bus);
+    if (err != ESP_OK) return g_init_error = err;
+  }
   g_init_stage = "queue";
   g_touch_queue = xQueueCreate(PET_P4_TOUCH_QUEUE_LENGTH, sizeof(touch_sample_t));
   if (!g_touch_queue) goto no_memory;
   g_init_stage = "task";
-  if (xTaskCreate(touch_task, "pet_p4_touch", 4096, NULL, 8, NULL) != pdPASS) {
+#if BSP_LCD_PANEL_AUTO
+  BaseType_t task_created = g_address == PET_CST328_ADDRESS
+    ? xTaskCreatePinnedToCore(touch_task, "pet_p4_touch", 4096, NULL, 8, NULL, 1)
+    : xTaskCreate(touch_task, "pet_p4_touch", 4096, NULL, 8, NULL);
+#else
+  BaseType_t task_created = xTaskCreate(touch_task, "pet_p4_touch", 4096, NULL, 8, NULL);
+#endif
+  if (task_created != pdPASS) {
     vQueueDelete(g_touch_queue);
     g_touch_queue = NULL;
     goto no_memory;
   }
   g_ready = true;
   g_init_stage = "ready"; g_init_error = ESP_OK;
+#if BSP_LCD_PANEL_AUTO
+  if (g_address == PET_CST328_ADDRESS) {
+    ESP_LOGI(TAG, "CST328 ready addr=0x%02x raw=%ux%u sample=%dms", g_address,
+             g_cst328_info.x_resolution, g_cst328_info.y_resolution, PET_P4_CST328_SAMPLE_MS);
+  } else
+#endif
   ESP_LOGI(TAG, "%s ready addr=0x%02x chip=0x%02x reset=disabled sample=%dms",
-           pet_p4_touch_controller(), io_config.dev_addr, g_chip_id, PET_P4_TOUCH_SAMPLE_MS);
+           pet_p4_touch_controller(), g_address, g_chip_id, PET_P4_TOUCH_SAMPLE_MS);
   return ESP_OK;
 no_memory:
   if (g_touch) esp_lcd_touch_del(g_touch);
   g_touch = NULL; g_ft6336 = false;
-  esp_lcd_panel_io_del(g_touch_io); g_touch_io = NULL;
+  if (g_touch_io) esp_lcd_panel_io_del(g_touch_io);
+  g_touch_io = NULL;
+#if BSP_LCD_PANEL_AUTO
+  pet_cst328_deinit();
+  g_address = 0;
+#endif
   g_init_error = ESP_ERR_NO_MEM;
   return g_init_error;
 }
@@ -459,6 +560,19 @@ static void process_touch_event(
     return;
   }
 #endif
+#if PET_P4_EVENTS
+  if (state && !strcmp(state->screen_page, PET_ALARM_PAGE)) {
+    if (event->gesture == PET_P4_TOUCH_TAP && !pet_p4_state_approval_pending(state,event->ts_ms)) {
+      if (event->y < 64 && event->x < 140) strcpy(state->screen_page,"app");
+      if (event->x >= 24 && event->x < 616 && event->y >= 434 && event->y < 480)
+        pet_local_program_toggle();
+      if (event->x >= 24 && event->x < 616 && event->y >= 266 && event->y < 434)
+        pet_local_alarm_choose(PET_ALARM_ALERT - (event->y - 266) / 56);
+      state->last_update_ms = event->ts_ms;
+    }
+    return;
+  }
+#endif
   bool handled_locally = false;
   char action[PET_P4_MINIAPP_ACTION_MAX] = {0};
   if(state&&!strcmp(state->screen_page,"components")) {
@@ -561,6 +675,25 @@ void pet_p4_touch_process(
       && pet_p4_miniapp_slicing_active();
     bool application = state && !pet_p4_conversation_active(state) && !strcmp(state->screen_page,"app")
       && pet_p4_miniapp_pointer_active();
+#if PET_P4_EVENTS
+    static bool alarm_stroke;
+    if (sample.has_pointer && sample.pointer.kind == PET_P4_POINTER_DOWN)
+      alarm_stroke = state && !strcmp(state->screen_page,"app") &&
+        pet_alarm_button_hit(sample.pointer.x,sample.pointer.y) && !pet_p4_conversation_active(state) &&
+        !pet_p4_state_approval_pending(state,sample.pointer.ts_ms) && pet_local_alarm_view(NULL);
+    if (alarm_stroke) {
+      if (sample.has_gesture && sample.gesture.gesture == PET_P4_TOUCH_TAP &&
+          pet_alarm_button_hit(sample.gesture.x,sample.gesture.y) && state &&
+          !strcmp(state->screen_page,"app") && !pet_p4_conversation_active(state) &&
+          !pet_p4_state_approval_pending(state,sample.gesture.ts_ms) && pet_local_alarm_open()) {
+        strcpy(state->screen_page,PET_ALARM_PAGE);
+        state->last_update_ms = sample.gesture.ts_ms;
+      }
+      if (sample.has_pointer && (sample.pointer.kind == PET_P4_POINTER_UP ||
+                                 sample.pointer.kind == PET_P4_POINTER_CANCEL)) alarm_stroke = false;
+      continue;
+    }
+#endif
 #if PET_P4_SYSTEM_WIFI
     if (sample.has_pointer && sample.pointer.kind == PET_P4_POINTER_DOWN) {
       g_account_stroke = state && !strcmp(state->screen_page, "app") &&

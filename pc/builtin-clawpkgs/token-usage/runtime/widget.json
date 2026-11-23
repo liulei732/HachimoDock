@@ -8,7 +8,7 @@
     },
     "headline_text": {
       "type": "string",
-      "init": "等待今日统计"
+      "init": "等待用量统计"
     },
     "total_display": {
       "type": "string",
@@ -477,7 +477,7 @@
         "h": 24,
         "color": 42393,
         "font_size": 14,
-        "text": "摇杆右输出"
+        "text": "左右翻页"
       },
       {
         "type": "text",

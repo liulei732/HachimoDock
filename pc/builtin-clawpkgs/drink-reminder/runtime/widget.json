@@ -150,7 +150,7 @@
       }
     },
     "badge": {
-      "var": "drink_count_today"
+      "var": "interval_min"
     },
     "note": {
       "switch_page": {
@@ -159,11 +159,6 @@
       }
     },
     "footer": "主键记录  副键暂停/恢复  摇杆右切换  全局键退出",
-    "progress": {
-      "pct_of": "remaining_min",
-      "of_max": "interval_min",
-      "label": "距提醒"
-    },
     "visualStyle": "clean",
     "visualPalette": "ocean",
     "visualLayout": "tool",
@@ -350,23 +345,24 @@
         "page": 1
       },
       {
-        "type": "panel",
+        "type": "text",
         "x": 30,
-        "y": 330,
-        "w": 192,
-        "h": 5,
-        "color": 55035,
-        "radius": 2
+        "y": 318,
+        "w": 162,
+        "h": 24,
+        "color": 19342,
+        "font_size": 16,
+        "text": "下次间隔（分钟）"
       },
       {
-        "type": "meter",
-        "x": 30,
-        "y": 330,
-        "w": 192,
-        "h": 5,
-        "color": 13265,
-        "bind": "progress",
-        "page": 0
+        "type": "text",
+        "x": 194,
+        "y": 318,
+        "w": 60,
+        "h": 24,
+        "color": 19342,
+        "font_size": 16,
+        "bind": "badge"
       },
       {
         "type": "text",

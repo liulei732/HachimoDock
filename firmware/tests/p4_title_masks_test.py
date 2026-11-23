@@ -19,12 +19,12 @@ def title_frame(title='标题', now=10, lan=False, alpha=8, **kwargs):
             for i, (p, s) in enumerate(zip(packets, send(packets)))]
 
 
-def shown(title='标题', body='正文', now=0, pending=False, mask=False, body_pending=False,
+def shown(title='标题', body='正文', now=0, pending=False, mask=False,
           body_mask=False, body_exact=False):
     return [select(title, body, now=now, owner='visible', hold=True),
             {'titleState': {'pending': pending, 'mask': mask}},
-            {'titleDraw': {'localCalls': int(not (pending or mask))}},
-            {'bodyState': {'pending': body_pending, 'mask': body_mask, 'exact': body_exact}},
+            {'titleDraw': {'localCalls': int(not mask)}},
+            {'bodyState': {'pending': False, 'mask': body_mask, 'exact': body_exact}},
             {'drawHeld': {'style': 1, 'ok': mask, 'first': (14 << 11) | (29 << 5) | 14}},
             {'release': True}]
 
@@ -34,17 +34,17 @@ def test_title_first_gray_frame_is_independent_of_missing_and_updating_body(rend
     commands = [{'localFonts': True}, manifest(lan=lan)]
     if lan:
         commands += [request({'phase': 'capabilities'}, reply={'ok': True, 'titleMasks': True})]
-    commands += shown(now=1, pending=True, body_pending=True)
+    commands += shown(now=1, pending=True)
     commands += title_frame(now=10, lan=lan)
-    commands += shown(now=100, mask=True, body_pending=True)
+    commands += shown(now=100, mask=True)
     commands += [manifest(body='更新正文', now=120, lan=lan)]
-    commands += shown(body='更新正文', now=130, mask=True, body_pending=True)
+    commands += shown(body='更新正文', now=130, mask=True)
     commands += body_frame(4, '更新正文', 150, lan=lan)
     commands += shown(body='更新正文', now=180, mask=True, body_mask=True, body_exact=True)
     renderer_receiver(commands)
 
 
-def test_body_arrives_first_without_revealing_a_local_title(renderer_receiver):
+def test_body_arrives_first_while_local_title_is_visible(renderer_receiver):
     renderer_receiver([{'localFonts': True}, manifest(),
         *body_frame(4, '正文', 10),
         *shown(now=100, pending=True, body_mask=True, body_exact=True),
@@ -52,11 +52,11 @@ def test_body_arrives_first_without_revealing_a_local_title(renderer_receiver):
         *shown(now=150, mask=True, body_mask=True, body_exact=True)])
 
 
-def test_managed_title_never_flashes_local_during_slow_delivery_and_body_partials(renderer_receiver):
-    commands = [{'localFonts': True}, manifest(), *shown(now=100, pending=True, body_pending=True)]
+def test_managed_title_remains_readable_during_slow_delivery_and_body_partials(renderer_receiver):
+    commands = [{'localFonts': True}, manifest(), *shown(now=100, pending=True)]
     for i in range(1, 8):
         commands += [manifest(body=str(i), now=100+i*300)]
-        commands += shown(body=str(i), now=100+i*300, pending=True, body_pending=True)
+        commands += shown(body=str(i), now=100+i*300, pending=True)
     for now in range(2600, 20000, 400):
         commands += shown(body='7', now=now, pending=True)
     commands += title_frame(now=20000)
@@ -64,14 +64,14 @@ def test_managed_title_never_flashes_local_during_slow_delivery_and_body_partial
     renderer_receiver(commands)
 
 
-def test_new_title_never_draws_old_title_or_flashes_local_after_delay(renderer_receiver):
-    commands = [{'localFonts': True}, manifest(), *title_frame(), *shown(now=100, mask=True, body_pending=True)]
+def test_new_title_immediately_replaces_old_title(renderer_receiver):
+    commands = [{'localFonts': True}, manifest(), *title_frame(), *shown(now=100, mask=True)]
     for i in range(1, 8):
         commands += [manifest(title=str(i), now=100+i*300)]
-        commands += shown(title=str(i), now=100+i*300, pending=True, body_pending=True)
-    commands += shown(title='7', now=2900, pending=True, body_pending=True)
+        commands += shown(title=str(i), now=100+i*300, pending=True)
+    commands += shown(title='7', now=2900, pending=True)
     commands += title_frame('7', now=3000)
-    commands += shown(title='7', now=3100, mask=True, body_pending=True)
+    commands += shown(title='7', now=3100, mask=True)
     renderer_receiver(commands)
 
 
@@ -115,29 +115,43 @@ def test_title_need_reuses_page_protocol_and_only_current_owners(renderer_receiv
         {'need': {'now': 800, 'ok': False}}])
 
 
-def test_renderer_suppresses_local_title_in_both_card_paths_and_advertises_usb_capability():
+def test_renderer_allows_local_title_in_both_card_paths_and_advertises_usb_capability():
     renderer = (ROOT/'main/pet_p4_renderer.c').read_text()
     for name in ('draw_bubble', 'draw_session_queue_uncached'):
         assert 'draw_bubble_card_title(&text' in function(renderer, name)
-    assert 'if (view->title_pending) return;' in function(renderer, 'draw_bubble_card_title')
-    assert '"bubbleTitleMasks", true' in (ROOT/'main/pet_p4_protocol.c').read_text()
+    assert 'if (view->title_pending) return;' not in function(renderer, 'draw_bubble_card_title')
+    assert '"bubbleTitleMasks", !pet_shared_font_ready()' in (ROOT/'main/pet_p4_protocol.c').read_text()
 
 
-def test_dropped_title_chunks_do_not_reveal_local_title_before_fresh_complete_transfer(renderer_receiver):
+def test_dropped_title_chunks_keep_local_title_visible_until_fresh_complete_transfer(renderer_receiver):
     packets = transfer('标题', solid(1, 8), style=1)
-    renderer_receiver([{'localFonts': True}, manifest(), *shown(now=10, pending=True, body_pending=True),
+    renderer_receiver([{'localFonts': True}, manifest(), *shown(now=10, pending=True),
         *[{**p, 'now': 20+i} for i, p in enumerate(send(packets[:2]))],
         {'maintain': {'now': 4000}}, {'payload': packets[2], 'ok': False, 'now': 4001},
         *shown(now=4002, pending=True), *shown(now=8000, pending=True),
         *title_frame(now=8100, transfer='c'*32), *shown(now=8200, mask=True)])
 
 
-def test_unmanaged_or_offline_title_is_local_even_if_the_same_mask_is_cached(renderer_receiver):
+def test_cached_title_survives_manifest_gap_until_peer_retirement(renderer_receiver):
     empty = manifest(now=110); empty['desire']['textPixels']['owners'] = []
     renderer_receiver([{'localFonts': True}, manifest(), *title_frame(),
-        *shown(now=100, mask=True, body_pending=True), empty, *shown(now=120),
+        *shown(now=100, mask=True), empty, *shown(now=120, mask=True),
         manifest(now=130), *shown(now=140, mask=True),
         {'desire': {}}, *shown(now=150)])
+
+
+@pytest.mark.parametrize('lan', [False, True])
+def test_cached_title_stays_stable_across_same_peer_manifest_gap(renderer_receiver, lan):
+    owned = manifest(body='', lan=lan)
+    unowned = manifest(body='', now=110, lan=lan)
+    unowned['desire']['textPixels']['owners'] = []
+    renderer_receiver([{'localFonts': True}, owned, *title_frame(lan=lan),
+        *shown(body='', now=100, mask=True), {'revisionChanged': True},
+        unowned, *shown(body='', now=120, mask=True), {'revisionChanged': False},
+        *shown(body='', now=125, mask=True), {'revisionChanged': False},
+        manifest(body='', now=130, lan=lan), *shown(body='', now=140, mask=True),
+        {'revisionChanged': False}, *shown(body='', now=145, mask=True),
+        {'revisionChanged': False}])
 
 
 def test_conversation_hold_allows_managed_title_need_and_frame_but_not_legacy_page(renderer_receiver):
@@ -168,5 +182,5 @@ def test_title_only_negotiation_does_not_block_legacy_body_page(renderer_receive
     m = manifest(); m['desire']['textPixels'].update(bodyMasks=False, glyphCells=False)
     renderer_receiver([m, *send(transfer('正文')),
         select('标题', '正文', now=100, owner='visible', pixels=True, hold=True),
-        {'titleState': {'pending': True}}, {'titleDraw': {'localCalls': 0}},
+        {'titleState': {'pending': True}}, {'titleDraw': {'localCalls': 1}},
         {'bodyDraw': {'localCalls': 0}}, {'release': True}])

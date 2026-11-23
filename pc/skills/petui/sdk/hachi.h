@@ -72,6 +72,17 @@ HACHI_IMPORT(uv_read) int hachi_uv_read(hachi_snapshot_t *out);
 /* A fresh unsigned value from the host, for games and visual effects. */
 HACHI_IMPORT(random_u32) uint32_t hachi_random_u32(void);
 
+/* component-network-v1: bounded asynchronous services. See component-network.md.
+ * Submit up to 8192 JSON bytes. Poll <=512 bytes, read <=4096 bytes per call.
+ * Release response handles after use. hachi_service_read reads response payloads;
+ * credential.get returns presence status and zero bytes. At most 8 calls per entry.
+ * Errors are negative; 0 from poll means no event. No network occurs in previews
+ * and service calls return unavailable in the browser preview. */
+HACHI_IMPORT(service_submit) int hachi_service_submit(const char *,unsigned);
+HACHI_IMPORT(service_poll) int hachi_service_poll(char *,unsigned);
+HACHI_IMPORT(service_read) int hachi_service_read(unsigned,unsigned,void *,unsigned);
+HACHI_IMPORT(service_release) int hachi_service_release(unsigned);
+
 HACHI_IMPORT(media_cmd) void hachi_media_cmd(int command);
 
 HACHI_EXPORT(hachi_init) void hachi_init(void);

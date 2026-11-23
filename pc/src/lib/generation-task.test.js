@@ -9,6 +9,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
+import { loadGenerationTaskFixture } from "../../tests/generation-task-fixture.js";
 import { recordDiagnostic } from "./avatar-pipeline/diagnostics.js";
 import { publicGenerationConfig, generationSessionNeedsProtection, summarizeGenerationSession, canAutoResume } from "./avatar-pipeline/session.js";
 import {
@@ -17,7 +18,6 @@ import {
 } from "./generation-task.js";
 
 test('automatic task saves every clip, converts once, and conversion-only recovery makes no model calls',async()=>{
-  const source=readFileSync(new URL('./generation-task.js',import.meta.url),'utf8').replace(/^import .*;\n/gm,'').replace(/^export /gm,'');
   let stored, runs=0, saves=0, replacements=0, conversions=0, failConversion=true;
   const entries=Array.from({length:11},(_,i)=>({family:`fixture-${i}`,prompt:'fixture'}));
   const context=vm.createContext({recordDiagnostic,publicGenerationConfig,generationSessionNeedsProtection,summarizeGenerationSession,canAutoResume,clearTimeout,setTimeout,
@@ -26,7 +26,6 @@ test('automatic task saves every clip, converts once, and conversion-only recove
     saveAppearance:async data=>{assert.equal(data.deferPreparation,true);saves++;return {id:'saved'};},
     replaceFamilyVideo:async data=>{assert.equal(data.deferPreparation,true);replacements++;},
     prepareSavedAppearance:async()=>{conversions++;if(failConversion)throw Error('fixture conversion failed');},
-    getVolcanoInputImageRejection:()=>null,getArkImageEditPolicyRejection:()=>null,
     runAvatarPipeline:async options=>{
       runs++;assert.equal(options.automatic,true);assert.equal(options.confirmReference,undefined);assert.equal(options.confirmTrial,undefined);
       assert.equal(options.styleDescription,'水彩风格');assert.equal(options.session.reference.dataUrl,'data:image/png;base64,AQ==');
@@ -37,7 +36,7 @@ test('automatic task saves every clip, converts once, and conversion-only recove
       return {families};
     },
   });
-  vm.runInContext(source+'\nthis.api={run:async(input)=>{activeController=new AbortController();return runTask(input);},getGenerationTask};',context);
+  loadGenerationTaskFixture(context, '\nglobalThis.api={run:async(input)=>{activeController=new AbortController();return runTask(input);},getGenerationTask};');
   const input={providerConfig:{provider:'volcengine'},appearanceName:'fixture',styleDescription:'水彩风格',referencePreview:{bytes:new Uint8Array([1]),dataUrl:'data:image/png;base64,AQ=='}};
   await context.api.run(input);
   assert.equal(runs,1);assert.equal(saves,1);assert.equal(replacements,10);assert.equal(conversions,1);
@@ -56,16 +55,14 @@ test('automatic task saves every clip, converts once, and conversion-only recove
 });
 
 test("failed preprocessing releases durable task lock and a fresh request reaches the pipeline", async () => {
-  const source=readFileSync(new URL('./generation-task.js',import.meta.url),'utf8').replace(/^import .*;\n/gm,'').replace(/^export /gm,'');
   let stored={id:'legacy',imageIntent:true,actions:{}}; let runs=0; const archived=[];
   const context=vm.createContext({recordDiagnostic,publicGenerationConfig,generationSessionNeedsProtection,summarizeGenerationSession,canAutoResume,clearTimeout,setTimeout,
     crypto:{randomUUID:()=>`fresh-${runs}`},AbortController,
     loadGenerationSession:async()=>stored,saveGenerationSession:async s=>{stored=structuredClone(s);},
     beginGenerationSession:async s=>{archived.push(structuredClone(stored));stored=structuredClone(s);},
     runAvatarPipeline:async()=>{runs++;throw Error('fixture preprocessing failure');},
-    getVolcanoInputImageRejection:()=>null,getArkImageEditPolicyRejection:()=>null,
   });
-  vm.runInContext(source+'\nthis.api={run:async(input)=>{activeController=new AbortController();return runTask(input);},getGenerationTask};',context);
+  loadGenerationTaskFixture(context, '\nglobalThis.api={run:async(input)=>{activeController=new AbortController();return runTask(input);},getGenerationTask};');
   const input={appearanceName:'new',providerConfig:{provider:'volcengine'},skipProcessing:true};
   await context.api.run(input);
   assert.equal(runs,1);assert.equal(stored.dismissed,true);assert.equal(stored.terminalFailure,true);
@@ -88,12 +85,34 @@ test("wizard defaults to full subject cleaning and warns before explicit origina
   assert.doesNotMatch(source,/云端不可用时会保留原图继续生成/);
 });
 
+test("checkpoint read failure is visible and retry shares a single read without resubmission", async () => {
+  let reads = 0, resolveRead;
+  const context = vm.createContext({recordDiagnostic, summarizeGenerationSession, canAutoResume, clearTimeout,
+    setTimeout: () => assert.fail("a read retry must not schedule cloud work"),
+    loadGenerationSession: async () => {
+      if (++reads === 1) throw Error("temporary read failure");
+      return new Promise(resolve => { resolveRead = resolve; });
+    },
+  });
+  const api = loadGenerationTaskFixture(context, "globalThis.api={initializeGenerationRecovery,getGenerationTask};");
+  await api.initializeGenerationRecovery();
+  assert.equal(api.getGenerationTask().recoveryReadError, "temporary read failure");
+  const retry = api.initializeGenerationRecovery();
+  assert.equal(retry, api.initializeGenerationRecovery());
+  resolveRead({appearanceName:"原任务",automatic:true,actions:{welcome:{videoBytes:new Uint8Array([1])}}});
+  await retry;
+  assert.equal(api.getGenerationTask().progress.completed, 1);
+  assert.equal(api.getGenerationTask().appearanceName, "原任务");
+  assert.equal(api.getGenerationTask().recoveryReadError, "");
+  await api.initializeGenerationRecovery();
+  assert.equal(reads, 2);
+});
+
 test("restart restores saved trial progress without fabricating failure or paid work",async()=>{
-  const source=readFileSync(new URL('./generation-task.js',import.meta.url),'utf8').replace(/^import .*;\n/gm,'').replace(/^export /gm,'');
   const stored={appearanceName:'2',appearanceId:'saved',skipProcessing:true,createdAt:123,
     actions:{welcome:{videoBytes:new Uint8Array([1,2])}}};
   const context=vm.createContext({recordDiagnostic,summarizeGenerationSession,canAutoResume,clearTimeout,setTimeout,loadGenerationSession:async()=>stored});
-  vm.runInContext(source+'\nthis.api={initializeGenerationRecovery,getGenerationTask,acknowledgeGenerationTask};',context);
+  loadGenerationTaskFixture(context, '\nglobalThis.api={initializeGenerationRecovery,getGenerationTask,acknowledgeGenerationTask};');
   await context.api.initializeGenerationRecovery();
   const state=context.api.getGenerationTask();
   assert.equal(state.status,'paused');assert.equal(state.appearanceId,'saved');
@@ -105,11 +124,8 @@ test("restart restores saved trial progress without fabricating failure or paid 
 
 test("terminal acknowledgement ignores older toasts and running tasks", () => {
   // Exercise the real state machine in isolation; no provider calls or user data.
-  const source = readFileSync(new URL("./generation-task.js", import.meta.url), "utf8")
-    .replace(/^import .*;\n/gm, "")
-    .replace(/^export /gm, "");
   const context = vm.createContext({ recordDiagnostic });
-  vm.runInContext(source + "\nthis.api = { setState, getGenerationTask, acknowledgeGenerationTask };", context);
+  loadGenerationTaskFixture(context, "\nglobalThis.api = { setState, getGenerationTask, acknowledgeGenerationTask };");
   const { setState, getGenerationTask, acknowledgeGenerationTask } = context.api;
   setState({ status: "failed", completionEpoch: 2, error: "test" });
   acknowledgeGenerationTask(1);
@@ -167,7 +183,7 @@ test("raw provider errors are translated into product-level guidance", () => {
 
   assert.match(
     normalizeGenerationErrorMessage('volcano submit HTTP 401: {"error":{"message":"invalid api key"}}'),
-    /API Key 无效或已过期/,
+    /火山方舟.*视频生成.*HTTP 401.*未接受.*API Key/,
   );
 });
 

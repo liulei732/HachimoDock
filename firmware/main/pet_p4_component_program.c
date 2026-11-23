@@ -102,9 +102,12 @@ bool pet_component_program_parse(const cJSON *root,pet_component_program_config_
 #if !PET_COMPONENT_PROGRAM_ENABLED
   return false;
 #else
-  static const char *const keys[]={"engine","image","outputs","actions","timers"};
+  static const char *const keys[]={"engine","image","outputs","actions","timers","background"};
+  const cJSON *background=cJSON_GetObjectItemCaseSensitive(p,"background");
+  if (background && (!PET_COMPONENT_BACKGROUND_ENABLED || !PET_P4_EVENTS || !cJSON_IsTrue(background))) return false;
+  out->local_background=background!=NULL;
   out->v2=PET_P4_PROGRAM_V2&&!strcmp(string(p,"engine"),PET_COMPONENT_PROGRAM_ENGINE_V2);
-  if(!fields(p,keys,5)||(!out->v2&&strcmp(string(p,"engine"),PET_COMPONENT_PROGRAM_ENGINE))
+  if(!fields(p,keys,background?6:5)||(!out->v2&&strcmp(string(p,"engine"),PET_COMPONENT_PROGRAM_ENGINE))
       ||strcmp(string(root,"engine"),"p4-bounded-runtime-v4")||strcmp(string(cJSON_GetObjectItemCaseSensitive(root,"surface"),"engine"),"p4-app-surface-v1")
       ||strcmp(string(cJSON_GetObjectItemCaseSensitive(root,"input"),"engine"),"p4-input-v1"))return false;
   pet_variable_owners_t owners;
@@ -164,6 +167,7 @@ bool pet_component_program_parse(const cJSON *root,pet_component_program_config_
   const cJSON *timers=cJSON_GetObjectItemCaseSensitive(p,"timers");
   if(!cJSON_IsArray(timers)||cJSON_GetArraySize(timers)>8)return false;
   out->timer_count=(uint8_t)cJSON_GetArraySize(timers);
+  if(out->local_background && !out->timer_count)return false;
   for(unsigned i=0;i<out->timer_count;i++){
     static const char *const timer_keys[]={"id","delayMs","intervalMs","words"};
     const cJSON *t=cJSON_GetArrayItem(timers,i);pet_program_timer_spec_t *spec=&out->timers[i];int64_t n;

@@ -32,7 +32,7 @@ def test_pack_word_stays_private_and_keeps_original_worker_and_fence():
     from p4_render_trace_test import function
     source=(ROOT/'main/pet_p4_renderer.c').read_text()
     job=function(source,'pack_h264_i420_for_ppa')
-    assert job.index('xTaskNotifyGive(')<job.index('xSemaphoreTake(g_h264_pack_done, portMAX_DELAY)')<job.index('*packed =')
+    assert job.index('h264_pack_rows_joined(primary_job, true)') < job.index('*packed =')
     rows=function(source,'pack_h264_i420_rows')
     assert 'memcpy(&y_lo, source_y + x, sizeof(y_lo));' in rows
     assert 'for (; x < src_w; x += 2)' in rows

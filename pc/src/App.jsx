@@ -6,12 +6,13 @@
  * [Sync] If this file changes, update this header and `pc/src/.folder.md`.
  */
 
-import React, { useState, useEffect, useCallback, useRef, lazy, Suspense } from "react";
+import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, lazy, Suspense } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   ImagePlus,
   Loader2,
   MonitorSmartphone,
+  Plus,
   Blocks,
   KeyRound,
   Keyboard,
@@ -33,17 +34,15 @@ const DeviceSettings = lazy(() => import("./DeviceSettings.jsx"));
 const SmartHome = lazy(() => import("./SmartHome.jsx"));
 import { DeviceContextProvider, useDeviceContext } from "./shell/DeviceContext.jsx";
 import ToastStack, { ToastProvider, useToast } from "./shell/ToastStack.jsx";
-import ContextRail from "./shell/ContextRail.jsx";
 import FirmwareUpdateNavItem from "./shell/FirmwareUpdateNavItem.jsx";
 import {
   acknowledgeGenerationTask,
   subscribeGenerationTask,
 } from "./lib/generation-task.js";
-import petManagerMark from "./assets/logo/pet-manager-mark.svg";
 import { version as clientVersion } from "../package.json";
 import { initializeProviderConfigs } from "./lib/avatar-pipeline/provider-config.js";
 import { loadDesktopStartup } from "./lib/desktop-startup.js";
-import { installBrowserExitProtection, setExitReason, useExitReasons } from "./lib/exit-protection.js";
+import { installBrowserExitProtection, setExitReason } from "./lib/exit-protection.js";
 
 const DEV_DIRECT_DASHBOARD_BINDING = {
   boardDeviceId: "board-dev-direct-001",
@@ -149,7 +148,8 @@ export default function App() {
   }, []);
 
   const handleOpenApiSettings = useCallback(() => {
-    setApiReturnView(view === "api" ? "" : view);
+    if (view === "api") return;
+    setApiReturnView(view);
     setView("api");
   }, [view]);
 
@@ -238,8 +238,12 @@ function AppInner({
   handleDetailBack,
 }) {
   const { push, dismiss } = useToast();
-  const activity = useExitReasons();
-  const { refresh, usb, wifi, selectedAgentId } = useDeviceContext();
+  const contentRef = useRef(null);
+  useLayoutEffect(() => {
+    if (contentRef.current) contentRef.current.scrollTop = 0;
+    if (document.scrollingElement) document.scrollingElement.scrollTop = 0;
+  }, [view]);
+  const { refresh, usb, wifi, selectedAgentId, activeBoardDeviceId } = useDeviceContext();
   // One persistent owner for both USB dashboard and LAN-only follow paths.
   const dshFollowConnection = useDshFollowConnection(hasTauriRuntime() ? selectedAgentId : "");
   const dashboardBinding = binding || (wifi ? { boardDeviceId: wifi.boardDeviceId } : null);
@@ -249,6 +253,8 @@ function AppInner({
   const generationToastRef = useRef(null);
   const [componentsVisited, setComponentsVisited] = useState(view === "components");
   useEffect(() => { if (view === "components") setComponentsVisited(true); }, [view]);
+  const [settingsVisited, setSettingsVisited] = useState(view === "settings");
+  useEffect(() => { if (view === "settings") setSettingsVisited(true); }, [view]);
   const [apiVisited, setApiVisited] = useState(view === "api");
   const [wirelessMaintenanceRequest, setWirelessMaintenanceRequest] = useState(0);
   const openWirelessMaintenance = useCallback(() => {
@@ -308,28 +314,25 @@ function AppInner({
         <aside className="app-sidebar">
           <div className="sidebar-head">
             <div className="sidebar-brand">
-              <span className="sidebar-brand__mark">
-                <img src={petManagerMark} alt="" />
-              </span>
               <span className="sidebar-brand__copy">
-                <strong className="sidebar-brand-name">Hachimodock</strong>
+                <strong className="sidebar-brand-name">HachimoDock</strong>
                 <span>桌宠管理端 · v{clientVersion}</span>
               </span>
             </div>
           </div>
-          <nav className="sidebar-nav">
+          <nav className="sidebar-nav" aria-label="主导航">
             <button
               type="button"
-              className={`sidebar-nav__item ${activeTab === "device" ? "is-active" : ""}`}
+              className={`sidebar-nav__item ${activeTab === "device" ? "is-active" : ""}`} aria-current={activeTab === "device" ? "page" : undefined}
               onClick={() => setView(dashboardBinding ? "dashboard" : "setup")}
-              title="Agent交互"
+              title="桌宠伙伴"
             >
               <MonitorSmartphone size={16} />
-              <span className="sidebar-nav-label">Agent交互</span>
+              <span className="sidebar-nav-label">桌宠伙伴</span>
             </button>
             <button
               type="button"
-              className={`sidebar-nav__item ${activeTab === "gallery" ? "is-active" : ""}`}
+              className={`sidebar-nav__item ${activeTab === "gallery" ? "is-active" : ""}`} aria-current={activeTab === "gallery" ? "page" : undefined}
               onClick={handleOpenGallery}
               title="形象画廊"
             >
@@ -338,46 +341,41 @@ function AppInner({
             </button>
             <button
               type="button"
-              className={`sidebar-nav__item ${activeTab === "components" ? "is-active" : ""}`}
+              className={`sidebar-nav__item ${activeTab === "components" ? "is-active" : ""}`} aria-current={activeTab === "components" ? "page" : undefined}
               onClick={handleOpenComponents}
               title="组件中心"
             >
               <Blocks size={16} />
               <span className="sidebar-nav-label">组件中心</span>
             </button>
-            <button type="button" className={`sidebar-nav__item ${activeTab === "home" ? "is-active" : ""}`} onClick={() => setView("home")} title="智能家居">
+            <button type="button" className={`sidebar-nav__item ${activeTab === "home" ? "is-active" : ""}`} aria-current={activeTab === "home" ? "page" : undefined} onClick={() => setView("home")} title="智能家居">
               <Home size={16} /><span className="sidebar-nav-label">智能家居</span>
             </button>
-            <button type="button" className={`sidebar-nav__item ${activeTab === "keyboard" ? "is-active" : ""}`} onClick={() => setView("keyboard")} title="键盘配置">
+            <button type="button" className={`sidebar-nav__item ${activeTab === "keyboard" ? "is-active" : ""}`} aria-current={activeTab === "keyboard" ? "page" : undefined} onClick={() => setView("keyboard")} title="键盘配置">
               <Keyboard size={16} /><span className="sidebar-nav-label">键盘配置</span>
             </button>
             <button
               type="button"
-              className={`sidebar-nav__item ${activeTab === "api" ? "is-active" : ""}`}
+              className={`sidebar-nav__item ${activeTab === "api" ? "is-active" : ""}`} aria-current={activeTab === "api" ? "page" : undefined}
               onClick={handleOpenApiSettings}
               title="模型配置"
             >
               <KeyRound size={16} />
               <span className="sidebar-nav-label">模型配置</span>
             </button>
-            <button type="button" className={`sidebar-nav__item ${activeTab === "settings" ? "is-active" : ""}`} onClick={() => setView("settings")} title="其它设置">
+            <button type="button" className={`sidebar-nav__item ${activeTab === "settings" ? "is-active" : ""}`} aria-current={activeTab === "settings" ? "page" : undefined} onClick={() => setView("settings")} title="其它设置">
               <Settings size={16} /><span className="sidebar-nav-label">其它设置</span>
             </button>
             <FirmwareUpdateNavItem usb={usb} wifi={wifi} />
           </nav>
-          {!!activity.length && <details className="app-activity"><summary>{activity.length} 项进行中或未保存</summary>
-            <ul>{activity.map(item => <li key={item}>{item}</li>)}</ul>
-          </details>}
-          <div className="sidebar-spacer" />
-          <ContextRail
-            onOpenDevice={() => setView(dashboardBinding ? "dashboard" : "setup")}
-            onOpenAppearance={handleOpenGallery}
-            onOpenComponent={handleOpenComponents}
-            onStartBinding={() => setView("setup")}
-          />
+          {!activeBoardDeviceId && (
+            <button type="button" className="sidebar-bind" onClick={() => setView("setup")}>
+              <Plus size={14} />绑定设备
+            </button>
+          )}
         </aside>
         <section className="app-main">
-          <main className="app-content">
+          <main className="app-content" ref={contentRef}>
             {configReadError && <div className="message-banner message-banner--warning" role="alert">
               <strong>已有 API 配置暂时无法读取，原文件已保留。</strong>
               <p>设备管理和本地组件仍可使用；依赖这些凭据的服务暂不可用。不会自动清空或覆盖原配置。</p>
@@ -387,9 +385,7 @@ function AppInner({
               && <DshConnectionPanel connection={dshFollowConnection} />}
             <Suspense fallback={<p role="status">正在载入页面…</p>}>
             {isSetup && <>
-              <p role="status">连接设备后可同步内容；也可以先浏览组件、创建形象或配置 API。</p>
-              <button type="button" className="btn-secondary" onClick={() => setView("settings")}>Wi-Fi 设备配对</button>
-              <DeviceSetup onComplete={handleSetupCompleteWithRefresh} />
+              <DeviceSetup onComplete={handleSetupCompleteWithRefresh} onOpenPairing={() => setView("settings")} />
             </>}
             {!dashboardBinding && hasTauriRuntime() && (
               <LanAgentSessionFeed agentId={selectedAgentId} usbConnected={usb.connected} />
@@ -450,8 +446,8 @@ function AppInner({
               </div>
             )}
             {view === "home" && <SmartHome />}
-            <div hidden={view !== "settings"}><DeviceSettings usb={usb} wifi={wifi} active={view === "settings"}
-              wirelessMaintenanceRequest={wirelessMaintenanceRequest} /></div>
+            {(settingsVisited || view === "settings") && <div hidden={view !== "settings"}><DeviceSettings usb={usb} wifi={wifi} active={view === "settings"}
+              wirelessMaintenanceRequest={wirelessMaintenanceRequest} /></div>}
             </Suspense>
           </main>
         </section>

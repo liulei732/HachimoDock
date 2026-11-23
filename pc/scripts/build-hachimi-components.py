@@ -145,7 +145,7 @@ def learn():
         raise ValueError('每日新知需要十类各100条独立知识，不允许使用缺失或重复的知识库')
     if any(len(re.findall(r'[\u3400-\u9fff]',c['text']))<300 for c in cards):
         raise ValueError('知识解释不足300个汉字')
-    result=hosted('每日新知','knowledge',[('primary','random','换一条或确认分类'),('secondary','category','选择分类或返回'),('previous','previous','上一页或上一分类'),('next','next','下一页或下一分类')],'mono','#f0eeff','#1d1e36','#d6d1fb','每天多一点好奇','连接 PC 后阅读完整知识库。','十个分类各100条知识，每条不少于300个汉字。进入设备组件跟随当前宠物音色朗读，换条后读新内容；退出或开启实时对话即停止。保留分类与换条入口，摇杆左右翻页。需新版 PC 客户端连接并配置语音服务。',cards,reading=True)
+    result=hosted('每日新知','knowledge',[('primary','random','换一条或确认分类'),('secondary','category','选择分类或返回'),('previous','previous','上一页或上一分类'),('next','next','下一页或下一分类')],'mono','#f0eeff','#1d1e36','#d6d1fb','每天多一点好奇','连接 PC 后阅读完整知识库。','十个分类各100条知识，每条不少于300个汉字。进入设备组件跟随当前宠物音色朗读，换条后读新内容；退出或开启实时对话即停止。保留分类与换条入口，摇杆左右翻页。阅读需连接 PC，自动朗读另需配置语音服务。',cards,reading=True)
     result[3]['engine']='pc-app-services-v3'
     result[3]['autoRead']=True
     result[0]['dashboard'].update(eyebrow='选择分类',footer='触屏或摇杆左右翻页，全文不会截断。',metricValue='1000 条 · 百科节选',badge='— / —')

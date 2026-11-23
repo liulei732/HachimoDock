@@ -94,6 +94,7 @@ def test_stopped_cue_only_after_admission_and_once_per_revision(tmp_path):
 #include "pet_p4_protocol.h"
 #define PET_P4_JSON_SAFE_INTEGER_MAX 9007199254740991ULL
 #define PET_P4_SESSION_NOTICE_MS 2200ULL
+void pet_p4_test_message_check_view(const pet_p4_runtime_state_t *state) { assert(state); }
 static int cues;
 static long long now_us=1000000;
 static long long esp_timer_get_time(void) {return now_us;}

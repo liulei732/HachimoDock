@@ -207,6 +207,7 @@ test("named storage preparation follows confirmation without inventing byte prog
     listen: async (_event, callback) => {
       callback({ payload: { stage: "preparing_storage" } });
       callback({ payload: { stage: "unknown_future_stage" } });
+      callback({ payload: { currentFile: 0, totalFiles: 4, bytesSent: 0, bytesTotal: 2048 } });
       return () => {};
     },
   });
@@ -409,4 +410,21 @@ test("a failed slot preflight explains the wait and never commits the switch", a
  await assert.rejects(f.run(), error => error.outcome === "not_submitted" && /存储操作/.test(error.message));
  assert.equal(f.count("usb_sync_appearance"), 1);
  noCommit(f);
+});
+
+test("USB follow can enter and leave Antigravity using the existing scoped switch", async t => {
+  for (const [previousSource, targetSource] of [["codex", "antigravity"], ["antigravity", "codex"]]) {
+    await t.test(previousSource + " to " + targetSource, async (subtest) => {
+      const f = fixture(subtest, { profile: { enabledAgents: [previousSource], selectedAgentId: previousSource } });
+      await f.run({ agentId: targetSource });
+
+      const dispatched = f.calls.find(x => x.command === "dispatch_remote_cli_binding").args.input;
+      assert.equal(dispatched.previousSource, previousSource);
+      assert.equal(dispatched.targetSource, targetSource);
+      assert.equal(dispatched.expectedConnectionId, USB.connectionId);
+      assert.equal(dispatched.expectedBootId, USB.bootId);
+      assert.equal(f.calls.find(x => x.command === "save_bridge_profile").args.input.selectedAgentId, targetSource);
+      assert.equal(f.count("ensure_bridge_runtime"), 1);
+    });
+  }
 });

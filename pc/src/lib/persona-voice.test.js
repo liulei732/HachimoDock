@@ -23,6 +23,7 @@ import {
   normalizePersonaVoice,
   personaSummaryLabel,
   validatePersonaVoice,
+  voiceSpecFor,
 } from "./persona-voice.js";
 
 test("built-in Terrier ships Peiqi 2.0 without changing the general voice default", () => {
@@ -33,7 +34,8 @@ test("built-in Terrier ships Peiqi 2.0 without changing the general voice defaul
   assert.equal(factory.voice.provider, TTS_PROVIDER_DOUBAO);
   assert.equal(factory.voice.speaker, "zh_female_peiqi_uranus_bigtts");
   assert.equal(BUILTIN_TERRIER_PERSONA_VOICE.voice.speaker, factory.voice.speaker);
-  assert.equal(personaSummaryLabel(factory), "小西 · 佩奇猪 2.0");
+  assert.equal(personaSummaryLabel(factory), "小西");
+  assert.equal(personaSummaryLabel(factory, { ttsProvider: "volcengine" }), "小西 · 佩奇猪 2.0");
   assert.equal(DEFAULT_SPEAKER_ID, "zh_female_vv_uranus_bigtts");
   assert.ok(DOUBAO_SPEAKERS.some((speaker) => speaker.id === factory.voice.speaker && speaker.label === "佩奇猪 2.0"));
   assert.ok(DOUBAO_SPEAKERS.some((speaker) => speaker.id === DEFAULT_SPEAKER_ID));
@@ -76,7 +78,7 @@ test("a saved document is normalized, clamped and reported as configured", () =>
   assert.equal(record.voice.provider, TTS_PROVIDER_DOUBAO);
   assert.equal(record.voice.speed, 2);
   assert.equal(record.voice.volume, 0.2);
-  assert.equal(personaSummaryLabel(record), "Torti · Vivi 2.0");
+  assert.equal(personaSummaryLabel(record, { ttsProvider: "" }), "Torti · Vivi 2.0");
   assert.match(record.voiceMigrationNotice, /旧版音色/);
 });
 
@@ -114,4 +116,32 @@ test("pending-setup marker is a no-op without localStorage and round-trips with 
   } finally {
     delete globalThis.localStorage;
   }
+});
+
+test("only bounded provider-scoped fields round trip through appearance storage and realtime IPC", () => {
+  const raw = { voice: { tts_overrides: {
+    mimo: { model: "mimo-v2.5-tts", voice: " 冰糖 ", apiKey: "fixture" },
+    openai: { model: "model", voice: "pet", baseUrl: "https://example.test/custom/v1" },
+    other: { voice: "ignore" },
+  } } };
+  const saved = normalizePersonaVoice(raw, { isBuiltin: true });
+  const slots = { mimo: { model: "mimo-v2.5-tts", voice: "冰糖" },
+    openai: { model: "model", voice: "pet", baseUrl: "https://example.test/custom/v1/audio/speech" } };
+  assert.deepEqual(saved.voice.tts_overrides, slots);
+  assert.deepEqual(voiceSpecFor(saved).ttsOverrides, slots);
+  const settings = { ttsProvider: "openai", ttsModel: "model", ttsBaseUrl: slots.openai.baseUrl, ttsVoice: "global" };
+  assert.equal(personaSummaryLabel(saved, settings), "小西 · 自定义 TTS · pet");
+  for (const changes of [{ ttsModel: "new" }, { ttsBaseUrl: "https://example.test/custom/v1/chat/completions" },
+    { ttsBaseUrl: "https://other.test/custom/v1" }]) {
+    assert.equal(personaSummaryLabel(saved, { ...settings, ...changes }), "小西 · 自定义 TTS · 跟随全局（global）");
+  }
+  assert.equal(personaSummaryLabel(saved, { ttsProvider: "future" }), "小西");
+  assert.equal(personaSummaryLabel(saved, { ttsProvider: "mimo", ttsModel: slots.mimo.model }), "小西 · MiMo · 冰糖");
+  for (const baseUrl of ["https://example.test/v1?token=fixture", "https://name:key@example.test"]) {
+    raw.voice.tts_overrides.openai.baseUrl = baseUrl;
+    assert.deepEqual(voiceSpecFor(raw).ttsOverrides, { mimo: slots.mimo });
+  }
+  raw.voice.tts_overrides.mimo.voice = "中".repeat(342);
+  assert.match(validatePersonaVoice(raw).tts_overrides, /1024/);
+  assert.equal(voiceSpecFor(raw).ttsOverrides, undefined);
 });

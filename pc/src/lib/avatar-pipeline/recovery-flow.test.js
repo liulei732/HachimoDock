@@ -90,7 +90,13 @@ test('bad trial JSON retains clip; explicit recovery generates only remaining 10
     providerConfig:{provider:'volcengine',apiKey:'fixture',model:'doubao-seedance-2-0-fast-260128'},automatic:true,session,
     checkpoint:async()=>{structuredClone(session);}};
   try{
-    await assert.rejects(runAvatarPipeline(args),/自动检查返回格式异常/);
+    await assert.rejects(runAvatarPipeline(args), error => {
+      assert.match(error.message, /自动检查返回格式异常/);
+      assert.match(error.message, /已有图片和视频已保留/);
+      assert.match(error.message, /恢复任务只补做检查/);
+      assert.doesNotMatch(error.message, /传输失败|检查云服务连接|\{pass: true/);
+      return true;
+    });
     assert.equal(videoCalls,1);assert.equal(reviewCalls,1);
     const first=CUSTOM_GENERATION_FAMILIES[0].family;
     assert.equal(session.actions[first].videoBytes.byteLength,3);assert.ok(session.actions[first].qualityResponse);

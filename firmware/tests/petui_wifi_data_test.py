@@ -17,6 +17,7 @@ def test_wifi_data_sources_and_cache():
         (out / "nvs.h").write_text("""
 #include <stddef.h>
 #define ESP_OK 0
+#define ESP_ERR_NVS_NOT_FOUND 1
 #define NVS_READONLY 0
 #define NVS_READWRITE 1
 typedef int nvs_handle_t;
@@ -37,7 +38,7 @@ int nvs_set_blob(nvs_handle_t, const char *, const void *, size_t);
         binary = out / "wifi_data_test"
         subprocess.run([
             os.environ.get("CC", "cc"), "-std=c11", "-D_POSIX_C_SOURCE=200809L",
-            "-DPET_P4_SYSTEM_WIFI=1", "-Wall", "-Wextra", "-Werror",
+            "-DPET_P4_SYSTEM_WIFI=1", "-DPET_P4_SCOPED_WRITE=1", "-Wall", "-Wextra", "-Werror",
             "-I", str(out), "-I", str(FIRMWARE / "main"), "-I", str(cjson),
             "-I", str(FIRMWARE / "tests/stubs/widget_data"),
             str(FIRMWARE / "tests/petui_wifi_data_test.c"),

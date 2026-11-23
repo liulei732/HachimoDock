@@ -6,6 +6,8 @@ import {
   readFavorites,
   updateFavorites,
   publicationStatus,
+  publicationCandidates,
+  publicationReceiptError,
   COMMUNITY_CATEGORIES,
   COMMUNITY_TABS,
 } from "./community-model.js";
@@ -64,4 +66,32 @@ test("official community versions can replace bundled copies at the same version
   assert.equal(versionState(work, { ...bundled, isBundledCopy: false }).contentConflict, true);
   assert.equal(versionState({ ...work, official: false }, bundled).contentConflict, true);
   assert.equal(versionState(work, { ...bundled, version: "1.4.2" }).localNewer, true);
+});
+
+test("publication uses formal sources and provenance even for an unknown local capability", () => {
+  const local = {id: "custom-mix", version: "1.0.1", libraryPath: "/test/a", isLocal: true,
+    valid: false, syncRequirements: {blockedReason: "unknown local capability"}};
+  const variant = {...local, libraryPath: "/test/b"};
+  const fork = id => ({...local, id, libraryPath: "/test/" + id});
+  const ownedUpdate = fork("my-update");
+  const items = [local, {sourceAlternatives: [{...local, isLocal:false}, variant]},
+    fork("reserved"), fork("official-copy"), fork("hachimo-copy"), fork("downloaded"),
+    ownedUpdate, fork("upcoming-todos"), {...fork("bundled"), isBundledCopy:true},
+    {...fork("inventory"), isLocal:false}, {...fork("draft"), libraryPath:""}];
+  const state = {reservedIds:["reserved"], downloaded:{downloaded:{}, "my-update":{}}};
+  const owned = {"my-update": {}};
+  assert.deepEqual(publicationCandidates(items,state,owned), [local, variant, ownedUpdate]);
+  assert.deepEqual(publicationCandidates(items,null,owned), []);
+});
+
+test("only an affirmative server receipt for the selected identity can enable submission", () => {
+  const receipt = {id:"my-work", version:"1.0.4", contentHash:"a".repeat(64), files:["component.json"],
+    canPublish:true, serverChecked:true};
+  const check = change => publicationReceiptError({...receipt, ...change}, "my-work", "1.0.4");
+  assert.equal(check({}), "");
+  for (const serverChecked of [undefined, null, false, 1, "true"])
+    assert.equal(check({serverChecked}), "尚未取得社区预检通过回执，请重新检查。");
+  assert.equal(check({canPublish:false,warning:"版本必须递增"}), "版本必须递增");
+  for (const change of [{canPublish:undefined},
+    {id:"other"}, {version:"1.0.3"}, {contentHash:"short"}, {files:[]}]) assert.ok(check(change));
 });

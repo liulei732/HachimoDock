@@ -162,6 +162,16 @@
       "inc": {
         "focus_s": 300
       }
+    },
+    {
+      "from": "focus_paused",
+      "on": "tomato.configure",
+      "to": "ready"
+    },
+    {
+      "from": "rest_paused",
+      "on": "tomato.configure",
+      "to": "ready"
     }
   ],
   "tick": [
@@ -211,22 +221,13 @@
   ],
   "dashboard": {
     "title": "番茄钟",
-    "eyebrow": {
+    "headline": {
       "switch_state": {
         "focus": "专注阶段",
         "focus_paused": "专注已暂停",
         "rest": "休息阶段",
         "rest_paused": "休息已暂停",
         "ready": "准备开始"
-      }
-    },
-    "headline": {
-      "switch_state": {
-        "focus": "把这一刻，留给专注。",
-        "focus_paused": "歇一歇，稍后继续。",
-        "rest": "做完一轮，放松一下。",
-        "rest_paused": "休息计时已暂停。",
-        "ready": "选好时长，再开始。"
       }
     },
     "metricLabel": "剩余时间",
@@ -261,7 +262,7 @@
     "badge": {
       "var": "completed_sessions"
     },
-    "note": "开始前可调 5–60 分钟 · 休息 5 分钟",
+    "note": "专注 5–60 分钟 · 休息 5 分钟",
     "footer": "主键开始/暂停  副键跳过  全局键退出",
     "progress": {
       "pct_of": "remaining_s",
@@ -368,16 +369,6 @@
       },
       {
         "type": "text",
-        "x": 30,
-        "y": 94,
-        "w": 340,
-        "h": 25,
-        "color": 41899,
-        "font_size": 16,
-        "bind": "eyebrow"
-      },
-      {
-        "type": "text",
         "x": 28,
         "y": 139,
         "w": 362,
@@ -398,15 +389,6 @@
         "font_size": 48,
         "bind": "metricValue",
         "weight": 600
-      },
-      {
-        "type": "panel",
-        "x": 30,
-        "y": 330,
-        "w": 192,
-        "h": 5,
-        "color": 58999,
-        "radius": 2
       },
       {
         "type": "meter",
@@ -595,6 +577,21 @@
         "text": "+5 分钟",
         "action": "tomato.longer",
         "state_mask": 16
+      },
+      {
+        "type": "button",
+        "x": 514,
+        "y": 378,
+        "w": 100,
+        "h": 48,
+        "color": 63454,
+        "foreground": 16970,
+        "font_size": 16,
+        "radius": 14,
+        "padding": 8,
+        "text": "改时长",
+        "action": "tomato.configure",
+        "state_mask": 10
       }
     ],
     "typography": "p4-app-type-v1",
@@ -885,7 +882,8 @@
     "engine": "p4-input-v1",
     "confirm": {
       "tomato.reset_phase": "重置本轮计时？已完成的轮数会保留。",
-      "tomato.skip_phase": "跳过本轮，进入下一阶段？"
+      "tomato.skip_phase": "跳过本轮，进入下一阶段？",
+      "tomato.configure": "结束本轮并重新选时长？已完成轮次会保留。"
     }
   }
 }

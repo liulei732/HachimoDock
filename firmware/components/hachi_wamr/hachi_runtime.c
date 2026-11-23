@@ -3,6 +3,12 @@
 #include <stdio.h>
 #include <string.h>
 
+#if !defined(ESP_PLATFORM) || (defined(PET_P4_COMPONENT_NETWORK) && PET_P4_COMPONENT_NETWORK)
+#define HACHI_NETWORK_ENABLED 1
+#else
+#define HACHI_NETWORK_ENABLED 0
+#endif
+
 static bool read_u32(const uint8_t **position, const uint8_t *end, uint32_t *value) {
     *value = 0;
     for (unsigned shift = 0; shift <= 28 && *position < end; shift += 7) {
@@ -21,8 +27,8 @@ static const uint8_t *read_name(const uint8_t **p, const uint8_t *end, uint32_t 
     return name;
 }
 
-bool hachi_module_host_profile(const uint8_t *bytes, size_t size, bool *native_canvas,
-bool *host_services, bool *audio) {
+static bool module_profiles(const uint8_t *bytes, size_t size, bool *native_canvas,
+bool *host_services, bool *audio,bool *network) {
     static const uint8_t header[] = {0, 'a', 's', 'm', 1, 0, 0, 0};
     if (size < sizeof(header) || size > HACHI_MAX_MODULE ||
         memcmp(bytes, header, sizeof(header)) != 0) return false;
@@ -33,8 +39,9 @@ bool *host_services, bool *audio) {
     static const char *const names[] = {
         "canvas640", "text", "rect", "blit", "sprite", "tone", "load", "save", "media_cmd",
         "clock_read", "uv_read", "random_u32",
-#if HACHI_AUDIO_ENABLED
         "sample",
+#if HACHI_NETWORK_ENABLED
+        "service_submit", "service_poll", "service_read", "service_release",
 #endif
     };
     while (p < end) {
@@ -55,6 +62,7 @@ bool *host_services, bool *audio) {
                 if (!name) return false;
                 bool allowed = false;
                 for (unsigned j = 0; j < sizeof(names) / sizeof(names[0]); ++j) {
+                    if (j==12 && !HACHI_AUDIO_ENABLED) continue;
                     if (length != strlen(names[j]) || memcmp(name, names[j], length)) continue;
                     if (imports_seen & (1u << j)) return false;
                     imports_seen |= 1u << j;
@@ -84,9 +92,12 @@ bool *host_services, bool *audio) {
     if (native_canvas) *native_canvas = native;
     if (host_services) *host_services = ((imports_seen >> 9) & 7u) != 0;
     if (audio) *audio = has_audio;
+    if (network) *network=((imports_seen>>13)&15u)!=0;
     return true;
 }
 
+bool hachi_module_host_profile(const uint8_t *bytes,size_t size,bool *native,bool *host,bool *audio){return module_profiles(bytes,size,native,host,audio,NULL);}
+bool hachi_module_network_profile(const uint8_t *bytes,size_t size,bool *network){return module_profiles(bytes,size,NULL,NULL,NULL,network);}
 bool hachi_module_profile(const uint8_t *bytes, size_t size, bool *native_canvas) {
     return hachi_module_host_profile(bytes, size, native_canvas, NULL, NULL);
 }
@@ -331,6 +342,30 @@ static uint32_t random_u32(wasm_exec_env_t env) {
     return rt->host_random ? rt->host_random() : 0;
 }
 
+#if HACHI_NETWORK_ENABLED
+static bool service_range(wasm_exec_env_t env,uint32_t offset,uint32_t n){
+ if(!n)return false;
+ wasm_module_inst_t instance=wasm_runtime_get_module_inst(env);
+ if(wasm_runtime_validate_app_addr(instance,offset,n))return true;
+ /* Invalid buffers are recoverable service errors, not guest execution traps. */
+ wasm_runtime_clear_exception(instance);return false;
+}
+static int32_t service_submit(wasm_exec_env_t env,uint32_t offset,uint32_t n){
+ hachi_runtime_t *rt=wasm_runtime_get_user_data(env);if(n>8192||!service_range(env,offset,n)||++rt->service_calls>8)return -3;
+ return rt->service?rt->service(rt->service_context,1,wasm_runtime_addr_app_to_native(rt->instance,offset),n,NULL,0):-1;
+}
+static int32_t service_poll(wasm_exec_env_t env,uint32_t offset,uint32_t n){
+ hachi_runtime_t *rt=wasm_runtime_get_user_data(env);if(n>512||!service_range(env,offset,n)||++rt->service_calls>8)return -3;
+ return rt->service?rt->service(rt->service_context,2,NULL,0,wasm_runtime_addr_app_to_native(rt->instance,offset),n):-1;
+}
+static int32_t service_read(wasm_exec_env_t env,uint32_t handle,uint32_t at,uint32_t offset,uint32_t n){
+ hachi_runtime_t *rt=wasm_runtime_get_user_data(env);if(n>4096||!service_range(env,offset,n)||++rt->service_calls>8)return -3;
+ uint32_t input[2]={handle,at};return rt->service?rt->service(rt->service_context,3,input,sizeof input,wasm_runtime_addr_app_to_native(rt->instance,offset),n):-1;
+}
+static int32_t service_release(wasm_exec_env_t env,uint32_t handle){hachi_runtime_t *rt=wasm_runtime_get_user_data(env);if(++rt->service_calls>8)return -3;return rt->service?rt->service(rt->service_context,4,&handle,sizeof handle,NULL,0):-1;}
+
+#endif
+
 static NativeSymbol imports[] = {
     {"canvas640", (void *)canvas640, "()", NULL},
     {"text", (void *)text, "(iiiiii)", NULL},
@@ -343,6 +378,12 @@ static NativeSymbol imports[] = {
     {"clock_read", (void *)clock_read, "(ii)i", NULL},
     {"uv_read", (void *)uv_read, "(i)i", NULL},
     {"random_u32", (void *)random_u32, "()i", NULL},
+#if HACHI_NETWORK_ENABLED
+    {"service_submit",(void *)service_submit,"(ii)i",NULL},
+    {"service_poll",(void *)service_poll,"(ii)i",NULL},
+    {"service_read",(void *)service_read,"(iiii)i",NULL},
+    {"service_release",(void *)service_release,"(i)i",NULL},
+#endif
     {"media_cmd", (void *)media_cmd, "(i)", NULL},
 #if HACHI_AUDIO_ENABLED
     {"sample", (void *)sample, "(i)", NULL},
@@ -411,7 +452,7 @@ static wasm_function_inst_t entry(hachi_runtime_t *rt, const char *name, uint32_
 
 static bool run(hachi_runtime_t *rt, wasm_function_inst_t fn, uint32_t count, uint32_t *args) {
     hachi_saves_t original = *rt->saves;
-    rt->tone_count = rt->operations = rt->area = rt->writes = 0;
+    rt->tone_count = rt->operations = rt->area = rt->writes = rt->service_calls = 0;
     rt->media_command = 0;
     rt->sample_index = rt->music_index = HACHI_SAMPLE_NONE;
     wasm_runtime_set_instruction_count_limit(rt->env, 160000);
@@ -431,7 +472,13 @@ bool hachi_open(hachi_runtime_t *rt, uint8_t *wasm, uint32_t size, uint16_t *scr
 bool hachi_open_host(hachi_runtime_t *rt, uint8_t *wasm, uint32_t size, uint16_t *screen,
                      size_t screen_pixels, hachi_saves_t *saves, hachi_host_read_fn read,
                      uint32_t (*random)(void), char *error, size_t error_size) {
-    *rt = (hachi_runtime_t){.host_read = read, .host_random = random, .screen = screen, .saves = saves};
+    return hachi_open_services(rt,wasm,size,screen,screen_pixels,saves,read,random,NULL,NULL,error,error_size);
+}
+
+bool hachi_open_services(hachi_runtime_t *rt, uint8_t *wasm, uint32_t size, uint16_t *screen,
+                     size_t screen_pixels, hachi_saves_t *saves, hachi_host_read_fn read,
+                     uint32_t (*random)(void),hachi_service_fn service,void *context, char *error, size_t error_size) {
+    *rt = (hachi_runtime_t){.service=service,.service_context=context,.host_read = read, .host_random = random, .screen = screen, .saves = saves};
     bool native;
     if (!hachi_module_profile(wasm, size, &native)) {
         snprintf(error, error_size, "invalid module profile");

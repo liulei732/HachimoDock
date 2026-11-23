@@ -1,20 +1,23 @@
-"""Strict bounded composition contract; no executable package code or credentials."""
+"""Strict bounded composition contract with an isolated Python data source."""
 import ipaddress
 import json
 import re
+from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
 
 ENGINE = 'pc-app-composition-v1'
 ENGINE_V2 = 'pc-app-composition-v2'
 ENGINE_V3 = 'pc-app-composition-v3'
+LOCAL_TELEMETRY = json.loads(Path(__file__).with_name('local_telemetry_sources.json').read_text(encoding='utf-8'))
 OPERATIONS = {'constant': set(), 'clock': set(), 'counter': {'increment', 'decrement', 'reset'},
-              'timer': {'start', 'pause', 'reset'}, 'json-get': {'refresh'}, 'local-telemetry': {
-                  'refresh','previous','next','page_up','page_down','quota','overview','detail','cycle_period','hour','today','day','week','month'},
+              'timer': {'start', 'pause', 'reset'}, 'json-get': {'refresh'}, 'local-telemetry': set(), 'python': {'refresh'},
               'ledger': {'append','remove_latest','previous','next'},'computed':set(),'document':{'set','append','remove'},
               'workflow': {'start', 'resume', 'cancel'},
               'collection': {'page_next','page_previous','up','down','clear_selection'} | {'row_'+str(i) for i in range(8)}}
 
 def operations(source):
+    if source['kind'] == 'local-telemetry':
+        return LOCAL_TELEMETRY[source['source']]['actions']
     return OPERATIONS[source['kind']]
 
 def name(value, limit):
@@ -138,15 +141,33 @@ def composition_errors(value, runtime):
         for alias, source in sources.items():
             assert name(alias, 16) and isinstance(source, dict)
             assert v2 or any(b.get('source') == alias for b in bindings.values()) or any(isinstance(a, str) and a.split(':')[0] == alias for a in value['actions'].values())
-            kind = source['kind']; assert kind in OPERATIONS
+            kind = source['kind']
+            if isinstance(kind, str) and kind not in OPERATIONS:
+                return [f'pc/application.json 中数据源 {alias} 的类型尚未注册: {kind}']
+            assert kind in OPERATIONS
             assert v2 or kind not in ('computed','document','collection')
             assert v3 or kind != 'workflow'
             fields = {'kind'} | {'constant': {'value'}, 'clock': set(), 'counter': {'initial', 'min', 'max', 'step'},
                                  'timer': {'seconds'}, 'json-get': {'endpoint', 'hosts', 'refresh_sec'}, 'local-telemetry': {'source'},
+                                 'python': {'entry','input','refresh_sec'},
                                  'ledger': {'unit','target','capacity','label'},'computed':{'expression'},'document':{'initial'},'workflow':{'workflow'},'collection':{'expression','view'}}[kind]
             assert set(source) == fields
             if kind == 'local-telemetry':
-                assert source['source'] == 'codex.accounts'
+                provider = source['source']
+                assert name(provider, 47)
+                if provider not in LOCAL_TELEMETRY:
+                    return [f'pc/application.json 中本机数据源尚未注册: {provider}']
+            elif kind == 'python':
+                from python_plugin import ENTRY
+                assert source['entry'] == ENTRY and type(source['refresh_sec']) is int and 30 <= source['refresh_sec'] <= 86400
+                assert sum(isinstance(s,dict) and s.get('kind') == 'python' for s in sources.values()) == 1
+                spec = source['input']; assert isinstance(spec,dict)
+                if spec['kind'] in ('none','text-file'):
+                    assert set(spec) == {'kind'}
+                else:
+                    assert spec['kind'] == 'https-json' and set(spec) == {'kind','endpoint','hosts','pointer'}
+                    public_get(spec['endpoint'],spec['hosts'])
+                    assert json_pointer(spec['pointer'])
             elif kind == 'constant':
                 assert len(json.dumps(source['value'], ensure_ascii=False, separators=(',', ':')).encode()) <= 4096
             elif kind == 'workflow':
@@ -190,7 +211,7 @@ def composition_errors(value, runtime):
                 assert isinstance(step,dict) and 'target' in step and set(step)<={'target','pointer','value','when'}
                 assert isinstance(step['target'],str) and step['target'].count(':')==1
                 alias,op=step['target'].split(':')
-                assert alias in sources and op in operations(sources[alias]) and sources[alias]['kind'] not in ('json-get','local-telemetry','workflow','collection')
+                assert alias in sources and op in operations(sources[alias]) and sources[alias]['kind'] not in ('json-get','local-telemetry','python','workflow','collection')
                 if sources[alias]['kind']=='document':
                     ptr=step['pointer'];assert isinstance(ptr,str) and len(ptr.encode())<=128 and (not ptr or ptr.startswith('/')) and re.search(r'~(?:[^01]|$)',ptr) is None
                     assert (op=='remove')==('value' not in step) and (op!='remove' or ptr!='')

@@ -28,7 +28,7 @@ def test_actual_audio_control_overlap_aba_and_write_stop_completion(tmp_path):
         "production_stream_drain.inc": ("static void stream_silence_step(", "static atomic_bool g_instrument_enabled"),
         "production_wasm_speech.inc": ("/* WASM speech cancellation", "\n#endif"),
         "production_audio_control.inc": ("esp_err_t pet_p4_audio_set_enabled(", None),
-        "production_capture_task.inc": ("static void audio_task(", "esp_err_t pet_p4_audio_init("),
+        "production_capture_task.inc": ('#include "pet_foreground_hardware.h"', "esp_err_t pet_p4_audio_init("),
         "production_audio_begin.inc": ("static void send_audio_begin(", "static bool send_audio_chunk("),
     }
     for name, (start, end) in sections.items():
@@ -40,7 +40,8 @@ def test_actual_audio_control_overlap_aba_and_write_stop_completion(tmp_path):
     cjson = ROOT / "tests/vendor/cjson"
     compile_and_run(tmp_path, "p4_audio_realtime_test", "-DPET_P4_WASM_AUDIO=1",
                     "-I", str(cjson), str(cjson / "cJSON.c"),
-                    str(ROOT / "main/pet_p4_media_codec.c"))
+                    str(ROOT / "main/pet_p4_media_codec.c"),
+                    str(ROOT / "main/pet_p4_voice_feedback.c"))
 
 
 def test_physical_capture_file_cues_and_fx_are_scoped_without_dsp_or_priority_changes():

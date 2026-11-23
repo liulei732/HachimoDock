@@ -24,7 +24,7 @@ try {
   const manifest=JSON.parse(fs.readFileSync(path.join(source,'component.json')));
   const runtime=JSON.parse(fs.readFileSync(path.join(source,'runtime/widget.json')));
   const stage=path.join(out,manifest.id);fs.mkdirSync(stage,{recursive:true});
-  const allowed=name=>['component.json','negative-screen.json','buttons.json','runtime/widget.json','share.json','pc/extension.json','assets/.keep'].includes(name)||/^assets\/[\w-]+\.png$/.test(name);
+  const allowed=name=>['pc/cover.png','hachiapp.json','component.json','negative-screen.json','buttons.json','runtime/widget.json','share.json','pc/extension.json','assets/.keep'].includes(name)||/^assets\/[\w-]+\.png$/.test(name);
   function copy(dir,prefix=''){for(const e of fs.readdirSync(dir,{withFileTypes:true})){
    const rel=prefix+e.name;if(e.isSymbolicLink())throw Error('Symlink in official source');
    if(e.isDirectory())copy(path.join(dir,e.name),rel+'/');
@@ -53,13 +53,14 @@ try {
   await page.locator('#capture').waitFor();
   await page.waitForTimeout(700);
   if(errors.length)throw Error(manifest.id+': '+errors.join('; '));
-  const cover=await page.locator('#capture').screenshot({path:path.join(out,manifest.id+'.png')});
+  await page.locator('#capture').screenshot({path:path.join(out,manifest.id+'.png')});
+  const cover=fs.readFileSync(path.join(stage,'pc/cover.png'));
   const zip=path.join(out,manifest.id+'.clawpkg');
   const files=fs.readdirSync(stage).sort();
   const packed=spawnSync('python3',['-m','zipfile','-c',zip,...files],{cwd:stage,encoding:'utf8'});if(packed.status!==0)throw Error(packed.stderr);
   const data=fs.readFileSync(zip);
   const category=manifest.kind==='game'?'game':(['wooden-fish','music-player','city-radio'].includes(manifest.id)?'relax':(['tomato-clock','upcoming-todos','token-usage'].includes(manifest.id)?'productivity':manifest.id==='drink-reminder'?'life':'tool'));
-  batch.push({approve:manifest.id!=='music-player',publication:{requestId:'official-'+createHash('sha256').update(data).update(cover).digest('hex').slice(0,48),package:data.toString('base64'),covers:[cover.toString('base64')],metadata:{author:'哈基米桌搭',summary:manifest.description.slice(0,160),description:manifest.description+'\n截图为组件真实默认预览，不包含用户数据。设备需安装支持相应能力的固件。'+(manifest.id==='music-player'?'\n此版本仅供管理员审核测试，音源尚未开放，不对外上架。':''),category,license:'HachimoDock Project License 1.0（非商业）',sourceUrl:'https://github.com/YizhengWw/HachimoDock',releaseNotes:'官方组件首次发布到社区，保留现有功能与组件身份。'}}});
+  batch.push({approve:manifest.id!=='music-player',publication:{requestId:'official-'+createHash('sha256').update(data).update(cover).digest('hex').slice(0,48),package:data.toString('base64'),covers:[],metadata:{author:'哈基米桌搭',summary:manifest.description.slice(0,160),description:manifest.description+'\n截图为组件真实默认预览，不包含用户数据。设备需安装支持相应能力的固件。'+(manifest.id==='music-player'?'\n此版本仅供管理员审核测试，音源尚未开放，不对外上架。':''),category,license:'HachimoDock Project License 1.0（非商业）',sourceUrl:'https://github.com/YizhengWw/HachimoDock',releaseNotes:'官方组件首次发布到社区，保留现有功能与组件身份。'}}});
   reports.push({id:manifest.id,version:manifest.version,source:path.relative(repo,source),status:manifest.id==='music-player'?'pending':'approve-requested',bytes:data.length});
   console.log(manifest.id,manifest.version,'preview and archive ready');
  }

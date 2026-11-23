@@ -1,7 +1,7 @@
 {
  "schemaVersion": 1,
  "profile": "p4-events-v1",
- "notes": "Shared p4-events-v1 vectors: emit names (<= 8, <= 15 safe ASCII), event:<name> transition triggers (<= 8 subscriptions), and alarms (<= 4, every_ms >= 60000 or at_ms_var, action must be a declared transition trigger, background bubbles need the PC alarm policy). Alarms need events and persist.",
+ "notes": "Shared p4-events-v1 vectors: emit names (<= 8, <= 15 safe ASCII), event:<name> transition triggers (<= 8 subscriptions), and alarms (<= 4, every_ms >= 60000 or at_ms_var, action must be a declared transition trigger, devices advertising widgetLocalAlarms=p4-local-alarms-v1 support per-app device settings for silent scheduled counts or local reminders. A local stop overrides the legacy per-boot PC alarm policy). Alarms need events and persist.",
  "limits": {
   "names": 8,
   "queue": 8,

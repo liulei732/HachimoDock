@@ -23,13 +23,16 @@ def test_mqtt_feed_accepts_only_bounded_readonly_packets(tmp_path):
 #include <assert.h>
 #include <string.h>
 #include "pet_p4_mqtt_wire.h"
+#include <stdatomic.h>
+static atomic_uint mqtt_messages,mqtt_applied;
 typedef struct { char topic[128]; } pet_private_feed_t;
-typedef void (*pet_mqtt_feed_value_fn)(const char *, size_t, void *);
+typedef bool (*pet_mqtt_feed_value_fn)(const char *, size_t, void *);
 #define PET_WIFI_DATA_BODY_MAX 16384
 ''' + text[start:end] + r'''
-static void accepted(const char *source, size_t n, void *ctx) {
-  assert(n == 2 && !memcmp(source, "{}", n));
+static bool accepted(const char *source, size_t n, void *ctx) {
+  if (n != 2 || memcmp(source, "{}", n)) return false;
   ++*(unsigned *)ctx;
+  return true;
 }
 int main(void) {
   for (size_t i = 0; i <= PET_MQTT_BODY_LIMIT; ++i) {
@@ -49,12 +52,16 @@ int main(void) {
   pet_private_feed_t feed = {.topic = "a/x"};
   unsigned applied = 0;
   const char packet[] = {0, 3, 'a', '/', 'x', '{', '}'};
-  assert(accept_publish(&feed, 0x31, packet, sizeof(packet), accepted, &applied));
-  assert(!accept_publish(&feed, 0x32, packet, sizeof(packet), accepted, &applied));
-  assert(!accept_publish(&feed, 0x30, packet, 3, accepted, &applied));
+  bool useful=false;
+  assert(accept_publish(&feed, 0x30, packet, 5, accepted, &applied, &useful) && !useful);
+  assert(accept_publish(&feed, 0x30, packet, 6, accepted, &applied, &useful) && !useful);
+  assert(accept_publish(&feed, 0x31, packet, sizeof(packet), accepted, &applied, &useful) && useful);
+  assert(accept_publish(&feed, 0x30, packet, 5, accepted, &applied, &useful) && useful);
+  assert(!accept_publish(&feed, 0x32, packet, sizeof(packet), accepted, &applied, &useful));
+  assert(!accept_publish(&feed, 0x30, packet, 3, accepted, &applied, &useful));
   feed.topic[2] = 'y';
-  assert(!accept_publish(&feed, 0x30, packet, sizeof(packet), accepted, &applied));
-  assert(applied == 1);
+  assert(!accept_publish(&feed, 0x30, packet, sizeof(packet), accepted, &applied, &useful));
+  assert(applied == 1 && mqtt_messages == 4 && mqtt_applied == 1);
 }
 ''')
 
@@ -67,6 +74,7 @@ def test_mqtt_session_subscribes_without_publishing_and_handles_fragmentation(tm
 #include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
+#include <stdatomic.h>
 #include "pet_p4_mqtt_wire.h"
 typedef struct { char host[128]; } pet_wifi_endpoint_t;
 #define PET_PUBLIC_MQTT 3
@@ -74,7 +82,7 @@ typedef struct { char host[128]; } pet_wifi_endpoint_t;
 typedef struct { unsigned kind; uint16_t port; char topic[128]; } pet_private_feed_t;
 typedef struct { char user[65], token[257]; } pet_private_secret_t;
 typedef bool (*pet_mqtt_feed_current_fn)(void *);
-typedef void (*pet_mqtt_feed_value_fn)(const char *, size_t, void *);
+typedef bool (*pet_mqtt_feed_value_fn)(const char *, size_t, void *);
 typedef struct { bool non_block; int timeout_ms; void (*crt_bundle_attach)(void); } esp_tls_cfg_t;
 typedef int esp_tls_t;
 #define PET_PRIVATE_TOPIC_MAX 127
@@ -129,10 +137,12 @@ static ssize_t esp_tls_conn_read(esp_tls_t *tls, void *data, size_t n) {
 }
 ''' + production + r'''
 static bool current(void *ctx) { return true; }
-static void accepted(const char *source, size_t n, void *ctx) {
+static bool reject_values;
+static bool accepted(const char *source, size_t n, void *ctx) {
   unsigned *count = ctx;
   assert(*count < 2 && n == 2 && !memcmp(source, *count ? "[]" : "{}", n));
   ++*count;
+  return !reject_values;
 }
 int main(void) {
   const pet_wifi_endpoint_t endpoint = {.host = "lab.example.org"};
@@ -156,5 +166,11 @@ int main(void) {
   assert(pet_mqtt_feed_run(&endpoint, &public_feed, &anonymous, workspace, current, accepted, &accepted_count));
   assert(closed && accepted_count == 2 && written[9] == 2);
   assert(written[1] + 6u == subscribe_at - 2u);
+  reject_values=true; written_len=read_at=timestamp=accepted_count=0; closed=false;
+  assert(!pet_mqtt_feed_run(&endpoint,&public_feed,&anonymous,workspace,current,accepted,&accepted_count));
+  assert(closed && accepted_count==2);
+  unsigned subscriptions,messages,applied;
+  pet_mqtt_feed_counts(&subscriptions,&messages,&applied);
+  assert(subscriptions==3 && messages==6 && applied==4);
 }
 ''')

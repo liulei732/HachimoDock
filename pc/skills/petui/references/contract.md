@@ -27,7 +27,7 @@
 - `gomoku` 是唯一允许新建的原生预设：用户要求五子棋 / 五子对弈时使用 `game.type="gomoku"`
   （见第 6 节末），需设备 `widgetGamePresets` 含 `gomoku`；其他棋类或自定玩法仍走通用 `scene`。
 - 默认不假设触控可用。只有能力文件明确给出 `touchInput.ready=true` 时才允许触屏事件。
-- 第三方组件不能执行任意代码，也不能自行访问网络或本地文件。
+- 网络读取经已声明的设备或 PC 宿主执行。有界 WASM 只使用已协商导入；桌面 Python 只接收用户授权的输入并返回 JSON。
 
 可向校验器传入设备能力 JSON：
 
@@ -48,8 +48,7 @@
 ```
 
 上方是基础能力示例，不是完整能力表。未提供能力文件时，仅使用校验器内置的
-离线创作基线；这不能证明实体设备支持。实际同步始终使用 USB 报告的能力，
-显式传入空能力表不会获得扩展能力。
+离线创作基线。带 USB 能力要求的包应以目标板 USB 握手逐字段核对。经受信 Wi-Fi 交付时，另核对该安装事务与板上目录提交结果。显式传入空能力表不会获得扩展能力。
 
 ## 2. 包结构
 
@@ -93,7 +92,7 @@ UTF-16 代理项必须正确配对，不能用替换字符静默修复。Python/
 - 游戏 `description` 使用 1-2 个简短句子说明目标、核心规则和结束条件，不能只写题材或宣传语。组件中心会根据 `buttons.json` 另行展示实际操作方法，所以 description 不写死允许用户改绑的物理键位。
 - `negative-screen.json.dashboard` 是初始预览，必须与 runtime 的初始 state/page/vars 相符。
 - `share.json` 必须是 JSON 对象，至少包含非空 `title`。
-- 允许在 `assets/` 放运行时支持的静态 PNG 资源；单个 sprite sheet 不超过 128 KiB。禁止 JS、Python、HTML、CSS、SVG、shell、PowerShell、批处理和可执行文件。
+- 允许在 `assets/` 放运行时支持的静态 PNG 资源；单个 sprite sheet 不超过 128 KiB。受控代码入口仅限已声明的 `runtime/app.wasm` 和桌面 `pc/plugin.py`；其余 JS、Python、HTML、CSS、SVG、shell、PowerShell、批处理和任意可执行文件均拒绝。
 - `assets/` 只允许 `.keep` 与最终发布用 PNG。游戏的每个 PNG 必须被 `runtime/widget.json scene.sprites` 精确引用；媒体切图必须被受控 `surface.images` 精确引用；不得遗留未使用的候选图、单帧临时图、提示词或把 JPEG/WebP 改为 `.png`。
 - 包内不得包含符号链接。
 
@@ -232,9 +231,9 @@ screen.region.long_press
   `program` 混用。详见 [sfx.md](sfx.md)。
 - `runtime/widget.json` 紧凑 JSON 不超过 4095 字节。
 - `buttons.json` 紧凑 JSON 不超过 2047 字节。
-- P4 第三方组件不声明任意 `fetchers` 或 `readers`。实时数据只能使用产品已经提供的 bridge 变量。
+- P4 第三方组件通过固件实现的有界数据宿主、PC 提供器快照或已有宿主变量取得实时数据。包内的任意 `fetchers`、`readers` 声明无法注册新的网络或文件接口。
 
-### 5.1 可选 PC 实时数据列表
+### 5.1 设备直连与 PC 实时数据列表
 
 仅支持 `widgetData: "p4-data-list-v1"` 的新固件可以在 v4 工具 runtime 中声明
 `"data": {"source": "stocks.watchlist", "page_var": "list_page"}`。
@@ -248,16 +247,15 @@ PC 在 USB 或受信 Wi-Fi 链路上发布相同快照，来源声明与传输�
 设备每页显示 5 行。通用行包含 label/value/detail/meta/tone；股票适配器分别映射
 名称、价格、涨跌幅、代码币种及数据状态、正负色彩。当前行情顶部统一显示日期，行内不显示时刻；
 只有 value/detail（股价/涨跌幅）按 tone 着色，label/meta 保持正常色。PC 详情保留原始行情时间。
-其他来源必须先有真实产品适配器，
-不能仅改 source 名就宣称支持天气等数据。
+WiFi6 自定义服务使用 `wifi.feed` 和[设备联网](wifi-data.md)中的协议、映射及凭据能力。PC 命名来源须有实际提供器。`news.hn` 用[资讯宿主投影](news.md)声明。
 
 Dashboard 使用 clean/tool，提供 title/footer；初始预览使用“等待数据”，不填示例价格。
 摇杆左右通过普通 transition 增减 page_var；可用 SW1 将其置 0 回到首页。
-自动取价由 PC 后台服务负责，不用 runtime tick 模拟价格，不声明设备端手动刷新。
+自动取价由当前路径的 WiFi6 数据宿主或 PC 提供器完成。定制列表声明的 `data.refresh` 只在对应宿主实现该动作时可用。
 PC 快照仅保留在设备 RAM，最后一份 PC 报价在 30 秒后过期。仍在线的设备直连可以继续更新行情。
 上游失败与单只行情缺失同样明确标注，不把旧价格当实时价格。
 行情时间来自数据源，不以请求时间冒充行情时间。
-PC 快照、设备直接 HTTPS 及 `petui data-link` 收包验收见 [live-data.md](live-data.md)。实时列表也必须通过现有自测脚本的分页测试；
+PC 快照、设备直接 HTTPS/MQTT 及 `petui data-link` 收包验收见 [live-data.md](live-data.md)。实时列表也必须通过现有自测脚本的分页测试；
 模拟通过不等于完成网络、断连恢复或真机显示验收。
 
 ### 5.2 可选 PC 音频播放器

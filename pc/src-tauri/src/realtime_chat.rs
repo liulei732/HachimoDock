@@ -52,8 +52,10 @@ const SPEECH_START_FRAMES: usize = 3; // 60 ms above threshold
 const SPEECH_END_FRAMES: usize = 35; // 700 ms of silence
 const MAX_UTTERANCE_MS: u64 = 15_000;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const ASR_FINAL_TIMEOUT: Duration = Duration::from_secs(8);
-const FINAL_CAPTURE_LIMIT: usize = 576; // > 8 s final wait + existing 128-frame ingress
+const fn final_capture_limit(budget: Duration) -> usize {
+    budget.as_millis() as usize / 20 + 128 // Incoming 20 ms frames plus one ingress burst.
+}
+const FINAL_CAPTURE_LIMIT: usize = final_capture_limit(crate::volcengine_asr::MAX_FINAL_WAIT);
 const POST_SPEAK_GUARD: Duration = Duration::from_millis(250);
 const PLAYBACK_LEAD_MS: u64 = 1200;
 const PLAY_CHUNK_BYTES: usize = 3200; // 100 ms
@@ -73,6 +75,8 @@ const PREVIEW_MAX_SECONDS: u64 = 20;
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct VoiceSpec {
+    #[serde(skip_serializing_if = "crate::persona_tts::VoiceOverrides::is_empty")]
+    pub(crate) tts_overrides: crate::persona_tts::VoiceOverrides,
     pub speaker: String,
     pub clone_speaker_id: String,
     pub speed: f32,
@@ -80,6 +84,10 @@ pub struct VoiceSpec {
 }
 
 impl VoiceSpec {
+    pub(crate) fn tts_config(&self) -> Result<crate::doubao_tts::DoubaoTtsConfig, String> {
+        self.tts_overrides.config(&self.speaker, &self.clone_speaker_id, self.speed())
+    }
+
     fn speed(&self) -> f32 {
         if self.speed.is_finite() && self.speed > 0.0 { self.speed } else { 1.0 }
     }
@@ -121,6 +129,7 @@ pub struct RealtimeChatStatus {
     pub transcript: String,
     pub reply: String,
     pub error: String,
+    pub error_stage: Option<&'static str>,
     pub reason: String,
     pub started_at_ms: u64,
     pub turns: u32,
@@ -130,6 +139,19 @@ pub struct RealtimeChatStatus {
     pub search_sources: Vec<crate::web_search::Source>,
     pub search_retrieved_at: String,
     pub device_stop_state: String,
+}
+
+fn model_error_stage(reason: &str, error: &str) -> Option<&'static str> {
+    if error.is_empty() { return None; }
+    if error.starts_with(crate::model_issue::ASR) { return Some("asr"); }
+    if error.starts_with(crate::model_issue::TTS) { return Some("tts"); }
+    if error.starts_with(crate::model_issue::LLM) { return Some("chat"); }
+    match reason {
+        "asr" | "asr_timeout" => Some("asr"),
+        "tts" => Some("tts"),
+        "llm" => Some("chat"),
+        _ => None,
+    }
 }
 
 fn clear_search(status: &mut RealtimeChatStatus) {
@@ -297,6 +319,7 @@ fn publish(app: &AppHandle, session: &Session, update: impl FnOnce(&mut Realtime
                 next.reason = status.reason.clone();
                 next.error = status.error.clone();
             }
+            next.error_stage = model_error_stage(&next.reason, &next.error);
             *status = next;
             if status.state != previous {
                 diagnostics::record(&session.id, "state", json!({"state": status.state, "turn": status.turns}));
@@ -350,44 +373,74 @@ fn with_ordinary_audio_egress<T>(session:&Session,write:impl FnOnce()->Result<T,
     let _egress=session.audio_egress.lock().map_err(|_|"实时音频发送顺序不可用，未发送")?;
     let closing={session.audio_requests.lock().map_err(|_|"实时音频回执状态不可用")?.closing()};
     if session.cancelled.load(Ordering::SeqCst)||closing{return Err("实时对话已停止接收普通音频指令，未发送".into());}
-    write()
-}
-
-fn send_session_board(usb:&UsbSerialManager,session:&Session,topic:&str,payload:&Value)->Result<(),String>{
-    with_ordinary_audio_egress(session,||{
     if (session.transport.is_some() || session.wifi.is_some())&&(!transport_current(session)
         ||!active_slot().lock().ok().is_some_and(|slot|slot.as_ref().is_some_and(|s|std::ptr::eq(s.as_ref(),session)))){
         return Err("实时对话所有者或连接已变化，未发送".into());
     }
-    if let Some(link) = &session.wifi {
-        let id = payload["sessionId"].as_str().unwrap_or("");
-        use lan_audio::Playback;
-        return match topic {
-            "audio/play_begin" => link.playback(Playback::Begin, id, &[]),
-            "audio/play_chunk" => {
-                let bytes = payload["data"].as_str().ok_or("Wi-Fi 播放缺少音频。")?;
-                let bytes = zeroize::Zeroizing::new(BASE64.decode(bytes).map_err(|_| "Wi-Fi 播放音频格式无效。")?);
-                link.playback(Playback::Pcm, id, &bytes)
-            }
-            "audio/play_end" => link.playback(Playback::End, id, &[]),
-            "audio/play_flush" => link.playback(Playback::Flush, id, &[]),
-            "ui/conversation" => wifi::Link::hud(session, payload),
-            "audio/play_subtitle" => Ok(()),
-            _ => Err("这条指令不属于 Wi-Fi 实时音频协议。".into()),
-        };
-    }
-    let mut request=payload.clone();
-    if audio_ack::managed_topic(topic){
-        let id=session.audio_requests.lock().map_err(|_|"实时音频回执状态不可用")?
-            .issue(&session.id,topic,payload["sessionId"].as_str().unwrap_or(""))?;
-        request["requestId"]=json!(id);
-    }
-    send_bound_session_payload(usb,session,topic,&request)
+    write()
+}
+
+fn send_session_board(usb:&UsbSerialManager,session:&Session,topic:&str,payload:&Value)->Result<(),String>{
+    with_ordinary_audio_egress(session, || {
+        if session.wifi.is_some() {
+            return match topic {
+                "ui/conversation" => wifi::Link::hud(session, payload),
+                _ => Err("这条指令不属于 Wi-Fi 实时音频协议。".into()),
+            };
+        }
+        send_usb_audio(usb, session, topic, payload.clone())
     })
 }
 
-fn send_player_board(usb: &UsbSerialManager, session: &Session, topic: &str, payload: Value) {
-    if send_session_board(usb, session, topic, &payload).is_err() {
+fn send_usb_audio(usb: &UsbSerialManager, session: &Session, topic: &str, mut request: Value) -> Result<(), String> {
+    if audio_ack::managed_topic(topic){
+        let id=session.audio_requests.lock().map_err(|_|"实时音频回执状态不可用")?
+            .issue(&session.id,topic,request["sessionId"].as_str().unwrap_or(""))?;
+        request["requestId"]=json!(id);
+    }
+    send_bound_session_payload(usb,session,topic,&request)
+}
+
+#[derive(Clone, Copy)]
+enum PlaybackFrame<'a> {
+    Begin,
+    Pcm { seq: u32, bytes: &'a [u8] },
+    Subtitle { offset: u32, text: &'a str },
+    End { bytes: u64 },
+    Flush,
+}
+
+impl PlaybackFrame<'_> {
+    fn usb_payload(self, turn: &str) -> (&'static str, Value) {
+        match self {
+            PlaybackFrame::Begin => ("audio/play_begin", json!({"sessionId":turn,"sampleRate":16000,"channels":1,"format":"pcm_s16le"})),
+            PlaybackFrame::Pcm { seq, bytes } => ("audio/play_chunk", json!({"sessionId":turn,"seq":seq,"bytes":bytes.len(),"data":BASE64.encode(bytes)})),
+            PlaybackFrame::Subtitle { offset, text } => ("audio/play_subtitle", json!({"sessionId":turn,"offsetBytes":offset,"text":text})),
+            PlaybackFrame::End { bytes } => ("audio/play_end", json!({"sessionId":turn,"bytes":bytes})),
+            PlaybackFrame::Flush => ("audio/play_flush", json!({"sessionId":turn})),
+        }
+    }
+}
+
+fn send_playback(usb: &UsbSerialManager, session: &Session, turn: &str, frame: PlaybackFrame<'_>) -> Result<(), String> {
+    with_ordinary_audio_egress(session, || {
+        if let Some(link) = &session.wifi {
+            use lan_audio::Playback;
+            return match frame {
+                PlaybackFrame::Begin => link.playback(Playback::Begin, turn, &[]),
+                PlaybackFrame::Pcm { bytes, .. } => link.playback(Playback::Pcm, turn, bytes),
+                PlaybackFrame::Subtitle { offset, text } => link.subtitle(turn, offset, text),
+                PlaybackFrame::End { .. } => link.playback(Playback::End, turn, &[]),
+                PlaybackFrame::Flush => link.playback(Playback::Flush, turn, &[]),
+            };
+        }
+        let (topic, payload) = frame.usb_payload(turn);
+        send_usb_audio(usb, session, topic, payload)
+    })
+}
+
+fn send_player_board(usb: &UsbSerialManager, session: &Session, turn: &str, frame: PlaybackFrame<'_>) {
+    if send_playback(usb, session, turn, frame).is_err() {
         request_failure(session, "playback_write_failed", Some("设备音频传输失败，请检查设备连接后重试"));
     }
 }
@@ -447,7 +500,7 @@ fn hud(usb: &UsbSerialManager, board: &str, session_id: &str, state: &str, name:
 }
 
 fn user_caption(usb: &UsbSerialManager, board: &str, id: &str, name: &str, text: &str, final_text: bool) {
-    send_board(usb, board, "ui/conversation", json!({"sessionId":id,"state":"listening",
+    send_board(usb, board, "ui/conversation", json!({"sessionId":id,"state":if final_text { "thinking" } else { "listening" },
         "name":name,"text":text,"role":"user","final":final_text}));
 }
 
@@ -640,8 +693,7 @@ fn route_session_audio(session: &Session, topic: &str, payload: &Value) -> bool 
         return true;
     }
     if topic == "audio/error" {
-        let message = payload.get("error").or_else(|| payload.get("message")).and_then(Value::as_str).unwrap_or("device audio error");
-        request_failure(session, "device_audio_error", Some(&format!("设备音频错误：{message}")));
+        request_failure(session, "device_audio_error", Some("设备报告音频错误，请检查设备连接后重试"));
         return true;
     }
     if topic == "audio/end" && capture_terminal {
@@ -722,6 +774,7 @@ fn request_failure(session: &Session, reason: &str, error: Option<&str>) {
     status.reason = reason.to_owned();
     // Earlier recoverable-round warnings are not a new user-stop failure.
     status.error = error.unwrap_or_default().to_owned();
+    status.error_stage = model_error_stage(&status.reason, &status.error);
     drop(status);
     crate::smart_home::cancel_voice_session(&session.id);
     session.stop_notify.notify_one();
@@ -756,13 +809,13 @@ fn start_with_target(app: &AppHandle, mut input: RealtimeChatStartInput, lan_tar
     }
     let settings = voice_chat_settings::status()?;
     if !settings.llm_configured {
-        return Err("对话大模型未配置，请在「API 配置」填写大模型 API Key".to_string());
+        return Err("[LLM] 对话大模型未配置，请在「API 配置」填写大模型 API Key".to_string());
     }
     if !settings.tts_configured {
-        return Err("豆包 TTS 未配置，请在「API 配置」填写语音合成 API Key".to_string());
+        return Err("[TTS] 语音合成未配置，请在「API 配置」填写语音合成 API Key".to_string());
     }
     if !crate::volcengine_asr::settings_status()?.configured {
-        return Err("语音识别未配置，请先在 API 配置填写 ASR Key".into());
+        return Err("[ASR] 语音识别未配置，请先在 API 配置填写 ASR Key".into());
     }
     let usb = app.state::<UsbSerialManager>().inner().clone();
     let usb_status = usb.status();
@@ -1067,39 +1120,106 @@ impl Vad {
 enum PlayerCmd {
     Begin(String),
     Subtitle(String),
-    Pcm(Vec<u8>),
+    Pcm(Vec<u8>, tokio::sync::OwnedSemaphorePermit),
     End(std_mpsc::Sender<()>),
     Flush,
 }
 
+type PlayerCommands = Arc<Mutex<VecDeque<(u64, PlayerCmd)>>>;
+const PLAYER_CONTROL_LIMIT: usize = 32;
+
+// The one-slot channel wakes the worker and reports sender disconnect. The
+// deque lets Flush release stale PCM permits immediately, even during pacing.
+struct PlayerReceiver {
+    commands: PlayerCommands,
+    wake: std_mpsc::Receiver<()>,
+    pcm_budget: Arc<tokio::sync::Semaphore>,
+}
+
+impl PlayerReceiver {
+    fn recv(&self) -> Result<(u64, PlayerCmd), ()> {
+        loop {
+            if let Some(next) = self.commands.lock().map_err(|_| ())?.pop_front() {
+                return Ok(next);
+            }
+            self.wake.recv().map_err(|_| ())?;
+        }
+    }
+}
+
+impl Drop for PlayerReceiver {
+    fn drop(&mut self) {
+        self.pcm_budget.close();
+        if let Ok(mut commands) = self.commands.lock() { commands.clear(); }
+    }
+}
+
 #[derive(Clone)]
 struct Player {
-    tx: std_mpsc::Sender<(u64, PlayerCmd)>,
+    wake: std_mpsc::SyncSender<()>,
+    commands: PlayerCommands,
+    pcm_budget: Arc<tokio::sync::Semaphore>,
     epoch: Arc<AtomicU64>,
     ack_requests:Arc<Mutex<audio_ack::Requests>>,
 }
 impl Player {
-    fn send(&self, cmd: PlayerCmd) -> Result<(), ()> {
-        {let mut requests=self.ack_requests.lock().map_err(|_|())?;
-            match &cmd{PlayerCmd::Begin(id)=>requests.playback(Some(id)).map_err(|_|())?,
-                PlayerCmd::Flush=>requests.playback(None).map_err(|_|())?,_=>{}}
+    fn channel(ack_requests: Arc<Mutex<audio_ack::Requests>>) -> (Self, PlayerReceiver) {
+        let (tx, rx) = std_mpsc::sync_channel(1);
+        let commands = Arc::new(Mutex::new(VecDeque::new()));
+        let pcm_budget = Arc::new(tokio::sync::Semaphore::new(64000));
+        let receiver = PlayerReceiver { commands: commands.clone(), wake: rx, pcm_budget: pcm_budget.clone() };
+        (Self { wake: tx, commands, pcm_budget, epoch: Arc::new(AtomicU64::new(0)), ack_requests }, receiver)
+    }
+
+    async fn pcm(&self, epoch: u64, bytes: &[u8]) -> Result<(), String> {
+        for chunk in bytes.chunks(8000).filter(|c| !c.is_empty()) {
+            let permit = self.pcm_budget.clone().acquire_many_owned(chunk.len().max(FRAME_BYTES) as u32).await
+                .map_err(|_| "设备播放通道已关闭")?;
+            if self.epoch.load(Ordering::SeqCst) != epoch { return Err("本轮播放已取消".into()); }
+            self.enqueue(Some(epoch), PlayerCmd::Pcm(chunk.to_vec(), permit)).map_err(|_| "设备播放通道已关闭")?;
         }
-        let epoch = if matches!(&cmd, PlayerCmd::Flush) {
-            self.epoch.fetch_add(1, Ordering::SeqCst) + 1
-        } else { self.epoch.load(Ordering::SeqCst) };
-        self.tx.send((epoch, cmd)).map_err(|_| ())
+        Ok(())
+    }
+
+    fn send(&self, cmd: PlayerCmd) -> Result<(), ()> {
+        self.enqueue(None, cmd)
+    }
+
+    fn enqueue(&self, expected: Option<u64>, cmd: PlayerCmd) -> Result<(), ()> {
+        let mut commands = self.commands.lock().map_err(|_| ())?;
+        let mut epoch = self.epoch.load(Ordering::SeqCst);
+        if expected.is_some_and(|e| e != epoch) || self.pcm_budget.is_closed() { return Err(()); }
+        if matches!(cmd, PlayerCmd::Flush) {
+            self.ack_requests.lock().map_err(|_| ())?.playback(None).map_err(|_| ())?;
+            epoch = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+            commands.clear();
+        } else if !matches!(cmd, PlayerCmd::Pcm(..)) {
+            // Leave two control slots for a turn boundary when subtitles back up.
+            let limit = if matches!(cmd, PlayerCmd::Subtitle(_)) { PLAYER_CONTROL_LIMIT - 2 } else { PLAYER_CONTROL_LIMIT };
+            if commands.iter().filter(|(_, c)| !matches!(c, PlayerCmd::Pcm(..))).count() >= limit { return Err(()); }
+            if let PlayerCmd::Begin(id) = &cmd {
+                self.ack_requests.lock().map_err(|_| ())?.playback(Some(id)).map_err(|_| ())?;
+            }
+        }
+        commands.push_back((epoch, cmd));
+        match self.wake.try_send(()) {
+            Ok(()) | Err(std_mpsc::TrySendError::Full(())) => Ok(()),
+            Err(std_mpsc::TrySendError::Disconnected(())) => { commands.clear(); Err(()) }
+        }
     }
 }
 
 /// Dedicated thread: packs PCM into 100 ms `audio/play_chunk` frames and paces them so the board
 /// never holds more than ~1.2 s of audio ahead of real time.
 fn spawn_player(usb: UsbSerialManager, board: String, session: Arc<Session>) -> Player {
-    let subtitles = session.wifi.is_none() && usb.status().capabilities.pointer("/features/conversationSubtitles").and_then(Value::as_bool) == Some(true);
+    let subtitles = session.wifi.as_ref().map_or_else(
+        || usb.status().capabilities.pointer("/features/conversationSubtitles").and_then(Value::as_bool) == Some(true),
+        wifi::Link::timed_captions,
+    );
     let await_device = session.wifi.is_some() || (subtitles && active_session().map(|s| s.id == session.id).unwrap_or(false));
     let playback_lead_ms = if session.wifi.is_some() { wifi::PLAYBACK_LEAD_MS } else { PLAYBACK_LEAD_MS };
-    let (tx, rx) = std_mpsc::channel::<(u64, PlayerCmd)>();
-    let epoch = Arc::new(AtomicU64::new(0));
-    let player = Player { tx, epoch: epoch.clone(), ack_requests:session.audio_requests.clone() };
+    let (player, rx) = Player::channel(session.audio_requests.clone());
+    let epoch = player.epoch.clone();
     thread::spawn(move || {
         #[cfg(target_os = "macos")]
         let _audio_activity = {
@@ -1112,11 +1232,12 @@ fn spawn_player(usb: UsbSerialManager, board: String, session: Arc<Session>) -> 
         };
         let mut current_epoch = 0;
         let mut turn_id = String::new();
+        let mut turn_number = 0u64;
         let mut pending: Vec<u8> = Vec::new();
         let mut seq: u32 = 0;
         let mut begin_at: Option<Instant> = None;
         let mut sent_bytes: u64 = 0;
-        let flush_chunk = |usb: &UsbSerialManager, turn_id: &str, seq: &mut u32, chunk: &[u8], begin_at: &mut Option<Instant>, sent_bytes: &mut u64, expected: u64| {
+        let flush_chunk = |usb: &UsbSerialManager, turn_id: &str, turn_number: u64, seq: &mut u32, chunk: &[u8], begin_at: &mut Option<Instant>, sent_bytes: &mut u64, expected: u64| {
             if chunk.is_empty() {
                 return;
             }
@@ -1128,16 +1249,12 @@ fn spawn_player(usb: UsbSerialManager, board: String, session: Arc<Session>) -> 
             if session.cancelled.load(Ordering::SeqCst) || epoch.load(Ordering::SeqCst) != expected { return; }
             let write_started = Instant::now();
             let (pcm, gain) = playback_pcm(&session, chunk);
-            let result = send_session_board(
-                usb, &session,
-                "audio/play_chunk",
-                &json!({ "sessionId": turn_id, "seq": *seq, "bytes": pcm.len(), "data": BASE64.encode(&pcm) }),
-            );
+            let result = send_playback(usb, &session, turn_id, PlaybackFrame::Pcm { seq: *seq, bytes: &pcm });
             let elapsed_ms = write_started.elapsed().as_millis();
             // Metadata only: no PCM, transcript, key, port or personal path.
             if *seq < 3 || *seq % 10 == 0 || elapsed_ms >= 80 || result.is_err() {
                 diagnostics::record(&session.id, "playback_tx", json!({"seq":*seq,
-                    "bytes":chunk.len(),"elapsedMs":elapsed_ms,"ok":result.is_ok(),"volume":gain,
+                    "generation":expected,"turn":turn_number,"positionMs":*sent_bytes/32,"bytes":chunk.len(),"elapsedMs":elapsed_ms,"ok":result.is_ok(),"volume":gain,
                     "errorKind":result.as_ref().err().map(|error|diagnostics::error_kind(error))}));
             }
             if let Err(error) = result {
@@ -1153,43 +1270,60 @@ fn spawn_player(usb: UsbSerialManager, board: String, session: Arc<Session>) -> 
             if expected != epoch.load(Ordering::SeqCst) { continue; }
             if current_epoch != expected {
                 pending.clear(); begin_at = None; sent_bytes = 0;
-                send_player_board(&usb, &session, "audio/play_flush", json!({"sessionId":turn_id}));
+                if !turn_id.is_empty() {
+                    send_player_board(&usb, &session, &turn_id, PlaybackFrame::Flush);
+                    turn_id.clear();
+                }
                 current_epoch = expected;
             }
             match cmd {
                 PlayerCmd::Begin(id) => {
                     if let Ok(mut completed) = session.completed_playback.lock() { completed.clear(); }
                     turn_id = id;
+                    turn_number += 1;
                     pending.clear();
                     seq = 0;
                     begin_at = None;
                     sent_bytes = 0;
-                    send_player_board(
-                        &usb,
-                        &session,
-                        "audio/play_begin",
-                        json!({ "sessionId": turn_id, "sampleRate": 16000, "channels": 1, "format": "pcm_s16le" }),
-                    );
+                    send_player_board(&usb, &session, &turn_id, PlaybackFrame::Begin);
                 }
                 PlayerCmd::Subtitle(text) => {
                     if subtitles {
-                        send_player_board(&usb, &session, "audio/play_subtitle", json!({"sessionId":turn_id,
-                            "offsetBytes":sent_bytes + pending.len() as u64,"text":text}));
+                        let Ok(offset) = u32::try_from(sent_bytes + pending.len() as u64) else {
+                            request_failure(&session, "playback_offset_overflow", None);
+                            break;
+                        };
+                        send_player_board(&usb, &session, &turn_id, PlaybackFrame::Subtitle { offset, text: &text });
+                        diagnostics::record(&session.id, "playback_caption", json!({"generation":expected,"turn":turn_number,"seq":seq,"bytes":offset,"positionMs":offset/32}));
+                    } else {
+                        // The Wi-Fi HUD and older USB peers use the conversation envelope.
+                        let name = session.status.lock().map(|s| s.display_name.clone()).unwrap_or_default();
+                        send_board(&usb, &session.board_device_id, "ui/conversation", json!({
+                            "sessionId":session.id,"state":"speaking","name":name,"text":text,"final":true
+                        }));
                     }
                 }
-                PlayerCmd::Pcm(bytes) => {
-                    pending.extend_from_slice(&bytes);
-                    while pending.len() >= PLAY_CHUNK_BYTES {
-                        let chunk: Vec<u8> = pending.drain(..PLAY_CHUNK_BYTES).collect();
-                        flush_chunk(&usb, &turn_id, &mut seq, &chunk, &mut begin_at, &mut sent_bytes, expected);
-                        if session.cancelled.load(Ordering::SeqCst) || epoch.load(Ordering::SeqCst) != expected { pending.clear(); break; }
+                PlayerCmd::Pcm(bytes, _permit) => {
+                    let mut rest = bytes.as_slice();
+                    while !rest.is_empty() {
+                        // Send the first complete 20 ms frame, then resume normal pacing.
+                        // Wi-Fi pads a partial frame only at the end of a turn.
+                        let target = if seq == 0 { FRAME_BYTES } else { PLAY_CHUNK_BYTES };
+                        let n = rest.len().min(target - pending.len());
+                        pending.extend_from_slice(&rest[..n]);
+                        rest = &rest[n..];
+                        if pending.len() == target {
+                            flush_chunk(&usb, &turn_id, turn_number, &mut seq, &pending, &mut begin_at, &mut sent_bytes, expected);
+                            pending.clear();
+                            if session.cancelled.load(Ordering::SeqCst) || epoch.load(Ordering::SeqCst) != expected { break; }
+                        }
                     }
                 }
                 PlayerCmd::End(done) => {
                     let chunk = std::mem::take(&mut pending);
-                    flush_chunk(&usb, &turn_id, &mut seq, &chunk, &mut begin_at, &mut sent_bytes, expected);
+                    flush_chunk(&usb, &turn_id, turn_number, &mut seq, &chunk, &mut begin_at, &mut sent_bytes, expected);
                     if session.cancelled.load(Ordering::SeqCst) || epoch.load(Ordering::SeqCst) != expected { continue; }
-                    send_player_board(&usb, &session, "audio/play_end", json!({ "sessionId": turn_id, "bytes": sent_bytes }));
+                    send_player_board(&usb, &session, &turn_id, PlaybackFrame::End { bytes: sent_bytes });
                     if let Some(started) = begin_at {
                         let total = Duration::from_millis(sent_bytes * 1000 / 32_000);
                         let elapsed = started.elapsed();
@@ -1215,12 +1349,7 @@ fn spawn_player(usb: UsbSerialManager, board: String, session: Arc<Session>) -> 
                     begin_at = None;
                     sent_bytes = 0;
                 }
-                PlayerCmd::Flush => {
-                    pending.clear();
-                    send_player_board(&usb, &session, "audio/play_flush", json!({ "sessionId": turn_id }));
-                    begin_at = None;
-                    sent_bytes = 0;
-                }
+                PlayerCmd::Flush => {} // The epoch transition above owns the physical flush.
             }
         }
     });
@@ -1244,8 +1373,9 @@ async fn run_session(
     let mut desktop_conversation = crate::desktop_agent::Conversation::default();
     crate::smart_home::prepare_agent_capabilities();
 
-    let llm_cfg = voice_chat_settings::llm_config();
-    let tts_cfg = voice_chat_settings::tts_config(&voice.speaker, &voice.clone_speaker_id, voice.speed());
+    let llm_cfg = voice_chat_settings::llm_config().map_err(|e| crate::model_issue::local(crate::model_issue::LLM,e));
+    let tts_cfg = voice.tts_config()
+        .map_err(|e| crate::model_issue::local(crate::model_issue::TTS,e));
     let (llm_cfg, tts_cfg) = match (llm_cfg, tts_cfg) {
         (Ok(l), Ok(t)) => (l, t),
         (Err(error), _) | (_, Err(error)) => {
@@ -1268,27 +1398,26 @@ async fn run_session(
     // Validate TTS with the actual greeting before enabling continuous microphone capture.
     let greeting = input.greeting.trim().to_string();
     if !greeting.is_empty() {
-        let mut greeting_pcm = Vec::new();
-        if let Err(error) = tts.synthesize(&greeting, |pcm| greeting_pcm.extend_from_slice(pcm)).await {
-            finish(&app, &usb, &session, "tts", &error).await;
-            return;
-        }
-        if duplex {
-            if let Err(error) = begin_capture(&usb, &session, true).await {
-                finish(&app, &usb, &session, "audio", &error).await; return;
+        publish(&app, &session, |s| { s.state = "synthesizing".into(); s.reply = greeting.clone(); });
+        match listen_with_verified_barge_in(async {
+            speak_one_logged(&mut tts, &player, &greeting, &session.id, async {
+                if duplex {
+                    begin_capture(&usb, &session, true).await.map_err(|e| format!("设备收音启动失败：{e}"))?;
+                }
+                player.send(PlayerCmd::Begin(format!("{}-greeting", session.id))).map_err(|_| "设备播放队列不可用".to_string())
+            }, || speaking(&app, &session)).await?;
+            wait_playback(&player).await
+        }, &mut rx, &mut deferred_audio, &mut vad, duplex).await {
+            Ok(frames) => pending_speech = frames,
+            Err(error) => {
+                let stage = if error.starts_with("[TTS") { "tts" }
+                    else if error.starts_with(ASR_USER_ACTION_PREFIX) { "asr" } else { "audio" };
+                finish(&app, &usb, &session, stage, &error).await; return;
             }
         }
-        diagnostics::record(&session.id, "greeting_ready", json!({"bytes":greeting_pcm.len()}));
-        publish(&app, &session, |s| { s.state = "speaking".into(); s.reply = greeting.clone(); });
-        hud(&usb, &board, &session.id, "speaking", &name, "");
-        let _ = player.send(PlayerCmd::Begin(format!("{}-greeting", session.id)));
-        let _ = player.send(PlayerCmd::Subtitle(greeting.clone()));
-        let _ = player.send(PlayerCmd::Pcm(greeting_pcm));
-        match listen_with_verified_barge_in(async {wait_playback(&player).await; Ok(())}, &mut rx, &mut deferred_audio, &mut vad, duplex).await {
-            Ok(frames) => pending_speech = frames,
-            Err(error) => {finish(&app, &usb, &session, "audio", &error).await; return;}
+        if pending_speech.as_ref().is_some_and(|speech| !speech.reply_completed) {
+            let _ = player.send(PlayerCmd::Flush); tts.interrupt();
         }
-        if pending_speech.as_ref().is_some_and(|speech| !speech.reply_completed) { let _ = player.send(PlayerCmd::Flush); }
     }
     if !duplex || greeting.is_empty() {
         if let Err(error) = begin_capture(&usb, &session, duplex).await {
@@ -1344,7 +1473,7 @@ async fn run_session(
             publish(&app, &session, |s| {
                 s.state="listening".into(); s.transcript.clear();
                 s.reason="asr_timeout".into();
-                s.error="刚才语音识别中断，仍在聆听，请再说一次。".into();
+                s.error=format!("{error}。仍在聆听，请再说一次。");
             });
             user_caption(&usb, &board, &session.id, &name, "", false);
             hud(&usb, &board, &session.id, "listening", &name, "识别中断，请再说一次");
@@ -1363,7 +1492,7 @@ async fn run_session(
             user_caption(&usb,&board,&session.id,&name,&latest_asr,false);
             diagnostics::record(&session.id,"asr_started",json!({"turn":turns+1,"reason":"confirmed_barge_in"}));
         }
-        match apply_pending_persona(&session, &mut input, &mut tts).await {
+        match apply_pending_persona(&session, &mut input, &mut tts, false).await {
             Ok(true) => {
                 name = input.display_name.clone();
                 publish(&app, &session, |s| s.display_name = name.clone());
@@ -1377,12 +1506,12 @@ async fn run_session(
                 diagnostics::record(&session.id,"desktop_receipt",json!({"stage":"playback_started", "chars":message.chars().count()}));
                 desktop_conversation.push("desktop_receipt", &message);
                 let notification_turn=format!("{}-desktop-{}",session.id,now_ms());
-                let _=player.send(PlayerCmd::Begin(notification_turn));
-                publish(&app,&session,|s|{s.state="speaking".into();s.reply=message.clone();});
-                hud(&usb,&board,&session.id,"speaking",&name,"");
+                publish(&app,&session,|s|{s.state="synthesizing".into();s.reply=message.clone();});
                 let announcement=async {
-                    speak_one_logged(&mut tts,&player,&message,&session.id).await?;
-                    wait_playback(&player).await;Ok(())
+                    player.send(PlayerCmd::Begin(notification_turn)).map_err(|_| "设备播放队列不可用")?;
+                    speak_one_logged(&mut tts,&player,&message,&session.id, std::future::ready(Ok(())),
+                        || speaking(&app, &session)).await?;
+                    wait_playback(&player).await
                 };
                 match listen_with_verified_barge_in(announcement,&mut rx,&mut deferred_audio,&mut vad,duplex).await {
                     Ok(speech)=>{
@@ -1422,7 +1551,14 @@ async fn run_session(
                 };
                 if !asr_generation_matches(asr_generation, *generation) { continue; }
                 match event {
-                    StreamingSpeechEvent::Partial { text, .. } => { if !text.trim().is_empty() { latest_asr = text; } }
+                    StreamingSpeechEvent::Partial { text, .. } => {
+                        if !text.trim().is_empty() {
+                            if latest_asr.is_empty() {
+                                diagnostics::record(&session.id, "asr_first_partial", json!({"turn": turns + 1, "elapsedMs": asr_started_at.elapsed().as_millis()}));
+                            }
+                            latest_asr = text;
+                        }
+                    }
                     StreamingSpeechEvent::Final { text, .. } => {
                         if !text.trim().is_empty() { latest_asr = text; }
                         final_asr = Some(latest_asr.clone());
@@ -1517,10 +1653,13 @@ async fn run_session(
                             recognizer_terminal = false;
                             capture_stats.record(&session.id, turns+1);
                             publish(&app, &session, |s| s.state = "thinking".into());
-                            hud(&usb, &board, &session.id, "thinking", &name, "正在处理");
+                            if latest_asr.is_empty() {
+                                hud(&usb, &board, &session.id, "thinking", &name, "正在处理");
+                            }
                             let final_result = match final_asr.take() {
                                 Some(text) => Ok(text),
-                                None => await_with_capture(await_final_text(&mut events, latest_asr.clone()), &mut rx, &mut deferred_audio, duplex).await,
+                                None => wait_for_asr_final(&rec, &mut events, latest_asr.clone(),
+                                    &mut rx, &mut deferred_audio, duplex).await,
                             };
                             let text = match final_result {
                                 Ok(text) => text,
@@ -1550,20 +1689,19 @@ async fn run_session(
                                 continue;
                             }
                             turns += 1;
-                            if let Err(error) = apply_pending_persona(&session, &mut input, &mut tts).await {
+                            if let Err(error) = apply_pending_persona(&session, &mut input, &mut tts, true).await {
                                 finish(&app, &usb, &session, "config", &error).await; return;
                             }
                             name = input.display_name.clone();
                             publish(&app, &session, |s| s.display_name = name.clone());
                             let user_text = text.clone();
                             user_caption(&usb, &board, &session.id, &name, &user_text, true);
-                            hud(&usb, &board, &session.id, "thinking", &name, "");
                             publish(&app, &session, |s| { s.transcript = user_text.clone(); s.turns = turns; });
                             diagnostics::record(&session.id, "asr_final", json!({"turn":turns,"chars":user_text.chars().count(),"elapsedMs":asr_finish_at.elapsed().as_millis()}));
                             vad.reset();
                             vad.previous_user = user_text.clone();
                             vad.turn_started = Some(Instant::now());
-                            match listen_with_verified_barge_in(answer_turn(&app, &usb, &session, &llm_cfg, &input.system_prompt, &mut history, &mut desktop_conversation, &user_text, &mut tts, &player, &name), &mut rx, &mut deferred_audio, &mut vad, duplex).await {
+                            match listen_with_verified_barge_in(answer_turn(&app, &session, &llm_cfg, &input.system_prompt, &mut history, &mut desktop_conversation, &user_text, &mut tts, &player), &mut rx, &mut deferred_audio, &mut vad, duplex).await {
                                 Ok(Some(speech)) => {
                                     if !speech.reply_completed {
                                         // The reply future is now dropped: aborts LLM and TTS callbacks.
@@ -1687,6 +1825,10 @@ where F: std::future::Future<Output=Result<(), String>>,
         let mut voiced_frames = vad.speech_run;
         let mut confirmation = barge_policy::Confirmation::default();
         let mut input_finished = false;
+        // A slow preceding upload may have retained more audio than a short
+        // confirmation window. Keep that backlog and bound fresh arrivals too.
+        let max_new = BARGE_CONFIRM_MAX_FRAMES + 128;
+        let capture_limit = deferred.len().min(FINAL_CAPTURE_LIMIT) + max_new;
         let mut rejection = "no_transcript";
         loop {
             // Poll ASR and the reply even when Windows has delivered a burst of
@@ -1740,7 +1882,7 @@ where F: std::future::Future<Output=Result<(), String>>,
                     let Some(Input::Pcm(pcm, speech)) = incoming else { return Err("设备收音通道关闭".into()); };
                     if speech.is_none() || pcm.len() != FRAME_BYTES { return Err("设备 AEC/VAD 音频帧无效".into()); }
                     if input_finished {
-                        if deferred.len() >= FINAL_CAPTURE_LIMIT { return Err("收音缓冲已满".into()); }
+                        if deferred.len() >= capture_limit { return Err("收音缓冲已满".into()); }
                         deferred.push_back(Input::Pcm(pcm,speech));
                         continue;
                     }
@@ -1799,10 +1941,10 @@ where F: std::future::Future<Output=Result<(), String>> {
     }
 }
 
-/// ASR can take up to eight seconds to finalize; the live ingress queue only
+/// A buffered ASR upload can take up to a minute; the live ingress queue only
 /// holds 2.56 seconds. Keep draining it without discarding a user's next words.
 /// The bounded backlog is replayed through the same VAD before any new reply.
-async fn await_with_capture<F, T>(result: F, rx: &mut mpsc::Receiver<Input>, deferred: &mut VecDeque<Input>, duplex: bool) -> Result<T, String>
+async fn await_with_capture<F, T>(result: F, rx: &mut mpsc::Receiver<Input>, deferred: &mut VecDeque<Input>, duplex: bool, limit: usize) -> Result<T, String>
 where F: std::future::Future<Output=Result<T, String>> {
     if !duplex { return result.await; }
     tokio::pin!(result);
@@ -1812,7 +1954,7 @@ where F: std::future::Future<Output=Result<T, String>> {
             incoming = rx.recv() => {
                 let Some(Input::Pcm(pcm, speech)) = incoming else {return Err("设备收音通道关闭".into());};
                 if speech.is_none() || pcm.len() != FRAME_BYTES { return Err("设备 AEC/VAD 音频帧无效".into()); }
-                if deferred.len() >= FINAL_CAPTURE_LIMIT { return Err("语音识别等待过久，收音缓冲已满，请重新开始对话".into()); }
+                if deferred.len() >= limit { return Err("语音识别等待过久，收音缓冲已满，请重新开始对话".into()); }
                 deferred.push_back(Input::Pcm(pcm, speech));
             }
         }
@@ -1833,23 +1975,28 @@ fn queue_persona_update(session: &Session, input: RealtimeChatStartInput) -> Res
     Ok(true)
 }
 
-async fn apply_pending_persona(session: &Session, current: &mut RealtimeChatStartInput, tts: &mut DoubaoTtsClient) -> Result<bool, String> {
-    apply_pending_persona_with(session, current, tts, |voice| {
-        voice_chat_settings::tts_config(&voice.speaker, &voice.clone_speaker_id, voice.speed())
-    }).await
+async fn apply_pending_persona(session: &Session, current: &mut RealtimeChatStartInput, tts: &mut DoubaoTtsClient,
+    starting_reply: bool) -> Result<bool, String> {
+    apply_pending_persona_with(session, current, tts, starting_reply, VoiceSpec::tts_config).await
 }
 
 async fn apply_pending_persona_with(session: &Session, current: &mut RealtimeChatStartInput, tts: &mut DoubaoTtsClient,
-    config_for: impl FnOnce(&VoiceSpec) -> Result<crate::doubao_tts::DoubaoTtsConfig, String>) -> Result<bool, String> {
-    // Separate from the PCM queue: playback cleanup must never discard a saved update.
+    starting_reply: bool, config_for: impl FnOnce(&VoiceSpec) -> Result<crate::doubao_tts::DoubaoTtsConfig, String>) -> Result<bool, String> {
+    // A new reply can follow a provider switch even when the pet was not edited.
+    // Resolve once at the turn boundary, or when a changed voice is queued.
     let pending = session.pending_persona.lock().map_err(|_| "实时对话配置锁异常")?.take();
-    let Some(next) = pending else { return Ok(false) };
-    if next.voice.speaker != current.voice.speaker || next.voice.clone_speaker_id != current.voice.clone_speaker_id
-        || next.voice.speed() != current.voice.speed() {
-        let cfg = config_for(&next.voice)?;
-        tts.reset().await;
-        *tts = DoubaoTtsClient::new(cfg);
+    let voice_changed = pending.as_ref().is_some_and(|next| next.voice.speaker != current.voice.speaker
+        || next.voice.clone_speaker_id != current.voice.clone_speaker_id || next.voice.speed() != current.voice.speed()
+        || next.voice.tts_overrides != current.voice.tts_overrides);
+    if starting_reply || voice_changed {
+        let voice = pending.as_ref().map_or(&current.voice, |next| &next.voice);
+        let cfg = config_for(voice)?;
+        if tts.config() != &cfg {
+            tts.reset().await;
+            *tts = DoubaoTtsClient::new(cfg);
+        }
     }
+    let Some(next) = pending else { return Ok(false); };
     current.display_name = next.display_name;
     current.system_prompt = next.system_prompt;
     current.greeting = next.greeting;
@@ -1889,7 +2036,7 @@ fn recoverable_asr_error(error: &str) -> bool {
 const ASR_USER_ACTION_PREFIX: &str = "云端 ASR 需要用户处理：";
 
 fn asr_user_action_error(error: &str) -> String {
-    format!("{ASR_USER_ACTION_PREFIX}请检查语音识别配置、授权和额度后重新进入。{error}")
+    format!("{ASR_USER_ACTION_PREFIX}{}", crate::model_issue::local(crate::model_issue::ASR,error.into()))
 }
 
 fn asr_generation_matches(current: u64, incoming: u64) -> bool {
@@ -1897,6 +2044,23 @@ fn asr_generation_matches(current: u64, incoming: u64) -> bool {
 }
 
 fn asr_failure_cause(error: &str) -> &'static str {
+    let error = error.strip_prefix("[ASR] ").unwrap_or(error);
+    if error.starts_with("[CREDENTIALS]") { return "configuration"; }
+    if error.starts_with("[NETWORK]") {
+        if error.contains("证书") { return "configuration"; }
+        return if error.contains("超时") { "timeout" } else { "transport" };
+    }
+    for prefix in ["WebSocket HTTP ", "HTTP ", "code=", "WS "] {
+        if let Some(token) = error.strip_prefix(prefix).and_then(|raw| raw.split_whitespace().next()) {
+            return match token {
+                "401" | "402" | "403" | "404" | "407" | "429" | "1008" | "invalid_api_key" | "permission_denied"
+                    | "model_not_found" | "insufficient_quota" | "rate_limit_exceeded" => "configuration",
+                "408" | "45000081" => "timeout",
+                "502" | "503" | "504" | "1000" | "1001" | "1006" | "1011" | "1012" | "1013" => "transport",
+                _ => "service",
+            };
+        }
+    }
     let text = error.to_lowercase();
     let code = |raw: &str| -> Option<u32> {
         let end = raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len());
@@ -1958,8 +2122,16 @@ fn reset_timed_out_asr(vad: &mut Vad, latest: &mut String, displayed: &mut Strin
     deferred.retain(|input| !matches!(input, Input::Pcm(..)));
 }
 
+async fn wait_for_asr_final(rec: &StreamingSpeechRecognizer, events: &mut mpsc::UnboundedReceiver<StreamingSpeechEvent>,
+    latest: String, rx: &mut mpsc::Receiver<Input>, deferred: &mut VecDeque<Input>, duplex: bool) -> Result<String, String> {
+    let budget = rec.final_wait_budget();
+    let limit = final_capture_limit(budget);
+    await_with_capture(await_final_text_with_timeout(events, latest, budget), rx, deferred, duplex, limit).await
+}
+
+#[cfg(test)]
 async fn await_final_text(events: &mut mpsc::UnboundedReceiver<StreamingSpeechEvent>, latest: String) -> Result<String, String> {
-    await_final_text_with_timeout(events, latest, ASR_FINAL_TIMEOUT).await
+    await_final_text_with_timeout(events, latest, Duration::from_secs(9)).await
 }
 
 async fn await_final_text_with_timeout(events: &mut mpsc::UnboundedReceiver<StreamingSpeechEvent>, mut latest: String, budget: Duration) -> Result<String, String> {
@@ -1998,7 +2170,6 @@ fn remember_interrupted_reply(history:&mut Vec<ChatTurn>, conversation:&mut crat
 #[allow(clippy::too_many_arguments)]
 async fn answer_turn(
     app: &AppHandle,
-    usb: &UsbSerialManager,
     session: &Arc<Session>,
     llm_cfg: &persona_llm::LlmConfig,
     system_prompt: &str,
@@ -2007,39 +2178,38 @@ async fn answer_turn(
     user_text: &str,
     tts: &mut DoubaoTtsClient,
     player: &Player,
-    name: &str,
 ) -> Result<(), String> {
-    let board = session.board_device_id.clone();
     enum ReplyEvent { Sentence(String), Search(crate::web_search::Event) }
     // This receiver belongs only to this reply. Dropping it on a verified
     // interruption makes late events unreachable by subsequent turns.
     let (sentence_tx, mut sentence_rx) = mpsc::unbounded_channel::<ReplyEvent>();
     let search_tx=sentence_tx.clone();
     publish(app,session,|s| {clear_search(s); s.reply.clear(); s.error.clear();});
-    let mut splitter = SentenceSplitter::default();
+    let mut splitter = SentenceSplitter::for_buffered_tts(crate::voice_chat_settings::buffered_speech(&tts.config().tts_provider));
     let llm_cfg = llm_cfg.clone();
     let prompt = format!("{}{}", system_prompt, crate::shared_location::chat_context());
     let history_snapshot = history.clone();
     let user = user_text.to_string();
     let turn_started = Instant::now();
     let log_session = session.id.clone();
-    let desktop_context=crate::desktop_agent::Context::new(&session.id,&board,
-        session.status.lock().map(|s|s.turns).unwrap_or(0),user_text)
+    let turn_number = session.status.lock().map(|s|s.turns).unwrap_or(0);
+    let desktop_context=crate::desktop_agent::Context::new(&session.id,&session.board_device_id,
+        turn_number,user_text)
         .with_conversation(desktop_conversation).with_followed_agent();
     // Retain the user turn even if the reply future is interrupted or fails.
     desktop_conversation.push("user", user_text);
-    diagnostics::record(&session.id, "llm_started", json!({}));
+    diagnostics::record(&session.id, "llm_started", json!({"turn":turn_number}));
     let llm_task = tokio::spawn(async move {
         let mut first_delta = true;
         let mut first_sentence = true;
         let result = persona_llm::stream_chat_with_desktop(&llm_cfg, &prompt, &history_snapshot, &user, Some(&log_session), Some(desktop_context), |delta| {
             if first_delta {
-                diagnostics::record(&log_session, "llm_first_delta", json!({"elapsedMs":turn_started.elapsed().as_millis()}));
+                diagnostics::record(&log_session, "llm_first_delta", json!({"turn":turn_number,"elapsedMs":turn_started.elapsed().as_millis()}));
                 first_delta = false;
             }
             for sentence in splitter.push(delta) {
                 if first_sentence {
-                    diagnostics::record(&log_session, "llm_first_sentence", json!({"elapsedMs":turn_started.elapsed().as_millis()}));
+                    diagnostics::record(&log_session, "llm_first_sentence", json!({"turn":turn_number,"elapsedMs":turn_started.elapsed().as_millis()}));
                     first_sentence = false;
                 }
                 let _ = sentence_tx.send(ReplyEvent::Sentence(sentence));
@@ -2048,7 +2218,7 @@ async fn answer_turn(
         .await;
         if let Some(rest) = splitter.flush() {
             if first_sentence {
-                diagnostics::record(&log_session, "llm_first_sentence", json!({"elapsedMs":turn_started.elapsed().as_millis()}));
+                diagnostics::record(&log_session, "llm_first_sentence", json!({"turn":turn_number,"elapsedMs":turn_started.elapsed().as_millis()}));
             }
             let _ = sentence_tx.send(ReplyEvent::Sentence(rest));
         }
@@ -2069,7 +2239,6 @@ async fn answer_turn(
             event = sentence_rx.recv() => match event { Some(event) => event, None => break },
             _ = &mut slow_hint, if !spoken && !hinted => {
                 hinted = true;
-                hud(usb,&board,&session.id,"thinking",name,"已听清，正在处理");
                 diagnostics::record(&session.id,"model_wait_hint",json!({"elapsedMs":turn_started.elapsed().as_millis()}));
                 continue;
             }
@@ -2082,7 +2251,6 @@ async fn answer_turn(
             ReplyEvent::Search(event)=>{
                 if matches!(event,crate::web_search::Event::Started) {
                     hinted = true;
-                    hud(usb,&board,&session.id,"thinking",name,"正在联网查询");
                 }
                 publish(app,session,|s|update_search(s,event));
                 continue;
@@ -2096,34 +2264,40 @@ async fn answer_turn(
         if clean.is_empty() {
             continue;
         }
-        if !spoken {
+        let first_sentence = !spoken;
+        if first_sentence {
             spoken = true;
-            let _ = player.send(PlayerCmd::Begin(turn_id.clone()));
-            publish(app, session, |s| s.state = "speaking".into());
-            hud(usb, &board, &session.id, "speaking", name, "");
+            player.send(PlayerCmd::Begin(turn_id.clone())).map_err(|_| "设备播放队列不可用")?;
+            publish(app, session, |s| s.state = "synthesizing".into());
         }
         reply.push_str(&clean);
         let shown = reply.clone();
         publish(app, session, |s| s.reply = shown.clone());
-        speak_one_logged(tts, player, &clean, &session.id).await?;
+        speak_one_logged(tts, player, &clean, &session.id, std::future::ready(Ok(())),
+            || { if first_sentence {
+                diagnostics::record(&session.id, "reply_first_pcm_queued", json!({"turn":turn_number,"elapsedMs":turn_started.elapsed().as_millis()}));
+                speaking(app, session);
+            } }).await?;
     }
     let full = match llm_task.await {
         Ok(Ok(text)) => text,
         Ok(Err(error)) => {
             if spoken {
-                wait_playback(player).await;
+                let _ = wait_playback(player).await;
             }
             return Err(error);
         }
-        Err(error) => return Err(format!("对话任务异常: {error}")),
+        Err(_) => return Err("[LLM] 对话任务中断，请重试".into()),
     };
     if spoken {
-        wait_playback(player).await;
+        wait_playback(player).await?;
     } else {
         let fallback = "嗯……我刚才走神了，你再说一遍？";
-        let _ = player.send(PlayerCmd::Begin(turn_id.clone()));
-        speak_one(tts, player, fallback).await?;
-        wait_playback(player).await;
+        player.send(PlayerCmd::Begin(turn_id.clone())).map_err(|_| "设备播放队列不可用")?;
+        publish(app, session, |s| { s.state = "synthesizing".into(); s.reply = fallback.into(); });
+        speak_one_logged(tts, player, fallback, &session.id, std::future::ready(Ok(())),
+            || speaking(app, session)).await?;
+        wait_playback(player).await?;
     }
     crate::smart_home::arm_voice_pending(&session.id).await;
     diagnostics::record(&session.id, "turn_completed", json!({"chars": full.chars().count(),"elapsedMs":turn_started.elapsed().as_millis()}));
@@ -2135,39 +2309,51 @@ async fn answer_turn(
     Ok(())
 }
 
+fn speaking(app: &AppHandle, session: &Session) {
+    // Timed boards enter speaking on the playback cue; legacy HUDs receive
+    // state and text together. A later empty HUD would erase that caption.
+    publish(app, session, |s| s.state = "speaking".into());
+}
+
+#[cfg(test)]
 async fn speak_one(tts: &mut DoubaoTtsClient, player: &Player, text: &str) -> Result<(), String> {
-    speak_one_logged(tts, player, text, "").await
+    speak_one_logged(tts, player, text, "", std::future::ready(Ok(())), || {}).await
 }
 
-async fn speak_one_logged(tts: &mut DoubaoTtsClient, player: &Player, text: &str, session_id: &str) -> Result<(), String> {
-    let sender = player.clone();
+async fn speak_one_logged(tts: &mut DoubaoTtsClient, sender: &Player, text: &str, session_id: &str,
+    ready: impl std::future::Future<Output = Result<(), String>>, accepted: impl FnOnce()) -> Result<(), String> {
     let started = Instant::now();
-    let mut first_pcm = true;
-    tts.synthesize(text, |pcm| {
-        if first_pcm && !pcm.is_empty() {
-            let _ = sender.send(PlayerCmd::Subtitle(text.to_string()));
-            diagnostics::record(session_id, "tts_first_pcm", json!({"elapsedMs":started.elapsed().as_millis()}));
-            first_pcm = false;
+    let mut first = Some((ready, accepted));
+    let epoch = sender.epoch.load(Ordering::SeqCst);
+    let result = tts.synthesize_paced(text, |pcm| {
+        let first = if pcm.is_empty() { None } else { first.take() };
+        let bytes = pcm.to_vec();
+        async move {
+            if let Some((ready, accepted)) = first {
+                diagnostics::record(session_id, "tts_first_pcm", json!({"elapsedMs":started.elapsed().as_millis()}));
+                ready.await?;
+                sender.enqueue(Some(epoch), PlayerCmd::Subtitle(text.to_owned())).map_err(|_| "设备播放字幕队列不可用")?;
+                let (head, tail) = bytes.split_at(bytes.len().min(8000));
+                sender.pcm(epoch, head).await?;
+                accepted();
+                sender.pcm(epoch, tail).await
+            } else { sender.pcm(epoch, &bytes).await }
         }
-        let _ = sender.send(PlayerCmd::Pcm(pcm.to_vec()));
-    })
-    .await
-    .map(|_| ())
-    .map_err(|error| {
+    }).await;
+    result.and_then(|n| if n > 0 { Ok(()) } else { Err("语音合成没有返回音频".into()) }).map_err(|error| {
         diagnostics::record(session_id,"tts_turn_failed",json!({"errorKind":diagnostics::error_kind(&error)}));
-        format!("语音合成失败：{error}")
+        match error.as_str() {
+            e if e.starts_with("设备") || e.starts_with("本轮播放") => error,
+            _ => crate::model_issue::local(crate::model_issue::TTS,error),
+        }
     })
 }
 
-async fn wait_playback(player: &Player) {
+async fn wait_playback(player: &Player) -> Result<(), String> {
     let (done_tx, done_rx) = std_mpsc::channel::<()>();
-    if player.send(PlayerCmd::End(done_tx)).is_err() {
-        return;
-    }
-    let _ = tauri::async_runtime::spawn_blocking(move || {
-        let _ = done_rx.recv_timeout(Duration::from_secs(120));
-    })
-    .await;
+    player.send(PlayerCmd::End(done_tx)).map_err(|_| "设备播放队列不可用")?;
+    tauri::async_runtime::spawn_blocking(move || done_rx.recv_timeout(Duration::from_secs(120)))
+        .await.map_err(|_| "设备播放等待失败")?.map_err(|_| "设备播放完成等待失败".into())
 }
 
 /// The closure is the same one production finish uses: two pre-reserved,
@@ -2188,10 +2374,12 @@ fn attempt_terminal_controls(session:&Session,mut send:impl FnMut(audio_ack::Ter
 }
 
 async fn finish(app:&AppHandle,usb:&UsbSerialManager,session:&Arc<Session>,reason:&str,error:&str){
+    let error=error.strip_prefix(ASR_USER_ACTION_PREFIX).unwrap_or(error);
     {let Ok(mut status)=session.status.lock() else{return;};
         if !session.cancelled.swap(true,Ordering::SeqCst){
             if status.reason=="asr_timeout"{status.error.clear();}
             status.reason=reason.into();status.error=error.into();
+            status.error_stage=model_error_stage(reason,error);
         }
     }
     session.capture_armed.store(false,Ordering::SeqCst);session.capture_ready.store(false,Ordering::SeqCst);
@@ -2292,22 +2480,42 @@ async fn finish(app:&AppHandle,usb:&UsbSerialManager,session:&Arc<Session>,reaso
 
 // ---- preview -----------------------------------------------------------------------------------
 
-pub async fn preview(input: PersonaVoicePreviewInput) -> Result<(), String> {
+pub(crate) async fn preview_pcm(input: PersonaVoicePreviewInput) -> Result<Vec<u8>, String> {
     let text = input.text.trim().to_string();
     if text.is_empty() {
         return Err("没有可试听的文本".to_string());
     }
-    let cfg = voice_chat_settings::tts_config(&input.voice.speaker, &input.voice.clone_speaker_id, input.voice.speed())?;
+    let cfg = input.voice.tts_config()?;
     let mut client = DoubaoTtsClient::new(cfg);
     let mut pcm: Vec<u8> = Vec::new();
-    client.synthesize(&text, |chunk| pcm.extend_from_slice(chunk)).await?;
+    let limit = PREVIEW_MAX_SECONDS as usize * 32_000;
+    client.synthesize(&text, |chunk| {
+        pcm.extend_from_slice(&chunk[..chunk.len().min(limit - pcm.len())]);
+    }).await?;
     client.reset().await;
     scale_pcm16(&mut pcm, input.voice.volume());
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::pc_playback::play_pcm16_mono_16k(&pcm, Duration::from_secs(PREVIEW_MAX_SECONDS))
-    })
-    .await
-    .map_err(|error| format!("试听播放线程异常: {error}"))?
+    Ok(pcm)
+}
+
+fn preview_owner() -> &'static tokio::sync::watch::Sender<Option<String>> {
+    static OWNER: OnceLock<tokio::sync::watch::Sender<Option<String>>> = OnceLock::new();
+    OWNER.get_or_init(|| tokio::sync::watch::channel(None).0)
+}
+
+#[tauri::command]
+pub fn reserve_persona_voice_preview() -> String {
+    let id = uuid::Uuid::new_v4().to_string();
+    preview_owner().send_replace(Some(id.clone()));
+    id
+}
+
+#[tauri::command]
+pub fn cancel_persona_voice_preview(preview_id: String) {
+    preview_owner().send_if_modified(|active| {
+        if active.as_ref() != Some(&preview_id) { return false; }
+        *active = None;
+        true
+    });
 }
 
 // ---- tauri commands --------------------------------------------------------------------------
@@ -2329,8 +2537,23 @@ pub async fn realtime_chat_status() -> Result<RealtimeChatStatus, String> {
 }
 
 #[tauri::command]
-pub async fn persona_voice_preview(input: PersonaVoicePreviewInput) -> Result<(), String> {
-    preview(input).await
+pub async fn persona_voice_preview(input: PersonaVoicePreviewInput, preview_id: Option<String>) -> Result<(), String> {
+    let id = preview_id.unwrap_or_else(reserve_persona_voice_preview);
+    let mut owner = preview_owner().subscribe();
+    if owner.borrow_and_update().as_ref() != Some(&id) { return Ok(()); }
+    let result = tokio::select! {
+        biased;
+        _ = owner.changed() => Ok(()),
+        result = preview_pcm(input) => match result {
+            Err(error) => Err(error),
+            Ok(pcm) => tauri::async_runtime::spawn_blocking(move || {
+                crate::pc_playback::play_pcm16_mono_16k(&pcm, Duration::from_secs(PREVIEW_MAX_SECONDS),
+                    move || owner.has_changed().unwrap_or(true))
+            }).await.map_err(|_| "试听播放线程中断，请重试".to_string()).and_then(|r|r),
+        }
+    };
+    cancel_persona_voice_preview(id);
+    result
 }
 
 #[tauri::command]
@@ -2339,8 +2562,13 @@ pub async fn load_voice_chat_settings() -> Result<voice_chat_settings::VoiceChat
 }
 
 #[tauri::command]
+pub async fn test_voice_chat_model(input: voice_chat_settings::VoiceChatSettingsInput) -> Result<(), String> {
+    voice_chat_settings::test_model(input).await.map_err(|e| crate::model_issue::local(crate::model_issue::LLM,e))
+}
+
+#[tauri::command]
 pub async fn list_voice_chat_models(input: voice_chat_settings::VoiceChatSettingsInput) -> Result<Vec<String>, String> {
-    voice_chat_settings::list_models(input).await
+    voice_chat_settings::list_models(input).await.map_err(|e| crate::model_issue::local(crate::model_issue::LLM,e))
 }
 
 #[tauri::command]
@@ -2351,9 +2579,13 @@ pub async fn save_voice_chat_settings(
 }
 
 #[tauri::command]
-pub async fn clear_voice_chat_secret(which: String) -> Result<voice_chat_settings::VoiceChatSettingsStatus, String> {
-    voice_chat_settings::clear_secret(&which)
+pub async fn clear_voice_chat_secret(which: String, scope: Option<String>) -> Result<voice_chat_settings::VoiceChatSettingsStatus, String> {
+    voice_chat_settings::clear_secret(&which, scope.as_deref())
 }
+
+#[cfg(test)]
+#[path = "realtime_chat/voice_timing_tests.rs"]
+mod voice_timing_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2386,6 +2618,14 @@ mod tests {
         super::remember_interrupted_reply(&mut empty,&mut conversation,"安装Chrome","");
         assert_eq!(empty.len(),2);
     }
+    #[test]
+    fn typed_pcm_preserves_usb_wire_contract() {
+        use super::*;
+        let (topic, body) = PlaybackFrame::Pcm { seq: 17, bytes: &[0, 128, 255, 127] }.usb_payload("turn");
+        assert_eq!(topic, "audio/play_chunk");
+        assert_eq!(body, json!({"sessionId":"turn","seq":17,"bytes":4,"data":"AID/fw=="}));
+    }
+
     #[test]
     fn output_gain_is_global_and_applies_once_even_to_already_queued_pcm() {
         use super::*;
@@ -2528,7 +2768,7 @@ mod tests {
     fn player_begin_and_flush_retire_old_epoch_ack_before_replacement_utterance(){
         use super::*;
         let (session,_rx)=routing_session();session.capture_armed.store(true,Ordering::SeqCst);
-        let (tx,_commands)=std_mpsc::channel();let player=Player{tx,epoch:Arc::new(AtomicU64::new(0)),ack_requests:session.audio_requests.clone()};
+        let (player, _commands) = Player::channel(session.audio_requests.clone());
         player.send(PlayerCmd::Begin("rtc-new-a".into())).unwrap();
         let old=session.audio_requests.lock().unwrap().issue(&session.id,"audio/play_chunk","rtc-new-a").unwrap();
         player.send(PlayerCmd::Flush).unwrap();player.send(PlayerCmd::Begin("rtc-new-b".into())).unwrap();
@@ -2790,6 +3030,30 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn delayed_final_backlog_survives_barge_probe_finish() {
+        let (mic, mut rx) = mpsc::channel(1);
+        let mut deferred: VecDeque<_> = (0..20).map(|_| Input::Pcm(frame(400), Some(true))).collect();
+        deferred.extend((0..800).map(|_| Input::Pcm(frame(0), Some(false))));
+        mic.send(Input::Pcm(frame(0), Some(false))).await.unwrap();
+        let mut guards = Vec::new();
+        let mut vad = Vad::new();
+        let result = verify_barge_in_with(std::future::pending(), &mut rx, &mut deferred, &mut vad, true, |frames| {
+            let (mut probe, guard) = fake_barge_probe(frames, &[], true);
+            guards.push(guard);
+            let (tx, events) = mpsc::unbounded_channel();
+            probe.events = events;
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                tx.send(StreamingSpeechEvent::Final { revision: 1, text: "停".into(), confidence: None }).unwrap();
+            });
+            Ok(probe)
+        }).await.unwrap().unwrap();
+        assert!(result.terminal);
+        assert!(deferred.len() > 576);
+        assert_eq!(mic.capacity(), 1);
+    }
+
     #[test]
     fn noise_and_one_character_do_not_cancel_the_reply() {
         tauri::async_runtime::block_on(async {
@@ -3012,7 +3276,7 @@ mod tests {
                 tx
             });
             let mut deferred = VecDeque::new();
-            let text = await_with_capture(async {finished.await.unwrap(); Ok("first sentence")}, &mut rx, &mut deferred, true).await.unwrap();
+            let text = await_with_capture(async {finished.await.unwrap(); Ok("first sentence")}, &mut rx, &mut deferred, true, FINAL_CAPTURE_LIMIT).await.unwrap();
             let _tx = sender.await.unwrap();
             assert_eq!(text, "first sentence"); assert_eq!(deferred.len(),310);
             let mut vad = Vad::new();
@@ -3028,25 +3292,25 @@ mod tests {
             let (tx,mut rx)=mpsc::channel(2);
             let mut deferred=VecDeque::new();
             tx.send(Input::Pcm(frame(0),None)).await.unwrap();
-            assert!(await_with_capture(std::future::pending::<Result<(),String>>(),&mut rx,&mut deferred,true).await.is_err());
+            assert!(await_with_capture(std::future::pending::<Result<(),String>>(),&mut rx,&mut deferred,true,FINAL_CAPTURE_LIMIT).await.is_err());
             for _ in 0..FINAL_CAPTURE_LIMIT {deferred.push_back(Input::Pcm(frame(0),Some(false)));}
             tx.send(Input::Pcm(frame(0),Some(false))).await.unwrap();
-            assert!(await_with_capture(std::future::pending::<Result<(),String>>(),&mut rx,&mut deferred,true).await.is_err());
+            assert!(await_with_capture(std::future::pending::<Result<(),String>>(),&mut rx,&mut deferred,true,FINAL_CAPTURE_LIMIT).await.is_err());
             assert_eq!(deferred.len(),FINAL_CAPTURE_LIMIT);
         });
     }
 
     #[test]
     fn playback_flush_invalidates_already_queued_pcm_and_subtitles() {
-        let (tx,rx)=std_mpsc::channel();
-        let player=Player{tx,epoch:Arc::new(AtomicU64::new(0)),ack_requests:Arc::new(Mutex::new(Default::default()))};
+        let (player, rx) = Player::channel(Arc::new(Mutex::new(Default::default())));
         player.send(PlayerCmd::Begin("old".into())).unwrap();
-        player.send(PlayerCmd::Pcm(vec![1;640])).unwrap();
-        player.send(PlayerCmd::Subtitle("old".into())).unwrap();
+        tauri::async_runtime::block_on(player.pcm(0, &[1;640])).unwrap();
+        for _ in 1..PLAYER_CONTROL_LIMIT-2 { player.send(PlayerCmd::Subtitle("old".into())).unwrap(); }
+        assert!(player.send(PlayerCmd::Subtitle("overflow".into())).is_err());
         player.send(PlayerCmd::Flush).unwrap();
         player.send(PlayerCmd::Begin("new".into())).unwrap();
-        let epoch=player.epoch.load(Ordering::SeqCst);
-        for _ in 0..3 {assert_ne!(rx.recv().unwrap().0,epoch);}
+        assert!(player.enqueue(Some(0), PlayerCmd::Subtitle("late".into())).is_err());
+        assert_eq!(player.pcm_budget.available_permits(), 64000);
         assert!(matches!(rx.recv().unwrap(),(1,PlayerCmd::Flush)));
         assert!(matches!(rx.recv().unwrap(),(1,PlayerCmd::Begin(id)) if id=="new"));
     }
@@ -3071,7 +3335,7 @@ mod tests {
             assert!(queue_persona_update(&session, next).unwrap());
             session.input.try_send(Input::Pcm(vec![0; FRAME_BYTES], None)).unwrap(); drain_pending(&mut rx);
             let mut tts = DoubaoTtsClient::new(crate::doubao_tts::DoubaoTtsConfig::new("test", "old", "", 1.0, ""));
-            assert!(apply_pending_persona_with(&session, &mut current, &mut tts, |voice| {
+            assert!(apply_pending_persona_with(&session, &mut current, &mut tts, false, |voice| {
                 assert_eq!(voice.speaker, "new-speaker"); assert_eq!(voice.speed, 1.2); assert_eq!(voice.volume, 0.8);
                 Ok(crate::doubao_tts::DoubaoTtsConfig::new("test", &voice.speaker, "", voice.speed(), ""))
             }).await.unwrap());
@@ -3079,9 +3343,14 @@ mod tests {
             assert_eq!(current.board_device_id, "board"); assert_eq!(current.appearance_id, "pet-a");
             let mut prompt_only = current.clone(); prompt_only.system_prompt = "next prompt".into(); prompt_only.voice.volume = 0.6;
             queue_persona_update(&session, prompt_only).unwrap();
-            assert!(apply_pending_persona_with(&session, &mut current, &mut tts, |_| panic!("unchanged voice must reuse TTS")).await.unwrap());
+            assert!(apply_pending_persona_with(&session, &mut current, &mut tts, false, |_| panic!("unchanged voice must reuse TTS")).await.unwrap());
             assert_eq!(current.voice.volume, 0.6);
-            assert!(!apply_pending_persona_with(&session, &mut current, &mut tts, |_| panic!("no pending update")).await.unwrap());
+            assert!(!apply_pending_persona_with(&session, &mut current, &mut tts, false, |_| panic!("no pending update")).await.unwrap());
+            let mut changed_route = tts.config().clone();
+            changed_route.tts_provider = "mimo".into();
+            changed_route.tts_voice = "saved".into();
+            assert!(!apply_pending_persona_with(&session, &mut current, &mut tts, true, |_| Ok(changed_route)).await.unwrap());
+            assert_eq!(tts.config().tts_voice, "saved");
             session.cancelled.store(true, Ordering::SeqCst);
             assert!(!queue_persona_update(&session, current).unwrap());
         });
@@ -3137,6 +3406,18 @@ mod tests {
             tx.send(StreamingSpeechEvent::Final {revision:1,text:"帮我打开36kr".into(),confidence:None}).unwrap();
             assert_eq!(await_final_text_with_timeout(&mut rx,String::new(),Duration::from_millis(50)).await.unwrap(),"帮我打开36kr");
         });
+    }
+
+    #[test]
+    fn model_issue_asr_recovery_uses_status_without_retrying_configuration_denials() {
+        for error in ["[ASR] WebSocket HTTP 403 检查授权", "[ASR] WS 1008", "[ASR] code=invalid_api_key",
+            "[CREDENTIALS] 无法读取本地凭据", "[ASR] HTTP 429", "[ASR] [NETWORK] HTTPS 证书校验失败"] {
+            assert_eq!(asr_failure_cause(error),"configuration");
+            assert!(!recoverable_asr_error(error));
+        }
+        assert!(recoverable_asr_error("[ASR] code=45000081 等待音频超时"));
+        assert!(recoverable_asr_error("[ASR] WebSocket HTTP 503"));
+        assert!(!recoverable_asr_error("[ASR] code=unknown"));
     }
 
     #[test]
@@ -3426,7 +3707,7 @@ mod tests {
             player.send(PlayerCmd::Begin(id.clone())).unwrap();
             hud(&usb, &board, &id, "speaking", "音频测试", "");
             speak_one(&mut tts, &player, "你好，设备语音播放测试。请稍等。" ).await.unwrap();
-            wait_playback(&player).await;
+            wait_playback(&player).await.unwrap();
             tts.reset().await;
         });
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -3601,8 +3882,7 @@ mod tests {
                 let reply=async {
                     player.send(PlayerCmd::Begin(format!("{id}-{turn}"))).unwrap();
                     speak_one(&mut tts,&player,text).await?;
-                    wait_playback(&player).await;
-                    Ok(())
+                    wait_playback(&player).await
                 };
                 let interruption=timeout(Duration::from_secs(40),listen_with_verified_barge_in(reply,&mut rx,&mut deferred,&mut vad,true)).await.unwrap().unwrap();
                 if let Some(speech)=interruption.as_ref() {
@@ -3691,7 +3971,7 @@ mod tests {
                 println!("echo baseline frames={} (expected about 150 in 3 s)", frames[0]);
                 if frames[0]<110 || faults>0 {break;}
                 player.send(PlayerCmd::Begin(format!("{id}-play"))).unwrap();
-                player.send(PlayerCmd::Pcm(pcm.clone())).unwrap();
+                tauri::async_runtime::block_on(player.pcm(player.epoch.load(Ordering::SeqCst), &pcm)).unwrap();
                 let (done,_)=std_mpsc::channel();player.send(PlayerCmd::End(done)).unwrap();started=true;
             }
             if let Ok((topic,p))=events.recv_timeout(Duration::from_millis(30)) {

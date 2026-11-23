@@ -1,4 +1,4 @@
-//! Bounded service composition. No component IDs, scripts, arbitrary IPC or credentials.
+//! Bounded service composition, including isolated Python snapshots.
 use crate::app_services::Declaration;
 use crate::component_runtime_lifecycle::{enter_owner, Resource, ResourceOwner};
 use serde::{Deserialize, Serialize};
@@ -141,6 +141,11 @@ enum Source {
         hosts: Vec<String>,
         refresh_sec: u32,
     },
+    Python {
+        entry: String,
+        input: crate::component_python::Input,
+        refresh_sec: u32,
+    },
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -186,6 +191,7 @@ struct Receipt {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 enum Model {
+    TelemetryView { source: String, slot: u8 },
     AccountView {
         slot: u8,
         #[serde(default)]
@@ -232,12 +238,19 @@ fn plan(d: &Declaration) -> Result<Plan, String> {
     serde_json::from_value(d.content[0].clone())
         .map_err(|_| "组合声明包含未知字段或无效类型".into())
 }
+pub(crate) fn python_spec(d: &Declaration) -> Option<crate::component_python::Spec> {
+    if !is_engine(&d.engine) { return None; }
+    plan(d).ok()?.sources.into_values().find_map(|source| match source {
+        Source::Python { input, refresh_sec, .. } => Some(crate::component_python::Spec { input, refresh_sec }),
+        _ => None,
+    })
+}
 fn operations(source: &Source) -> &'static [&'static str] {
     match source {
         Source::Counter { .. } => &["increment", "decrement", "reset"],
         Source::Timer { .. } => &["start", "pause", "reset"],
         Source::Ledger { .. } => &["append", "remove_latest", "previous", "next"],
-        Source::JsonGet { .. } => &["refresh"],
+        Source::JsonGet { .. } | Source::Python { .. } => &["refresh"],
         Source::LocalTelemetry { source } => crate::local_telemetry::operations(source),
         Source::Document { .. } => &["set", "append", "remove"],
         Source::Collection { .. } => crate::component_collection::OPERATIONS,
@@ -399,6 +412,15 @@ pub fn validate(d: &Declaration, r: &Value) -> Result<(), String> {
             }
             Source::LocalTelemetry { source } => {
                 if !crate::local_telemetry::registered(source) { return Err("未注册的本机遥测源".into()); }
+            }
+            Source::Python { entry, input, refresh_sec } => {
+                if entry != crate::component_python::PATH || !(30..=86400).contains(refresh_sec)
+                    || p.sources.values().filter(|s| matches!(s, Source::Python { .. })).count() != 1 {
+                    return Err("每个组件需要一份 pc/plugin.py，刷新间隔须为 30–86400 秒".into());
+                }
+                if let crate::component_python::Input::HttpsJson { endpoint, hosts, pointer } = input {
+                    validate_public_get(&PublicGet { endpoint: endpoint.clone(), hosts: hosts.clone(), pointer: pointer.clone() })?;
+                }
             }
             Source::Clock {} => {}
             Source::Workflow { workflow } => {
@@ -566,7 +588,7 @@ fn validate_workflows(p: &Plan, d: &Declaration, r: &Value) -> Result<(), String
                 .filter(|(alias, _)| *alias != "flow")
                 .ok_or("流程目标无效")?;
             let source = &p.sources[alias];
-            if matches!(source, Source::JsonGet { .. } | Source::LocalTelemetry { .. } | Source::Workflow { .. } | Source::Collection { .. }) {
+            if matches!(source, Source::JsonGet { .. } | Source::Python { .. } | Source::LocalTelemetry { .. } | Source::Workflow { .. } | Source::Collection { .. }) {
                 return Err("本地事务流程不允许网络副作用，尚未提交请求".into());
             }
             if let Source::Document { initial } = source {
@@ -775,6 +797,15 @@ fn pointer(s: &str) -> bool {
         }
     }
     true
+}
+pub(crate) fn project_binding(runtime: &Value, key: &str, raw: &Value) -> Option<Value> {
+    let kind = runtime["vars"][key]["type"].as_str()?;
+    let value = if kind == "string" && raw.is_number() {
+        Value::String(raw.to_string())
+    } else {
+        raw.clone()
+    };
+    (scalar(&value, kind) && within_limits(runtime, key, &value)).then_some(value)
 }
 fn within_limits(r: &Value, key: &str, value: &Value) -> bool {
     match r["limits"].get(key) {
@@ -1030,10 +1061,12 @@ pub(crate) fn library_mutation<T>(id:&str,rename:impl FnOnce()->Result<T,String>
     if LIBRARY_REVISION.load(Ordering::Acquire)==u64::MAX{return Err("组件库版本计数已耗尽".into());}
     let result=rename()?;
     LIBRARY_REVISION.fetch_add(1,Ordering::AcqRel);
+    crate::component_python::disable(id);
     checkpoint_retired(revoke_component_jobs(id));
     Ok(result)
 }
 pub fn disable(id: &str) {
+    crate::component_python::disable(id);
     let jobs=revoke_component_jobs(id);
     if let Ok(_guard)=record_transaction().lock(){checkpoint_retired(jobs);}
 }
@@ -1542,6 +1575,11 @@ fn codex_account_value(
         slot: 1,
         view: Default::default(),
     });
+    if let Model::TelemetryView { source, slot } = model {
+        if source == "codex.accounts" {
+            *model = Model::AccountView { slot: *slot, view: Default::default() };
+        }
+    }
     let Model::AccountView { slot, view } = model else {
         return Err("组合服务配置与既有存档不兼容，未覆盖数据".into());
     };
@@ -1600,7 +1638,14 @@ fn source_value(
         Source::LocalTelemetry { source } if source == "codex.accounts" => {
             codex_account_value(alias, s, now, op, false)
         }
-        Source::LocalTelemetry { source } => crate::local_telemetry::snapshot(source, now, op == Some("refresh")),
+        Source::LocalTelemetry { source } => {
+            let model = s.models.entry(alias.into()).or_insert_with(|| Model::TelemetryView {
+                source: source.clone(), slot: 1,
+            });
+            let Model::TelemetryView { source: selected_source, slot } = model else { return Err(bad()); };
+            if selected_source != source { return Err(bad()); }
+            crate::local_telemetry::snapshot(source, slot, now, op)
+        }
         Source::Constant { value } => Ok(value.clone()),
         Source::Clock {} => {
             use chrono::{Datelike, TimeZone, Timelike};
@@ -1703,7 +1748,7 @@ fn source_value(
                 json!({"seconds":(remaining+999)/1000,"progress":((max-remaining)*100/max).clamp(0,100),"phase":if remaining==0{"finished"}else if started_ms.is_some(){"running"}else{"paused"}}),
             )
         }
-        Source::JsonGet { .. } => Err("网络源由有界后台执行器处理".into()),
+        Source::JsonGet { .. } | Source::Python { .. } => Err("该数据源由后台执行器处理".into()),
         Source::Ledger {
             unit,
             target,
@@ -1776,6 +1821,13 @@ fn snapshot_sources(
             let _ = NETWORK_ACCESS.set(pool);
             let (v, phase) = fetched(id, &alias, source, network_now(), op == Some("refresh"));
             values.insert(alias.clone(), v);
+            status.insert(alias, phase);
+            continue;
+        }
+        if let Source::Python { input, refresh_sec, .. } = source {
+            let spec = crate::component_python::Spec { input: input.clone(), refresh_sec: *refresh_sec };
+            let (value, phase) = crate::component_python::snapshot(id, spec, op == Some("refresh"));
+            values.insert(alias.clone(), value);
             status.insert(alias, phase);
             continue;
         }
@@ -2131,15 +2183,7 @@ fn request_with_dispatch(
     let mut errors = Vec::new();
     for (key, b) in &p.bindings {
         let raw = sources.get(&b.source).and_then(|s| s.pointer(&b.pointer));
-        let kind = r["vars"][key]["type"].as_str().unwrap_or("");
-        let projected = raw.and_then(|v| {
-            if kind == "string" && v.is_number() {
-                Some(Value::String(v.to_string()))
-            } else {
-                Some(v.clone())
-            }
-        });
-        let value = match projected.filter(|v| scalar(v, kind) && within_limits(r, key, v)) {
+        let value = match raw.and_then(|v| project_binding(r, key, v)) {
             Some(v) => v,
             None => {
                 errors.push(key.clone());
@@ -2256,7 +2300,7 @@ fn request_with_dispatch(
                 }
                 let ready = status.get(alias) != Some(&"error")
                     || op == "reset"
-                    || matches!(p.sources[alias], Source::JsonGet { .. } | Source::LocalTelemetry { .. });
+                    || matches!(p.sources[alias], Source::JsonGet { .. } | Source::Python { .. } | Source::LocalTelemetry { .. });
                 if let (
                     Source::Ledger {
                         unit,

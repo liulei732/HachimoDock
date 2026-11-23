@@ -53,6 +53,7 @@ esp_err_t pet_p4_renderer_render_boot(
   bool *pet_visible
 );
 void pet_p4_renderer_finish_boot(void);
+bool pet_p4_renderer_voice_draft_drawn(void);
 esp_err_t pet_p4_renderer_render(
   const pet_p4_runtime_state_t *state,
   const pet_p4_view_model_t *view,
@@ -83,11 +84,7 @@ void pet_p4_renderer_note_wait_holder(uint32_t wait_us,const char *holder,uint32
 #else
 static inline void pet_p4_renderer_note_wait_holder(uint32_t wait_us,const char *holder,uint32_t topic_hash){(void)wait_us;(void)holder;(void)topic_hash;}
 #endif
-/* Access under the same render mutex that protects the framebuffer. */
 const uint16_t *pet_p4_renderer_logical_framebuffer(int *width, int *height);
-#if PET_P4_SYSTEM_WIFI
-bool pet_p4_renderer_frame_is_private(void);
-#endif
 #if PET_P4_PARTICLES
 /* Any task: accepted transition plus its exact native component revision. */
 void pet_p4_renderer_note_action(const char *action,uint32_t revision);

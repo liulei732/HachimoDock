@@ -32,3 +32,16 @@ test('new boot may reuse sequence; malformed events never reach native',async()=
   for(const seq of [0,-1,1.2,0x100000000])await handler.handle({payload:{...token,seq}});
   await handler.handle({payload:{...token,boardDeviceId:'other'}});assert.equal(calls,2);
 });
+
+test('configuration failure reports only the original Wi-Fi key and leaves the detailed error on PC', async () => {
+  const reported = [], errors = [];
+  const handler = createRealtimePressHandler({
+    accept: async () => null,
+    configure: async () => { throw Error('synthetic local configuration detail'); },
+    onConfigurationFailure: async (...args) => { reported.push(args); throw Error('receipt unavailable'); },
+    onError: error => errors.push(error.message),
+  });
+  await handler.handle(event);
+  assert.deepEqual(reported, [[token]]);
+  assert.deepEqual(errors, ['synthetic local configuration detail']);
+});

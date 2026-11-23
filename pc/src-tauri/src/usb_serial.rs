@@ -100,6 +100,7 @@ mod appearance_activation_evidence;
 mod inbound_owner;
 #[cfg(test)]
 mod lifecycle_safety_tests;
+pub(crate) mod center_thumb;
 mod widget_transaction;
 pub(crate) mod catalog;
 pub(crate) mod program_autostart_host;
@@ -134,7 +135,7 @@ use firmware_transaction::{
     P4_FIRMWARE_CORRUPTION_RETRIES_BEFORE_FALLBACK,
     P4_FIRMWARE_MAX_IMAGE_SIZE, P4_FIRMWARE_RECONNECT_TIMEOUT,
 };
-pub(crate) use firmware_transaction::inspect_firmware_image;
+pub(crate) use firmware_transaction::{inspect_firmware_image, read_firmware_image};
 pub use firmware_transaction::FirmwareUpdateResult;
 #[cfg(test)]
 use firmware_transaction::{
@@ -1383,103 +1384,273 @@ pub(crate) struct ComponentCenterTitle {
     data: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GlobalCuePhase {
+    Slots,
+    Begin,
+    Chunk,
+    Commit,
+    Abort,
+}
+
+impl GlobalCuePhase {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Slots => "slot-query",
+            Self::Begin => "audio-begin",
+            Self::Chunk => "audio-chunk",
+            Self::Commit => "audio-commit",
+            Self::Abort => "audio-abort",
+        }
+    }
+}
+
+/// Run the global WAV transaction over a board- and boot-bound transport.
+/// A transport submits each mutation once and returns the authenticated phase ACK.
+pub(crate) fn sync_global_cues<E>(
+    app_data_dir: &Path,
+    expected_board_device_id: &str,
+    boot: &str,
+    id: &str,
+    current: impl Fn() -> Result<(), String>,
+    mut exchange: E,
+    abort_on_cancel: bool,
+    on_progress: impl Fn(u32, u32, u64, u64),
+) -> Result<(u32, u64, bool), String>
+where
+    E: FnMut(GlobalCuePhase, &serde_json::Value) -> Result<serde_json::Value, String>,
+{
+    current()?;
+    // Fresh, nonce-bound readonly proof; no cached activation or Full.
+    let query = serde_json::json!({"transferId":id,"queryNonce":id,"scope":"global",
+        "observationSchema":appearance_recovery::SCHEMA,
+        "expectedBoardDeviceId":expected_board_device_id,"expectedBootId":boot});
+    let state = exchange(GlobalCuePhase::Slots, &query)?;
+    current()?;
+    if state["ok"] != true
+        || state["transferId"] != id
+        || state["phase"] != "slot-query"
+        || state["queryNonce"].as_str() != Some(id)
+        || state["boardDeviceId"].as_str() != Some(expected_board_device_id)
+        || state["bootId"].as_str() != Some(boot)
+        || state["serialized"] != true
+        || state["quiescent"] != true
+        || state["observationSchema"].as_str() != Some(appearance_recovery::SCHEMA)
+        || state.get("errorCode").is_some()
+        || state.get("proof").is_some()
+        || !state["nativeIoEpoch"]
+            .as_u64()
+            .is_some_and(|n| n < u64::from(u32::MAX))
+    {
+        return Err("audio-only current identity proof unavailable".into());
+    }
+    for key in [
+        "snapshotChanged",
+        "assetTransferActive",
+        "rawReceiving",
+        "appearanceOwnerActive",
+        "assetFileOpen",
+        "assetSlotPending",
+        "nativeTransferActive",
+        "nativeReceiving",
+        "nativeWorkerPending",
+        "protocolWorkerPending",
+        "storageWorkerPending",
+        "firmwareOtaActive",
+        "rebootPending",
+    ] {
+        if state[key].as_bool() != Some(false) {
+            return Err("audio-only device is not quiescent".into());
+        }
+    }
+    let rows = state["slots"]
+        .as_array()
+        .filter(|rows| rows.len() == 2)
+        .ok_or("audio-only slot proof unavailable")?;
+    let mut seen = HashSet::new();
+    for row in rows {
+        let n = row["slot"]
+            .as_u64()
+            .filter(|n| *n <= 1)
+            .ok_or("audio-only invalid slot proof")?;
+        if !seen.insert(n) || row["valid"].as_bool().is_none() {
+            return Err("audio-only invalid slot proof".into());
+        }
+    }
+    let slots = parse_p4_appearance_slot_state(&state)?;
+    let active = slots
+        .active_slot
+        .and_then(|slot| slots.slots.iter().find(|s| s.slot == slot))
+        .ok_or("audio-only current slot unavailable")?;
+    // The active slot is readonly transport authority, not cue storage identity.
+    let slot = slots
+        .active_slot
+        .filter(|n| *n <= 1)
+        .ok_or("audio-only current slot unavailable")?;
+    if active.pack_id.len() != 64
+        || !active
+            .pack_id
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    {
+        return Err("audio-only current identity unavailable".into());
+    }
+    let global_dir = app_data_dir.join("global-audio-cues");
+    let (files, _) = load_p4_audio_patch_files(&global_dir, app_data_dir, true)?;
+    let total = p4_audio_patch_byte_count(&files)?;
+    let metadata = files
+        .iter()
+        .map(|f| {
+            serde_json::json!({"family":f.family,"path":f.path,
+        "size":f.bytes.len(),"checksum":asset_checksum_hex(&f.bytes)})
+        })
+        .collect::<Vec<_>>();
+    let binding = || {
+        serde_json::json!({"transferId":id,
+        "boardDeviceId":expected_board_device_id,"bootId":boot,"slot":slot,
+        "packId":active.pack_id,"scope":"global"})
+    };
+    let mut begin = binding();
+    begin["files"] = serde_json::json!(metadata);
+    begin["totalBytes"] = serde_json::json!(total);
+    current()?;
+    // New protocol only: original manifest/raw/builtin files remain
+    // protected. Unknown results never reach a replay, Full or abort.
+    let admitted = exchange(GlobalCuePhase::Begin, &begin)?;
+    let exact = |ack: &serde_json::Value, phase: &str| {
+        ack["ok"].as_bool() == Some(true)
+            && ack.get("errorCode").is_none()
+            && ack.get("error").is_none()
+            && ack["transferId"].as_str() == Some(id)
+            && ack["phase"].as_str() == Some(phase)
+            && ack["boardDeviceId"].as_str() == Some(expected_board_device_id)
+            && ack["bootId"].as_str() == Some(boot)
+            && ack["slot"].as_u64() == Some(u64::from(slot))
+            && ack["packId"].as_str() == Some(active.pack_id.as_str())
+    };
+    if !exact(&admitted, "audio-begin") {
+        return Err("audio-only admission outcome unknown; no replay".into());
+    }
+    // An explicit cancellation between acknowledged phases may retire the exact
+    // admitted LAN staging transaction. Never send abort after an uncertain send.
+    let check_before_write = |send: &mut E| -> Result<(), String> {
+        match current() {
+            Err(error) if abort_on_cancel && error == APPEARANCE_SYNC_CANCELLED_ERROR => {
+                let ack = send(GlobalCuePhase::Abort, &binding())?;
+                if !exact(&ack, "audio-abort") {
+                    return Err("音效中止结果未确认。".into());
+                }
+                Err(error)
+            }
+            result => result,
+        }
+    };
+    p4_audio_patch_send_files(
+        &files,
+        |path, index, offset, chunk| {
+            check_before_write(&mut exchange)?;
+            let mut payload = binding();
+            payload["path"] = serde_json::json!(path);
+            payload["index"] = serde_json::json!(index);
+            payload["offset"] = serde_json::json!(offset);
+            payload["data"] =
+                serde_json::json!(base64::engine::general_purpose::STANDARD.encode(chunk));
+            let ack = exchange(GlobalCuePhase::Chunk, &payload)?;
+            let next = offset + chunk.len() as u64;
+            if !exact(&ack, "audio-chunk")
+                || ack["path"].as_str() != Some(path)
+                || ack["index"].as_u64() != Some(u64::from(index))
+                || ack["nextIndex"].as_u64() != Some(u64::from(index) + 1)
+                || ack["receivedBytes"].as_u64() != Some(next)
+            {
+                return Err("audio-only chunk outcome unknown; no replay".into());
+            }
+            Ok(())
+        },
+        &on_progress,
+    )?;
+    check_before_write(&mut exchange)?;
+    let mut commit = binding();
+    commit["files"] = serde_json::json!(files.len());
+    commit["totalBytes"] = serde_json::json!(total);
+    let committed = exchange(GlobalCuePhase::Commit, &commit)?;
+    if !exact(&committed, "audio-commit")
+        || committed["files"].as_u64() != Some(files.len() as u64)
+        || committed["totalBytes"].as_u64() != Some(total)
+        || !committed["audioGeneration"]
+            .as_u64()
+            .is_some_and(|n| n > 0 && n <= u64::from(u32::MAX))
+    {
+        return Err("audio-only commit outcome unknown; no replay".into());
+    }
+    current()?;
+    Ok((files.len() as u32, total, false))
+}
+
 impl UsbSerialManager {
     pub fn sync_appearance_audio_only_p4<F>(
-        &self, _appearance_dir: &Path, app_data_dir: &Path,
-        expected_board_device_id: &str, _builtin: bool, on_progress: F,
+        &self,
+        _appearance_dir: &Path,
+        app_data_dir: &Path,
+        expected_board_device_id: &str,
+        _builtin: bool,
+        on_progress: F,
     ) -> Result<(u32, u64, bool), String>
-    where F: Fn(u32, u32, u64, u64) {
-        let guard = self.asset_transfer_guard.lock().map_err(|_| "audio-only owner unavailable")?;
-        self.with_appearance_user_intent(expected_board_device_id, &guard, || {
+    where
+        F: Fn(u32, u32, u64, u64),
+    {
+        let guard = self
+            .asset_transfer_guard
+            .lock()
+            .map_err(|_| "audio-only owner unavailable")?;
+        self.with_appearance_user_intent(expected_board_device_id, None, &guard, || {
             let (status, generation) = self.connected_board_snapshot(expected_board_device_id)?;
             if status.capabilities["globalAudioCues"].as_str() != Some("p4-global-audio-cues-v1") {
-                return Err("设备固件不支持安全的独立音效更新，请升级固件；未下发视频或切换形象。".into());
+                return Err(
+                    "设备固件不支持安全的独立音效更新，请升级固件；未下发视频或切换形象。".into(),
+                );
             }
             let boot = status.boot_id.clone();
-            if boot.is_empty() { return Err("audio-only boot identity unavailable".into()); }
+            if boot.is_empty() {
+                return Err("audio-only boot identity unavailable".into());
+            }
             let current = || -> Result<(), String> {
                 self.ensure_appearance_sync_not_cancelled(None)?;
                 self.check_appearance_connection()?;
                 let (now, id) = self.connected_board_snapshot(expected_board_device_id)?;
-                if id != generation || now.boot_id != boot { return Err("audio-only connection changed; no replay".into()); }
+                if id != generation || now.boot_id != boot {
+                    return Err("audio-only connection changed; no replay".into());
+                }
                 Ok(())
             };
             let id = format!("audio-only-{}", uuid::Uuid::new_v4());
-            current()?;
-            // Fresh, nonce-bound readonly proof; no cached activation or Full.
-            let query = serde_json::json!({"transferId":id,"queryNonce":id,
-                "observationSchema":appearance_recovery::SCHEMA,
-                "expectedBoardDeviceId":expected_board_device_id,"expectedBootId":boot});
-            let state = self.send_asset_command_and_wait_timeout("asset/slot-query", &query, &id, "slot-query", None, None, ASSET_STAT_TIMEOUT)?;
-            current()?;
-            if state["queryNonce"].as_str()!=Some(id.as_str()) || state["boardDeviceId"].as_str()!=Some(expected_board_device_id)
-                || state["bootId"].as_str()!=Some(boot.as_str()) || state["serialized"]!=true || state["quiescent"]!=true
-                || state["observationSchema"].as_str()!=Some(appearance_recovery::SCHEMA)
-                || state.get("errorCode").is_some() || state.get("proof").is_some()
-                || !state["nativeIoEpoch"].as_u64().is_some_and(|n|n<u64::from(u32::MAX)) {
-                return Err("audio-only current identity proof unavailable".into());
-            }
-            for key in ["snapshotChanged","assetTransferActive","rawReceiving","appearanceOwnerActive",
-                "assetFileOpen","assetSlotPending","nativeTransferActive","nativeReceiving",
-                "nativeWorkerPending","protocolWorkerPending","storageWorkerPending","firmwareOtaActive","rebootPending"] {
-                if state[key].as_bool()!=Some(false) { return Err("audio-only device is not quiescent".into()); }
-            }
-            let rows=state["slots"].as_array().filter(|rows|rows.len()==2).ok_or("audio-only slot proof unavailable")?;
-            let mut seen=HashSet::new();
-            for row in rows {
-                let n=row["slot"].as_u64().filter(|n|*n<=1).ok_or("audio-only invalid slot proof")?;
-                if !seen.insert(n)||row["valid"].as_bool().is_none() {return Err("audio-only invalid slot proof".into());}
-            }
-            let slots = parse_p4_appearance_slot_state(&state)?;
-            let active = slots.active_slot.and_then(|slot| slots.slots.iter().find(|s| s.slot==slot)).ok_or("audio-only current slot unavailable")?;
-            // The active slot is readonly transport authority, not cue storage identity.
-            let slot=slots.active_slot.filter(|n| *n<=1).ok_or("audio-only current slot unavailable")?;
-            if active.pack_id.len()!=64 || !active.pack_id.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
-                return Err("audio-only current identity unavailable".into());
-            }
-            let global_dir=app_data_dir.join("global-audio-cues");
-            let (files, _) = load_p4_audio_patch_files(&global_dir, app_data_dir, true)?;
-            let total = p4_audio_patch_byte_count(&files)?;
-            let metadata = files.iter().map(|f| serde_json::json!({"family":f.family,"path":f.path,
-                "size":f.bytes.len(),"checksum":asset_checksum_hex(&f.bytes)})).collect::<Vec<_>>();
-            let binding = || serde_json::json!({"transferId":id,
-                "boardDeviceId":expected_board_device_id,"bootId":boot,"slot":slot,
-                "packId":active.pack_id,"scope":"global"});
-            let mut begin = binding();
-            begin["files"] = serde_json::json!(metadata);
-            begin["totalBytes"] = serde_json::json!(total);
-            current()?;
-            // New protocol only: original manifest/raw/builtin files remain
-            // protected. Unknown results never reach a replay, Full or abort.
-            let admitted = self.send_asset_command_and_wait("asset/audio-begin", &begin, &id, "audio-begin", None, None)?;
-            let exact = |ack: &serde_json::Value, phase: &str| ack["ok"].as_bool()==Some(true)
-                &&ack["transferId"].as_str()==Some(id.as_str())&&ack["phase"].as_str()==Some(phase)
-                &&ack["boardDeviceId"].as_str()==Some(expected_board_device_id)&&ack["bootId"].as_str()==Some(boot.as_str())
-                &&ack["slot"].as_u64()==Some(u64::from(slot))&&ack["packId"].as_str()==Some(active.pack_id.as_str());
-            if !exact(&admitted,"audio-begin") { return Err("audio-only admission outcome unknown; no replay".into()); }
-            p4_audio_patch_send_files(&files, |path, index, offset, chunk| {
-                current()?;
-                let mut payload=binding();
-                payload["path"]=serde_json::json!(path);
-                payload["index"]=serde_json::json!(index);
-                payload["offset"]=serde_json::json!(offset);
-                payload["data"]=serde_json::json!(base64::engine::general_purpose::STANDARD.encode(chunk));
-                let ack=self.send_asset_command_and_wait("asset/audio-chunk",&payload,&id,"audio-chunk",Some(path),Some(index))?;
-                let next=offset+chunk.len() as u64;
-                if !exact(&ack,"audio-chunk")||ack["path"].as_str()!=Some(path)
-                    ||ack["index"].as_u64()!=Some(u64::from(index))||ack["nextIndex"].as_u64()!=Some(u64::from(index)+1)
-                    ||ack["receivedBytes"].as_u64()!=Some(next) {return Err("audio-only chunk outcome unknown; no replay".into());}
-                Ok(())
-            }, &on_progress)?;
-            current()?;
-            let mut commit=binding();
-            commit["files"]=serde_json::json!(files.len());commit["totalBytes"]=serde_json::json!(total);
-            let committed=self.send_asset_command_and_wait("asset/audio-commit",&commit,&id,"audio-commit",None,None)?;
-            if !exact(&committed,"audio-commit")||committed["files"].as_u64()!=Some(files.len() as u64)
-                ||committed["totalBytes"].as_u64()!=Some(total)
-                ||!committed["audioGeneration"].as_u64().is_some_and(|n|n>0) {return Err("audio-only commit outcome unknown; no replay".into());}
-            current()?;
-            Ok((files.len() as u32,total,false))
+            sync_global_cues(
+                app_data_dir,
+                expected_board_device_id,
+                &boot,
+                &id,
+                current,
+                |phase, payload| {
+                    let index = payload["index"]
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok());
+                    self.send_asset_command_and_wait_timeout(
+                        &format!("asset/{}", phase.label()),
+                        payload,
+                        &id,
+                        phase.label(),
+                        payload["path"].as_str(),
+                        index,
+                        if phase == GlobalCuePhase::Slots {
+                            ASSET_STAT_TIMEOUT
+                        } else {
+                            ASSET_ACK_TIMEOUT
+                        },
+                    )
+                },
+                false,
+                on_progress,
+            )
         })
     }
 }
@@ -1595,12 +1766,7 @@ where
                 return Ok((0, 0, true));
             }
         }
-        Err(error) => {
-            eprintln!(
-                "[usb-p4-native-ota] slot reuse unavailable; falling back to full sync: {}",
-                error
-            );
-        }
+        Err(error) => return Err(error),
     }
     ensure_p4_native_full_pack_supported(&assets)?;
     eprintln!(
@@ -1839,6 +2005,7 @@ pub struct UsbSerialManager {
     widget_resume: Arc<Mutex<Option<WidgetTransferIntent>>>,
     media_requests_pending: Arc<AtomicUsize>,
     appearance_sync_active: Arc<AtomicBool>,
+    appearance_sync_owner: Arc<Mutex<Option<String>>>,
     appearance_sync_cancel_requested: Arc<AtomicBool>,
     serial_body_write_active: Arc<AtomicBool>,
     // Board wedge (deadlock) detector: set by the heartbeat monitor when the
@@ -2269,6 +2436,7 @@ impl UsbSerialManager {
             widget_resume: Arc::new(Mutex::new(None)),
             media_requests_pending: Arc::new(AtomicUsize::new(0)),
             appearance_sync_active: Arc::new(AtomicBool::new(false)),
+            appearance_sync_owner: Arc::new(Mutex::new(None)),
             appearance_sync_cancel_requested: Arc::new(AtomicBool::new(false)),
             serial_body_write_active: Arc::new(AtomicBool::new(false)),
             board_wedged: Arc::new(AtomicBool::new(false)),
@@ -2320,16 +2488,31 @@ impl UsbSerialManager {
     }
 
     pub fn begin_appearance_sync(&self) -> Result<(), String> {
+        self.begin_owned_appearance_sync(None)
+    }
+
+    pub fn begin_owned_appearance_sync(&self, request: Option<String>) -> Result<(), String> {
+        if request.as_ref().is_some_and(|id| uuid::Uuid::parse_str(id).is_err()) {
+            return Err("形象传输请求标识无效".into());
+        }
+        let mut owner = self.appearance_sync_owner.lock().map_err(|_| "形象传输状态不可用")?;
         self.appearance_sync_active
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .map_err(|_| "已有形象素材正在传输，请等待完成或先中断当前传输".to_string())?;
         self.appearance_sync_cancel_requested
             .store(false, Ordering::SeqCst);
+        *owner = request;
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn cancel_appearance_sync(&self) -> bool {
-        if !self.appearance_sync_active.load(Ordering::SeqCst) {
+        self.cancel_owned_appearance_sync(None)
+    }
+
+    pub fn cancel_owned_appearance_sync(&self, request: Option<&str>) -> bool {
+        let Ok(owner) = self.appearance_sync_owner.lock() else { return false };
+        if !self.appearance_sync_active.load(Ordering::SeqCst) || owner.as_deref() != request {
             return false;
         }
         self.appearance_sync_cancel_requested
@@ -2338,6 +2521,8 @@ impl UsbSerialManager {
     }
 
     pub fn finish_appearance_sync(&self) {
+        let mut owner = self.appearance_sync_owner.lock().unwrap_or_else(|e| e.into_inner());
+        *owner = None;
         self.appearance_sync_active.store(false, Ordering::SeqCst);
         self.appearance_sync_cancel_requested
             .store(false, Ordering::SeqCst);
@@ -2889,12 +3074,20 @@ impl UsbSerialManager {
                     // reader may attach physical connection provenance.
                     let scope = status_snapshot.lock().ok().and_then(|status| {
                         (status.connected && status.connection_id == connection_id.to_string())
-                            .then(|| serde_json::json!({
-                                "boardDeviceId": status.board_device_id,
-                                "connectionId": status.connection_id,
-                                "bootId": status.boot_id,
-                                "runtime": status.runtime,
-                            }))
+                            .then(|| {
+                                let mut scope = serde_json::json!({
+                                    "boardDeviceId": status.board_device_id,
+                                    "connectionId": status.connection_id,
+                                    "bootId": status.boot_id,
+                                    "runtime": status.runtime,
+                                });
+                                if matches!(msg.topic.as_str(), "audio/begin" | "input/event")
+                                    && status.capabilities["voiceFeedback"] == crate::device_voice_feedback::ENGINE
+                                {
+                                    scope["voiceFeedback"] = crate::device_voice_feedback::ENGINE.into();
+                                }
+                                scope
+                            })
                     });
                     let Some(scope) = scope else { continue; };
                     let Some(payload) = msg.payload.as_object_mut() else { continue; };
@@ -3127,37 +3320,18 @@ impl UsbSerialManager {
         }
         self.send_inner("widget/data", payload, true, Some(board), connection, None)
     }
-    #[cfg(test)]
-    pub(crate) fn send_app_snapshot(&self, board: &str, payload: &serde_json::Value) -> Result<(), String> {
-        self.send_app_snapshot_inner(board, None, payload, true)
+    pub(crate) fn send_app_snapshot(&self,board:&str,payload:&serde_json::Value)->Result<(),String>{
+        self.app_snapshot_scoped(board,None,payload,false)
     }
-
-    #[cfg(test)]
-    pub(crate) fn try_send_app_snapshot(&self, board: &str, payload: &serde_json::Value) -> Result<(), String> {
-        self.send_app_snapshot_inner(board, None, payload, false)
+    pub(crate) fn try_send_app_snapshot(&self,board:&str,payload:&serde_json::Value)->Result<(),String>{
+        self.app_snapshot_scoped(board,None,payload,true)
     }
-
-    pub(crate) fn send_app_snapshot_to_generation(
-        &self, board: &str, generation: u64, payload: &serde_json::Value, can_wait: bool,
-    ) -> Result<(), String> {
-        self.send_app_snapshot_inner(board, Some(generation), payload, can_wait)
-    }
-
-    fn send_app_snapshot_inner(
-        &self, board: &str, generation: Option<u64>, payload: &serde_json::Value, can_wait: bool,
-    ) -> Result<(), String> {
-        use crate::device_transport::{APP_SNAPSHOT, APP_SNAPSHOT_MAX};
-        if serde_json::to_vec(payload).map_err(|e| e.to_string())?.len() > APP_SNAPSHOT_MAX {
-            return Err("应用快照过大".into());
-        }
-        // The USB reader must not wait for media ACKs delivered by itself.
-        let _guard = if can_wait {
-            media_arbitration::acquire(&self.asset_transfer_guard, Duration::from_millis(250))
-                .map_err(|_| "设备传输繁忙，等待下一次状态更新")?
-        } else {
-            self.asset_transfer_guard.try_lock().map_err(|_| "设备资源同步中")?
-        };
-        self.send_inner(APP_SNAPSHOT, payload, true, Some(board), generation, None)
+    pub(crate) fn app_snapshot_scoped(&self,board:&str,connection:Option<u64>,payload:&serde_json::Value,try_only:bool)->Result<(),String>{
+        if serde_json::to_vec(payload).map_err(|e|e.to_string())?.len()>2048{return Err("应用快照过大".into());}
+        // The serial reader cannot wait for media ACKs. Workers may wait for a chunk boundary.
+        let _guard=if try_only {self.asset_transfer_guard.try_lock().map_err(|_|"设备资源同步中")?}
+            else {media_arbitration::acquire(&self.asset_transfer_guard,Duration::from_millis(250)).map_err(|_|"设备传输繁忙，等待下一次状态更新")?};
+        self.send_inner("app/snapshot",payload,true,Some(board),connection,None)
     }
 
     /// Send without flush - for streaming bulk data.
@@ -3181,24 +3355,6 @@ impl UsbSerialManager {
     }
     pub(crate) fn send_approval_bound(&self, board: &str, generation: u64, topic: &str, payload: &serde_json::Value) -> Result<(), String> {
         self.send_inner(topic, payload, true, Some(board), Some(generation), None)
-    }
-
-    pub(crate) fn send_voice_feedback_for_connection(
-        &self, board: &str, generation: u64, payload: &serde_json::Value,
-    ) -> Result<(), String> {
-        if generation == 0 || payload["boardDeviceId"] != board {
-            return Err("invalid voice feedback scope".into());
-        }
-        {
-            let connection = self.connection.lock().map_err(|_| "connection unavailable")?;
-            let Some(conn) = connection.as_ref() else { return Ok(()); };
-            if conn.connection_id != generation || conn.board_device_id != board
-                || conn.capabilities["voiceFeedback"].as_str() != Some(crate::device_voice_feedback::ENGINE)
-                || payload["bootId"] != conn.capabilities["debugBootId"] {
-                return Ok(());
-            }
-        }
-        self.send_inner("ui/voice-feedback", payload, true, Some(board), Some(generation), None)
     }
 
     pub(crate) fn send_audio_bridge_command_for_connection(
@@ -3282,6 +3438,13 @@ impl UsbSerialManager {
         self.send_inner("input/config", payload, true, Some(board), Some(generation), None)
     }
 
+    pub(crate) fn send_voice_feedback(
+        &self, board: &str, connection: u64, payload: &serde_json::Value,
+    ) -> Result<(), String> {
+        self.send_inner(crate::device_voice_feedback::TOPIC, payload, false,
+            Some(board), Some(connection), None)
+    }
+
     fn send_firmware_to_board(
         &self,
         expected_board_device_id: &str,
@@ -3308,11 +3471,11 @@ impl UsbSerialManager {
         expected_connection_id: Option<u64>,
         write_slice_bytes: Option<usize>,
     ) -> Result<(), String> {
-        self.send_inner_admitted(topic,payload,flush,expected_board_device_id,expected_connection_id,write_slice_bytes,None)
+        self.send_inner_admitted(topic,payload,flush,expected_board_device_id,expected_connection_id,write_slice_bytes,None,false)
     }
     fn send_inner_admitted(
         &self,topic:&str,payload:&serde_json::Value,flush:bool,
-        expected_board_device_id:Option<&str>,expected_connection_id:Option<u64>,write_slice_bytes:Option<usize>,program_epoch:Option<u64>,
+        expected_board_device_id:Option<&str>,expected_connection_id:Option<u64>,write_slice_bytes:Option<usize>,program_epoch:Option<u64>,test_speech:bool,
     )->Result<(),String>{
         let owned_notes=topic=="audio/control"&&expected_connection_id.is_some()&&payload.get("captureOwner").is_some();
         let preempt_on_send = !owned_notes&&((topic=="audio/conversation"&&payload["enabled"]==true)
@@ -3380,10 +3543,22 @@ impl UsbSerialManager {
             }
         }
 
+        let voice_feedback = topic == crate::device_voice_feedback::TOPIC;
+        if voice_feedback && (expected_connection_id.is_none()
+            || conn.runtime != "esp-p4"
+            || conn.capabilities["voiceFeedback"] != crate::device_voice_feedback::ENGINE
+            || payload["boardDeviceId"] != conn.board_device_id.as_str()
+            || !payload["bootId"].as_str().is_some_and(|boot|
+                !boot.is_empty() && conn.capabilities["debugBootId"] == boot))
+        {
+            return Err("voice feedback peer changed".into());
+        }
+
         let next_follow = if topic == "control/remote-cli-binding" && payload["enabled"] == true {
             Some(crate::normalize_agent_id(payload["targetSource"].as_str().unwrap_or(""))
                 .ok_or("follow source is not recognized")?)
         } else { None };
+        let mut test_payload = test_speech.then(|| payload.clone());
         {
             let mut scope = self.follow_scope.lock().map_err(|_| "follow scope unavailable")?;
             if scope.as_ref().is_some_and(|s| s.generation != conn.connection_id || s.board != conn.board_device_id) {
@@ -3394,10 +3569,25 @@ impl UsbSerialManager {
                 // only a new explicit binding submission can reopen it.
                 *scope = Some(UsbFollowScope { generation: conn.connection_id, board: conn.board_device_id.clone(),
                     agent: agent.clone(), session: None, submitted: false });
-            } else if scope.as_ref().is_some_and(|s| !s.allows(topic, payload)) {
-                return Err("stale follow agent/session; state not submitted".into());
+            } else if let Some(scope) = scope.as_ref() {
+                if let Some(test) = test_payload.as_mut() {
+                    // Only the local test command is stamped from the current
+                    // physical scope, while the wire/connection locks are held.
+                    test["source"] = serde_json::json!(scope.agent);
+                    if let Some(session) = &scope.session {
+                        test["sessionId"] = serde_json::json!(session);
+                    }
+                }
+                if !scope.allows(topic, test_payload.as_ref().unwrap_or(payload)) {
+                    return Err(if test_speech {
+                        "Agent 跟随尚未就绪，请稍后重试测试消息"
+                    } else {
+                        "stale follow agent/session; state not submitted"
+                    }.into());
+                }
             }
         }
+        let payload = test_payload.as_ref().unwrap_or(payload);
 
         if topic=="audio/volume" {
             master_volume::validate_write(conn,expected_board_device_id,expected_connection_id,payload)?;
@@ -3484,7 +3674,7 @@ impl UsbSerialManager {
         // Replaceable widget snapshots share the audio-safe paced path. A
         // driver's blocking drain can otherwise hold the mutex indefinitely
         // even after media itself stopped using flush()/tcdrain().
-        let live_frame = audio_frame || topic == "widget/data" || topic == "app/snapshot" || topic == "ui/text-pixels" || topic == "ui/voice-feedback"
+        let live_frame = audio_frame || voice_feedback || topic == "widget/data" || topic == "app/snapshot" || topic == "ui/text-pixels"
             || (!bulk_frame && conn.capture_active.load(Ordering::Acquire));
         // Heartbeats must keep RX running and recover only the unwritten
         // suffix, just like live frames. A busy device is not a dead handle.
@@ -3505,9 +3695,9 @@ impl UsbSerialManager {
                     if result.is_err() {
                         failure_progress = Some((report.bytes_written, report.retries, report.error_kind, report.os_error));
                         // The wire and connection locks still exclude another writer.
-                        // Cancel only the damaged audio line and let normal session
-                        // cleanup obtain its device ACKs. The audio write still failed.
-                        if topic == "audio/play_chunk" && conn.runtime.eq_ignore_ascii_case("esp-p4")
+                        // Discard only the damaged line. The write still failed,
+                        // and an audio session still needs its normal stop ACK.
+                        if (topic == "audio/play_chunk" || voice_feedback) && conn.runtime.eq_ignore_ascii_case("esp-p4")
                             && !conn.cancel_reader.load(Ordering::Acquire) {
                             audio_line_discarded = live_audio_pacing::recover_p4_audio_line(
                                 conn.writer.as_mut(), bytes.len(), report,
@@ -3810,6 +4000,10 @@ impl UsbSerialManager {
         self.send_device_payload_and_wait_scoped(expected_board_device_id, None, request_topic, response_topic, payload)
     }
 
+    pub(crate) fn test_message_exchange(&self, board: &str, connection: u64, payload: serde_json::Value) -> Result<serde_json::Value, String> {
+        self.send_device_payload_and_wait_scoped(board, Some(connection), "ui/test-message", "ui/test-message/status", payload)
+    }
+
     fn send_device_payload_and_wait_scoped(
         &self,
         expected_board_device_id: &str,
@@ -3830,14 +4024,13 @@ impl UsbSerialManager {
                 response_topic: response_topic.to_string(),
                 sender,
             });
-        if let Err(error) = self.send_inner(
-            request_topic,
-            &payload,
-            true,
-            Some(expected_board_device_id),
-            connection_id,
-            None,
-        ) {
+        let sent = if request_topic == "speech/text" && response_topic == "protocol/ack" {
+            self.send_inner_admitted(request_topic, &payload, true, Some(expected_board_device_id),
+                connection_id, None, None, true)
+        } else {
+            self.send_inner(request_topic, &payload, true, Some(expected_board_device_id), connection_id, None)
+        };
+        if let Err(error) = sent {
             self.remove_device_response_waiter(&request_id, response_topic);
             return Err(error);
         }
@@ -3881,11 +4074,28 @@ impl UsbSerialManager {
         )
     }
 
-    pub(crate) fn service_image_request(&self,board:&str,payload:serde_json::Value)->Result<serde_json::Value,String>{
+    pub(crate) fn ensure_bubble_font(&self, board: &str, connection: &str) -> Result<(), String> {
+        let status = self.connected_board_status(board)?;
+        let generation = connection.parse::<u64>().ok().filter(|n| *n != 0)
+            .ok_or("USB 连接标识无效。")?;
+        if status.connection_id != connection || !crate::shared_font::supports(&status.firmware) {
+            return Err("USB 设备或固件版本已变化。".into());
+        }
+        crate::shared_font::ensure_with_stream(board, |payload| self.send_device_payload_and_wait_scoped(
+            board, Some(generation), "resources/bubble-font", "resources/bubble-font/status", payload),
+            None, Some(&self.asset_transfer_guard), || {
+                if self.connected_board_status(board)?.connection_id != connection {
+                    return Err("USB 连接已变化。".into());
+                }
+                Ok(())
+            })
+    }
+
+    pub(crate) fn service_image_request(&self,board:&str,connection:u64,payload:serde_json::Value)->Result<serde_json::Value,String>{
         if self.status().capabilities["widgetServiceBridge"]!="p4-service-bridge-v1"{return Err("设备未声明服务桥图片能力".into());}
         if self.media_requests_pending.load(Ordering::Acquire)>0{return Err("音频传输优先，图片稍后更新".into());}
         let _guard=self.asset_transfer_guard.try_lock().map_err(|_|"资源传输繁忙，图片稍后更新")?;
-        self.send_device_payload_and_wait(board,"app/image","protocol/ack",payload)
+        self.send_device_payload_and_wait_scoped(board,Some(connection),"app/image","protocol/ack",payload)
     }
 
     pub(crate) fn media_request(&self, board: &str, topic: &str, payload: serde_json::Value) -> Result<serde_json::Value,String> {
@@ -4780,10 +4990,25 @@ impl UsbSerialManager {
         self.send(&topic, payload)
     }
 
-    /// Send speech text to the device
+    pub(crate) fn send_test_speech_confirmed(&self, board: &str, generation: u64, text: &str) -> Result<(), String> {
+        let ack = self.send_device_payload_and_wait_scoped(board, Some(generation),
+            "speech/text", "protocol/ack", serde_json::json!({"text": text}))
+            .map_err(|_| "设备未确认测试消息，请查看桌宠屏幕。本次不会自动重发。")?;
+        if ack["requestTopic"] != "speech/text" || ack["ok"] != true {
+            return Err("设备未提供匹配的测试消息回执。".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn send_test_speech_bound(&self, board: &str, generation: u64, text: &str) -> Result<(), String> {
+        self.send_inner_admitted("speech/text", &serde_json::json!({"text": text}), true,
+            Some(board), Some(generation), None, None, true)
+    }
+
+    /// Send a local test bubble under the current device follow scope.
     pub fn send_speech(&self, text: &str) -> Result<(), String> {
         let payload = serde_json::json!({"text": text});
-        self.send("speech/text", &payload)
+        self.send_inner_admitted("speech/text", &payload, true, None, None, None, None, true)
     }
 
     /// Send a control command to the device
@@ -5787,6 +6012,16 @@ impl UsbSerialManager {
         self.install_widget_clawpkg_mode(board, id, dir, overrides, on_progress, false, title)
     }
 
+    pub(crate) fn repair_center_thumb(&self, board: &str,id: &str,files: &[(String,Vec<u8>)]) -> Result<(),String> {
+        let _guard=self.asset_transfer_guard.lock().map_err(|e|e.to_string())?;
+        let (status,connection)=self.connected_board_snapshot(board)?;
+        if status.capabilities["widgetCenterThumb"]!=center_thumb::PROFILE
+            || status.capabilities["widgetTransfer"]!=widget_transaction::WIDGET_FILE_TRANSFER {
+            return Err("此固件不支持仅补封面，请先更新设备固件".into());
+        }
+        self.install_widget_file_transfer(board,id,connection,&status.capabilities,files,|_,_,_|{}).map(|_|())
+    }
+
     pub(crate) fn repair_widget_resources(&self,board:&str,id:&str,dir:&std::path::Path)->Result<(u32,u64),String>{
         if self.status().capabilities["widgetResourceIntegrity"]!="p4-resource-integrity-v1"{
             return Err("设备尚不支持保留配置的资源恢复".into());
@@ -5824,7 +6059,7 @@ impl UsbSerialManager {
                     walk(root, &p, out)?;
                 } else if p.is_file() {
                     let rel = widget_ota_relative_path(root, &p)?;
-                    if rel == CENTER_TITLE_PATH || widget_ota_should_skip_path(&rel) {
+                    if matches!(rel.as_str(), CENTER_TITLE_PATH | center_thumb::PATH | center_thumb::MATCH) || widget_ota_should_skip_path(&rel) {
                         continue;
                     }
                     let bytes =
@@ -5864,6 +6099,11 @@ impl UsbSerialManager {
             .map(|(_, bytes)| bytes.as_slice())
             .ok_or_else(|| "component package is missing runtime/widget.json".to_string())?;
         let widget_definition: serde_json::Value = serde_json::from_slice(widget_source).map_err(|e| e.to_string())?;
+        crate::clawpkg::validate_network_declaration(&widget_definition,
+            entries.iter().find(|(path, _)| path == "runtime/app.wasm").map(|(_, bytes)| bytes.as_slice()))?;
+        if widget_definition.get("hachiNetwork").is_some() && capabilities.is_none() {
+            return Err("联网组件需要设备握手确认网络和凭据能力，请通过 USB 同步".into());
+        }
         crate::app_component_program::validate(&widget_definition)?;
         if let Some(capabilities) = capabilities {
             crate::clawpkg::ComponentSyncRequirements::from_runtime(&widget_definition)
@@ -5906,7 +6146,11 @@ impl UsbSerialManager {
         entries.retain(|(relative_path, _)| !relative_path.starts_with("assets/"));
         entries.extend(compiled_sprites);
         entries.extend(compiled_media);
-        if capabilities.is_some_and(|caps| caps["widgetCenterTitle"] == "rle4-v1") {
+        if capabilities.is_some_and(|caps| caps["widgetCenterThumb"] == center_thumb::PROFILE) {
+            center_thumb::append_source(widget_dir,widget_dir,widget_id,&mut entries)?;
+        }
+        // LAN supplies a title only after its authenticated panel capability check.
+        if capabilities.is_none_or(|caps| caps["widgetCenterTitle"] == "rle4-v1") {
             if let Some(title) = center_title.filter(|title| {
                 !title.text.is_empty() && title.text.len() <= 63 && !title.text.contains('\0')
                     && title.data.len() <= 8192
@@ -6407,6 +6651,8 @@ impl UsbSerialManager {
         &self,
         appearance_dir: &std::path::Path,
         app_data_dir: &std::path::Path,
+        expected_board_device_id: &str,
+        expected_scope: Option<(u64, &str)>,
         on_progress: F,
     ) -> Result<(u32, u64), String>
     where
@@ -6416,7 +6662,7 @@ impl UsbSerialManager {
             .asset_transfer_guard
             .lock()
             .map_err(|e| e.to_string())?;
-        self.with_appearance_user_intent(&self.status().board_device_id, &_asset_transfer_guard, || {
+        self.with_appearance_user_intent(expected_board_device_id, expected_scope, &_asset_transfer_guard, || {
         self.ensure_appearance_sync_not_cancelled(None)?;
         let manifest_path = appearance_dir.join("manifest.json");
         let manifest_str = std::fs::read_to_string(&manifest_path)
@@ -6604,6 +6850,7 @@ impl UsbSerialManager {
             appearance_dir,
             app_data_dir,
             expected_board_device_id,
+            None,
             use_device_builtin,
             on_progress,
             |_| {},
@@ -6618,6 +6865,7 @@ impl UsbSerialManager {
         appearance_dir: &std::path::Path,
         app_data_dir: &std::path::Path,
         expected_board_device_id: &str,
+        expected_scope: Option<(u64, &str)>,
         use_device_builtin: bool,
         on_progress: F,
         on_stage: S,
@@ -6643,7 +6891,7 @@ impl UsbSerialManager {
             .asset_transfer_guard
             .lock()
             .map_err(|error| error.to_string())?;
-        self.with_appearance_user_intent(expected_board_device_id, &_asset_transfer_guard, || {
+        self.with_appearance_user_intent(expected_board_device_id, expected_scope, &_asset_transfer_guard, || {
         self.connected_board_status(expected_board_device_id)?;
         self.ensure_appearance_sync_not_cancelled(None)?;
         if p4_native_usb_available() {
@@ -6717,15 +6965,8 @@ impl UsbSerialManager {
                     return Ok((0, 0, false));
                 }
                 Ok(P4CachedPackActivation::NotFound) => {}
-                Err(error) if self.appearance_submitted() || matches!(error.as_str(),
-                    "appearance outcome unknown" | "appearance_slot_query_busy" | "appearance_slot_query_timeout"
-                ) => return Err(error),
-                Err(error) => {
-                    eprintln!(
-                        "[usb-p4-ota] cached slot query failed; falling back to current sync planner: {}",
-                        error
-                    );
-                }
+                // A slot-capable board must positively report a miss before any upload.
+                Err(error) => return Err(error),
             }
         }
         if !force_full_sync {
@@ -7007,7 +7248,7 @@ impl UsbSerialManager {
             .asset_transfer_guard
             .lock()
             .map_err(|error| error.to_string())?;
-        self.with_appearance_user_intent(expected_board_device_id, &_asset_transfer_guard, || {
+        self.with_appearance_user_intent(expected_board_device_id, None, &_asset_transfer_guard, || {
         sync_appearance_p4_native(
             self,
             appearance_dir,
@@ -8873,6 +9114,7 @@ mod tests {
                     let topic=request["topic"].as_str().unwrap();self.topics.lock().unwrap().push(topic.into());
                     let mut reply=serde_json::json!({"requestId":request["payload"]["requestId"],"ok":true,"boardDeviceId":"p4-test","engine":crate::app_program_background::ENGINE,"bootId":"0123456789abcdef","items":[]});
                     let response=if topic=="widget/list"{
+                        reply["maxInstalled"]=serde_json::json!(40);
                         reply["complete"]=serde_json::json!(self.mode!=3);reply["recoveryBlocked"]=serde_json::json!(false);reply["items"]=serde_json::json!([{"id":"focus"}]);"widget/inventory"
                     }else{
                         match topic{
@@ -8984,6 +9226,11 @@ manager.activate_memory_test_connection();
         assert!(!active.load(Ordering::Acquire));
         expected.store(false, Ordering::Release);
         let before_widget_flushes=stats.lock().unwrap().flushes;
+        let before=stats.lock().unwrap().writes.len();
+        for try_only in [true,false] {
+            assert!(manager.app_snapshot_scoped("p4-test",Some(2),&serde_json::json!({}),try_only).is_err());
+        }
+        assert_eq!(before,stats.lock().unwrap().writes.len(),"retired component generation wrote a frame");
         manager.send_widget_data("p4-test",&serde_json::json!({"source":"computer.status"})).unwrap();
         assert_eq!(stats.lock().unwrap().flushes,before_widget_flushes,"background widgets must not block in driver drain");
     }
@@ -9016,6 +9263,23 @@ manager.activate_memory_test_connection();
         assert!(manager.check_session_follow_target("p4-test", "codex", "1", "0123456789abcdef").is_err());
         assert!(!manager.session_follow_target_is_current("p4-test", "1", "codex"));
         assert!(recorded.lock().unwrap().writes.is_empty());
+        assert!(manager.send_speech("test").is_err());
+        assert!(recorded.lock().unwrap().writes.is_empty());
+        {
+            let mut scope = manager.follow_scope.lock().unwrap();
+            let scope = scope.as_mut().unwrap();
+            scope.submitted = true;
+            scope.session = Some("active-session".into());
+        }
+        assert!(manager.send("speech/text", &serde_json::json!({"text":"old", "source":"codex","sessionId":"retired-session"})).is_err());
+        assert!(recorded.lock().unwrap().writes.is_empty());
+        manager.send_speech("test").unwrap();
+        let wire = recorded.lock().unwrap().writes.concat();
+        let message: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(message["topic"], "speech/text");
+        assert_eq!(message["payload"]["source"], "codex");
+        assert_eq!(message["payload"]["sessionId"], "active-session");
+        assert_eq!(message["payload"]["text"], "test");
     }
 
     #[test]
@@ -9198,6 +9462,22 @@ manager.activate_memory_test_connection();
             assert_eq!(p4_slot_query_failure_kind("query-a", error), "slot_query_other");
         }
         assert_eq!(p4_slot_query_failure_kind("query-a", "appearance outcome unknown"), "result_unknown_no_replay");
+    }
+
+    #[test]
+    fn appearance_cancel_only_stops_the_clicked_request() {
+        let manager = UsbSerialManager::new();
+        let first = uuid::Uuid::new_v4().to_string();
+        let second = uuid::Uuid::new_v4().to_string();
+        manager.begin_owned_appearance_sync(Some(first.clone())).unwrap();
+        assert!(!manager.cancel_owned_appearance_sync(None));
+        manager.finish_appearance_sync();
+        manager.begin_owned_appearance_sync(Some(second.clone())).unwrap();
+        assert!(!manager.cancel_owned_appearance_sync(Some(&first)));
+        assert!(manager.ensure_appearance_sync_not_cancelled(None).is_ok());
+        assert!(manager.cancel_owned_appearance_sync(Some(&second)));
+        assert!(manager.ensure_appearance_sync_not_cancelled(None).is_err());
+        manager.finish_appearance_sync();
     }
 
     #[test]
@@ -10725,6 +11005,25 @@ manager.activate_memory_test_connection();
 
         std::fs::write(&first_path, b"changed").unwrap();
         assert_ne!(first, compute_p4_pack_id(&assets, b"manifest-a").unwrap());
+    }
+
+    #[test]
+    fn p4_protected_slot_snapshot_never_treats_a_missing_or_ambiguous_row_as_an_upload() {
+        let factory = serde_json::json!({"slot": 0, "valid": true, "packId": "factory"});
+        let empty = serde_json::json!({"slot": 1, "valid": false});
+        for rows in [
+            serde_json::json!([factory]),
+            serde_json::json!([factory, empty, empty]),
+            serde_json::json!([factory, {"slot": 1, "valid": true}]),
+            serde_json::json!([factory, {"slot": 1, "valid": false, "packId": "old"}]),
+        ] {
+            assert!(parse_p4_appearance_slot_state(&serde_json::json!({
+                "builtinProtected": true, "slots": rows
+            })).is_err());
+        }
+        assert!(parse_p4_appearance_slot_state(&serde_json::json!({
+            "builtinProtected": true, "slots": [factory, empty]
+        })).is_ok());
     }
 
     #[test]
@@ -13430,6 +13729,7 @@ manager.activate_memory_test_connection();
     fn widget_ota_skips_directory_placeholder_files() {
         assert!(widget_ota_should_skip_path("hachiapp.json"));
         assert!(widget_ota_should_skip_path("pc/application.json"));
+        assert!(widget_ota_should_skip_path("pc/plugin.py"));
         assert!(widget_ota_should_skip_path("pc/cover.png"));
         assert!(widget_ota_should_skip_path("assets/.keep"));
         assert!(widget_ota_should_skip_path("pc/extension.json"));

@@ -111,7 +111,7 @@ def books(sample,catalog=None):
         assert len(cards)==100 and len({c['category'] for c in cards})==10
         dashboard.update(eyebrow='原创导读 · 100 本',metricValue='10 类主题 · 进入随机打开一本')
         save(pack/'runtime/widget.json',runtime);save(pack/'negative-screen.json',{'dashboard':dashboard})
-        save(pack/'component.json',dict(id='book-pocket',name='每天一本书',version='1.0.2',kind='tool',author='橘子酱',description='100 本经济、商业与认知书籍的原创导读。进入随机打开一本，设备内选分类、换书与完整翻页；自动朗读跟随当前宠物音色，退出停止。'))
+        save(pack/'component.json',dict(id='book-pocket',name='每天一本书',version='1.0.3',kind='tool',author='橘子酱',description='100 本经济、商业与认知书籍的原创导读。连接 PC 后可在设备上选分类、换书和翻页。配置语音后按当前宠物音色自动朗读，退出即停。'))
         save(pack/'share.json',{'title':'每天一本书','author':'橘子酱','tags':['阅读','认知'],'description':'100 本原创导读 · 10 类主题 · 标准 PetUI'})
         notice='本包包含 100 本书的原创阅读导引与评论，不是原书全文、逐章浓缩或作者授权摘要，不替代阅读原书。原书版权归各自权利人。示例为原创假设，不冒称原书案例。部分中文标题为导读展示译名，作品身份以原书名、作者和书目链接为准。内容经过模型辅助审校及针对性修订，不声称专业审定或核对过所有版本全文。财富主题为概念教育，不提供买卖、仓位或收益建议。\n'
         bib=Path(catalog).with_name('bibliography.json')

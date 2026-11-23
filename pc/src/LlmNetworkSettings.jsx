@@ -1,8 +1,18 @@
 /** Per-computer LLM networking; imported CA status never exposes certificate contents. */
+import { formatModelIssue } from "./lib/model-issue.js";
 import React, { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useExitProtection } from "./lib/exit-protection.js";
+
+function probeMessage(result) {
+  const status = result.httpStatus;
+  if (result.reachable && !status) return result.provider + "：" + result.message;
+  const provider = result.provider === "火山方舟（豆包）" ? "火山方舟" : result.provider;
+  if (result.reachable) return `${provider}：已收到 HTTPS 响应（HTTP ${status}）。本次探测未验证模型权限。`;
+  return formatModelIssue("network", provider, { status, message: result.message }) +
+    (status === 403 ? " 模型权限尚未验证。" : status ? " 已收到 HTTPS 响应。模型权限尚未验证。" : "");
+}
 
 export default function LlmNetworkSettings() {
   const [settings, setSettings] = useState({ mode: "system", proxyUrl: "", certificateConfigured: false });
@@ -16,7 +26,7 @@ export default function LlmNetworkSettings() {
   useEffect(() => {
     let cancelled = false;
     invoke("load_llm_network_settings").then((value) => { if (!cancelled) setSettings(value); })
-      .catch((error) => { if (!cancelled) setMessage(`读取网络设置失败：${error}`); })
+      .catch((error) => { if (!cancelled) setMessage("读取网络设置失败。" + formatModelIssue("storage", "本机网络配置", error)); })
       .finally(() => { if (!cancelled) setBusy(false); });
     return () => { cancelled = true; };
   }, []);
@@ -25,7 +35,7 @@ export default function LlmNetworkSettings() {
     try {
       const selected = await open({ multiple: false, directory: false, filters: [{ name: "PEM 公共证书", extensions: ["pem", "crt", "cer"] }] });
       if (typeof selected === "string") { setCaFile(selected); setClearCertificate(false); setDirty(true); setResults([]); }
-    } catch (error) { setMessage(`选择证书失败：${error}`); }
+    } catch (error) { setMessage("选择证书失败。" + formatModelIssue("storage", "本机证书", error)); }
   };
   const save = async () => {
     setBusy(true); setResults([]);
@@ -33,20 +43,20 @@ export default function LlmNetworkSettings() {
       const status = await invoke("save_llm_network_settings", { input: { mode: settings.mode, proxyUrl: settings.proxyUrl, caFile, clearCertificate } });
       setSettings(status); setCaFile(null); setClearCertificate(false); setDirty(false);
       setMessage("已保存到这台电脑；新的云服务请求生效，正在进行的语音连接请重新进入。请点击测试连接。");
-    } catch (error) { setMessage(`保存失败：${error}`); }
+    } catch (error) { setMessage("保存网络设置失败。" + formatModelIssue("storage", "本机网络配置", error)); }
     finally { setBusy(false); }
   };
   const test = async () => {
-    setBusy(true); setMessage("正在检测火山与 DeepSeek 的 HTTPS 连接…"); setResults([]);
+    setBusy(true); setMessage("正在检测 MiMo、豆包语音、火山方舟和 DeepSeek 的 HTTPS 连接…"); setResults([]);
     try {
       setResults(await invoke("test_llm_network_settings"));
       setMessage("测试不发送 API Key，也不验证模型额度；HTTPS 可达不等于已获得服务权限。");
-    } catch (error) { setMessage(`检测失败：${error}`); }
+    } catch (error) { setMessage(formatModelIssue("network", "云服务连接检测", error)); }
     finally { setBusy(false); }
   };
   return (
     <details className="llm-network-settings">
-      <summary>云服务网络（内网 / 代理 / 企业证书）</summary>
+      <summary>连接方式、代理与企业证书</summary>
       <p className="muted small">设置只保存在当前电脑，适用于模型列表、图片与视频生成、素材下载、语音识别与合成、实时对话。不会内置或扫描任何代理地址，不影响设备与本机 Agent 通信。</p>
       <div className="api-settings__form">
         <label className="ui-field" htmlFor="llm-network-mode">
@@ -78,7 +88,7 @@ export default function LlmNetworkSettings() {
       {message && <p className="muted small" role="status">{message}</p>}
       <ul className="llm-network-settings__results" aria-live="polite">
         {results.map((result) => <li key={result.provider} className={`api-settings__result ${result.reachable ? "is-success" : "is-error"}`}>
-          {result.provider}：{result.message}
+          {probeMessage(result)}
         </li>)}
       </ul>
     </details>

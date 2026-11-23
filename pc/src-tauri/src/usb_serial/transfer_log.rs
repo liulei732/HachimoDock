@@ -143,6 +143,7 @@ fn safe_label(label: &str) -> &str {
         "would_block" | "interrupted" | "broken_pipe" | "not_connected" | "write_progress_unknown" |
         "not_submitted" | "activation_failure" | "current_intent_observed_quiescent" | "slot_query_failed" | "slot_query_busy" |
         "slot_query_snapshot_changed" | "slot_query_other" | "checking_cache" |
+        "slot_decision" | "custom_absent" | "different_pack" | "already_active" | "activate_cached" |
         "comparing_assets" | "preparing_slot" | "waiting_storage" |
         "phase_started" | "phase_ack" | "phase_timed_out" | "phase_wait_disconnected" |
         "phase_send_failed" | "phase_ack_invalid" | "transaction_completed" | "status" |

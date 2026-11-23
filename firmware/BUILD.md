@@ -71,11 +71,6 @@ node pc/scripts/package-factory-release.mjs \
 
 屏幕接 **DSI**，不是 CSI，插拔排线前断电。原生 USB 与 USB-UART 的选择取决于板卡切换电路，见 [USB 连接方式](README.md#usb-连接方式)。
 
-WiFi6 v1 的 `PET_P4_WIFI6_CONTROL_SIZE=1` 只将显式标记的低频音频控制、
-安装和存储元数据函数设为现有 `Oz` 体积配置。PCM/DSP、录放音 worker、绘制与
-媒体消费路径保持原性能配置；其他三种目标不启用该函数标记。
-每次修改后仍须分别检查四板镜像，不能凭某一目标达标推断其他目标通过。
-
 ## 验证与发布边界
 
 主机测试验证模型与协议，目标编译验证配置、链接资源和静态预算。输入、触控、显示、连续传输、OTA/恢复以及录放音、AEC 和真实听感仍需分别进行硬件验证。未运行、跳过或缺硬件的项目不表示通过。
@@ -87,3 +82,20 @@ WiFi6 v1 的 `PET_P4_WIFI6_CONTROL_SIZE=1` 只将显式标记的低频音频控�
 CI 使用 Python 3.12、Node.js 22、PlatformIO Core 6.1.19，以及 LLVM/LLD **20.1.8**。`CLANG` 指定该版本的 clang，配套 wasm-ld 位于其工具目录。生成的 WASM 与技能镜像按字节检查，不应更换编译器后重写产物绕过验证。
 
 完整测试会读取锁定 SDK 的源码、目标编译器和各环境的编译数据库。[tools/prepare_ci_sdk.py](tools/prepare_ci_sdk.py) 在 GitHub Actions 中准备 v1/v3 PlatformIO core，通过 `compiledb` 生成上下文并将路径写入 `GITHUB_ENV`；它不连接或烧录设备。本机测试同样需要相应输入，将 `PET_P4_V1_COMPILE_COMMANDS`、`PET_P4_V3_COMPILE_COMMANDS` 指向真实编译数据库，并提供测试要求的 SDK 路径。不要使用手写数据库或空 SDK 替代。
+
+WiFi6 v1 和 v3 的 ESP-Hosted RPC 按数字标签编解码。构建时会从锁定的供应商源文件生成
+protobuf-c 的精简描述表，以节省 OTA 空间。升级 ESP-Hosted 后须复核描述表生成器，
+并运行 `firmware/tests/hosted_descriptor_size_test.py` 核对消息、枚举及编解码结果。
+
+## 四板 OTA 预算与真机长稳
+
+提供四种配置的镜像和预算报告后，可以用公开发布清单作基线，核对每块板的修订范围、版本、SHA-256 和 OTA 余量。
+
+```sh
+python3 firmware/tools/ota_matrix.py --release-index latest-release.json \
+  --reports "$reports" --images "$images" --require-complete
+```
+
+四板使用 ESP-IDF 的 silent assertions。断言失败仍触发中止，使用同批 ELF 和故障 PC 定位。SDK 的 ESP_RETURN_ON_* 等检查仍执行错误返回，相应调用点的格式化报错文本已精简。通用凭证读写继续沿用原绑定与格式。WiFi6 固件和组件工具均已撤下旧 GitHub 账号卡专用声明。
+
+按板型、芯片、屏幕和候选 ELF 记录长稳及升级恢复结果。[四板实机验收](docs/board-soak.md)

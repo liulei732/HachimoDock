@@ -604,7 +604,7 @@ class LocalStatePublisher {
     return this.latestStateBySource.get(normalizeAgentId(sourceId || "")) || "";
   }
 
-  publishSource(payload, { sessionOnly = false } = {}) {
+  publishSource(payload, { sessionOnly = false, sourceOnly = false } = {}) {
     if (sessionOnly) {
       try {
         fs.mkdirSync(this.localStateDir, { recursive: true });
@@ -614,25 +614,25 @@ class LocalStatePublisher {
     }
     const source = normalizeAgentId(payload.source || "unknown");
     this.latestStateBySource.set(source, normalizeStatus(payload.state) || "");
-    this._writeLocalState(source, payload);
+    this._writeLocalState(source, payload, sourceOnly);
   }
 
-  publishSpeech(sourceId, payload) {
+  publishSpeech(sourceId, payload, { sourceOnly = false } = {}) {
     const source = normalizeAgentId(sourceId || payload?.source || "unknown");
     if (this.selectedSource && source !== this.selectedSource) return;
     const speechPayload = {
       source,
       ...(payload && typeof payload === "object" ? payload : {}),
     };
-    this._writeLocalSpeech(source, speechPayload);
+    this._writeLocalSpeech(source, speechPayload, sourceOnly);
   }
 
-  _writeLocalState(source, payload) {
+  _writeLocalState(source, payload, sourceOnly) {
     try {
       fs.mkdirSync(this.localStateDir, { recursive: true });
       const filePath = path.join(this.localStateDir, `${source}.json`);
       writeSnapshotAtomicSync(filePath, JSON.stringify(payload) + "\n");
-      this._writeLocalSessionPayload(source, payload, this.localStateDir);
+      if (!sourceOnly) this._writeLocalSessionPayload(source, payload, this.localStateDir);
     } catch (e) {
       // Best-effort: the USB poller will use the next complete snapshot.
     }
@@ -646,7 +646,7 @@ class LocalStatePublisher {
     writeSnapshotAtomicSync(filePath, JSON.stringify(payload) + "\n");
   }
 
-  _writeLocalSpeech(source, payload) {
+  _writeLocalSpeech(source, payload, sourceOnly) {
     try {
       if (!this._localSpeechDir) {
         this._localSpeechDir = path.join(os.tmpdir(), "pet-manager-bridge-speech");
@@ -654,7 +654,7 @@ class LocalStatePublisher {
       }
       const filePath = path.join(this._localSpeechDir, `${source}.json`);
       writeSnapshotAtomicSync(filePath, JSON.stringify(payload) + "\n");
-      this._writeLocalSessionPayload(source, payload, this._localSpeechDir);
+      if (!sourceOnly) this._writeLocalSessionPayload(source, payload, this._localSpeechDir);
     } catch (e) {
       // Best-effort: the USB poller will use the next complete snapshot.
     }
@@ -1884,7 +1884,7 @@ function startAgentLogMonitorWorker(kind, onState) {
       log("info", `${kind} log monitor ready`, {});
       return;
     }
-    if (message?.type !== "state") return;
+    if (stopped || message?.type !== "state") return;
     try {
       onState(message.sessionId, message.state, message.event, message.extra);
     } catch (error) {
@@ -2110,6 +2110,33 @@ function startClaudeLogMonitor(config) {
   };
 }
 
+function antigravityMonitorEnabled(env = process.env) {
+  return env.CLAWD_SELECTED_AGENT_ID === "antigravity"
+    && env.CLAWD_ENABLE_ANTIGRAVITY_MONITOR === "true";
+}
+
+function publishAntigravityState(publisher, sessionId, state, event, extra, tsMs = Date.now()) {
+  const base = {
+    source: "antigravity",
+    sessionId,
+    sessionTitle: extra.sessionTitle,
+    event,
+    ts: new Date(tsMs).toISOString(),
+    tsMs,
+  };
+  // One current snapshot per source. Old conversation files must not outrank
+  // the newest conversation or reappear as a selectable/voice-target session.
+  const sourceOnly = { sourceOnly: true };
+  publisher.publishSource({ ...base, channel: "antigravity-log", state, display: extra.display }, sourceOnly);
+  publisher.publishSpeech("antigravity", {
+    ...base,
+    status: state,
+    displayTitle: extra.display.title,
+    displayContent: extra.display.content,
+    expiresAtMs: tsMs + SPEECH_EXPIRES_MS,
+  }, sourceOnly);
+}
+
 function resolveConfig() {
   const defaultDeviceId = normalizeTopicPart(os.hostname().toLowerCase(), "devbox");
   const stateDirFallback = path.join(os.homedir(), ".status-bridge");
@@ -2174,6 +2201,7 @@ function resolveConfig() {
     mimocode: {
       enabled: getEnvBool("CLAWD_ENABLE_MIMOCODE", true),
     },
+    antigravity: { enabled: antigravityMonitorEnabled() },
     hermes: {
       enabled: parseCsvEnv("CLAWD_ENABLED_AGENTS", []).includes("hermes")
         || getEnv("CLAWD_SELECTED_AGENT_ID", "") === "hermes",
@@ -2440,6 +2468,17 @@ async function main() {
     }
   }
 
+  let antigravityMonitor = { stop() {} };
+  if (config.antigravity.enabled) {
+    try {
+      antigravityMonitor = startAgentLogMonitorWorker("antigravity", (...args) => {
+        publishAntigravityState(publisher, ...args);
+      });
+    } catch (error) {
+      log("warn", "antigravity log monitor not started", { error: String(error.message || error) });
+    }
+  }
+
   let hermesMonitor = { stop() {} };
   if (config.hermes.enabled) {
     try {
@@ -2564,6 +2603,7 @@ async function main() {
     codexMonitor.stop();
     claudeLogMonitor.stop();
     mimoDesktopMonitor.stop();
+    antigravityMonitor.stop();
     hermesMonitor.stop();
     dshMonitor.stop();
     server.stop();
@@ -2582,6 +2622,7 @@ async function main() {
     version: APP_VERSION,
     codexMonitor: config.codex.enabled,
     claudeLogMonitor: config.claude.enabledLogMonitor,
+    antigravityMonitor: config.antigravity.enabled,
     openclawEnabled: config.openclaw.enabled,
     mimocodeEnabled: config.mimocode.enabled,
     dshEnabled: config.dsh.enabled,
@@ -2600,6 +2641,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+  antigravityMonitorEnabled,
+  publishAntigravityState,
   LocalStatePublisher,
   writeSnapshotAtomicSync,
   HookHttpServer,

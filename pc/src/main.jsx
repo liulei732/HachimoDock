@@ -7,6 +7,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import "./styles.css";
+import "./companion-theme.css";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";

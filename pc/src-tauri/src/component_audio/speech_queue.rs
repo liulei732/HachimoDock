@@ -77,7 +77,7 @@ pub(super) fn play(j:&Arc<Job>,usb:&UsbSerialManager,cfg:crate::doubao_tts::Doub
         if let Some(at)=waiting_since.take(){j.speech_gap_ms.fetch_max(at.elapsed().as_millis().min(u32::MAX as u128)as u32,Ordering::AcqRel);}
         if stopped(j,usb){break;}
         if !begun{
-            usb.media_request(&j.board,"media/begin",json!({"source":format!("app.{}",j.id),"mode":"live","sessionId":j.session,"format":"ima-block-v1","sampleRate":48000,"durationMs":0,"offsetMs":0,"volume":100,"title":"组件连续朗读","artist":"HachimoDock","queue":[],"keys":[]})).map_err(|_|"设备未接受连续朗读")?;
+            j.binding.media(usb,"media/begin",json!({"source":format!("app.{}",j.id),"mode":"live","sessionId":j.session,"format":"ima-block-v1","sampleRate":48000,"durationMs":0,"offsetMs":0,"volume":100,"title":"组件连续朗读","artist":"HachimoDock","queue":[],"keys":[]})).map_err(|_|"设备未接受连续朗读")?;
             begun=true;*j.phase.lock().unwrap()="buffering".into();
             super::report(&j.id,"buffering","");
             if j.speech_key.starts_with("news-"){crate::realtime_chat_log::record("","news_playback",json!({"stage":"device_accepted","ok":true}));}
@@ -88,24 +88,24 @@ pub(super) fn play(j:&Arc<Job>,usb:&UsbSerialManager,cfg:crate::doubao_tts::Doub
         while offset<samples&&!stopped(j,usb){
             if buffered>560{
                 std::thread::sleep(Duration::from_millis(40));
-                let ack=usb.media_request(&j.board,"media/query",json!({"sessionId":j.session})).map_err(|_|"连续朗读会话已结束")?;
+                let ack=j.binding.media(usb,"media/query",json!({"sessionId":j.session})).map_err(|_|"连续朗读会话已结束")?;
                 buffered=ack["bufferedMs"].as_u64().unwrap_or(0);buffer_at=Instant::now();progress(&mut marks,sent,buffered);continue;
             }
             let count=(samples-offset).min(3840);let mut block=pcm[offset*2..(offset+count)*2].to_vec();
             let gain=j.volume.load(Ordering::Acquire)as f32/100.0;
             for b in block.chunks_exact_mut(2){let v=(i16::from_le_bytes([b[0],b[1]])as f32*gain)as i16;b.copy_from_slice(&v.to_le_bytes());}
-            let ack=usb.media_request(&j.board,"media/chunk",json!({"sessionId":j.session,"seq":seq,"data":base64::engine::general_purpose::STANDARD.encode(crate::media_codec::encode(&block)?)})).map_err(|_|"设备音频传输中断，已停止连续朗读")?;
+            let ack=j.binding.media(usb,"media/chunk",json!({"sessionId":j.session,"seq":seq,"data":base64::engine::general_purpose::STANDARD.encode(crate::media_codec::encode(&block)?)})).map_err(|_|"设备音频传输中断，已停止连续朗读")?;
             seq+=1;offset+=count;sent+=count as u64;buffered=ack["bufferedMs"].as_u64().unwrap_or(0);buffer_at=Instant::now();
             if ack["state"]=="playing"{*j.phase.lock().unwrap()="playing".into();super::report(&j.id,"playing","");}
             progress(&mut marks,sent,buffered);
         }
     }
     if begun&&!stopped(j,usb){
-        usb.media_request(&j.board,"media/end",json!({"sessionId":j.session})).map_err(|_|"连续朗读结束回执丢失")?;
+        j.binding.media(usb,"media/end",json!({"sessionId":j.session})).map_err(|_|"连续朗读结束回执丢失")?;
         let deadline=Instant::now()+Duration::from_secs(3);
         let mut drained=false;
         while !stopped(j,usb)&&Instant::now()<deadline{
-            let ack=usb.media_request(&j.board,"media/query",json!({"sessionId":j.session})).map_err(|_|"无法确认连续朗读结束")?;
+            let ack=j.binding.media(usb,"media/query",json!({"sessionId":j.session})).map_err(|_|"无法确认连续朗读结束")?;
             let remaining=ack["bufferedMs"].as_u64().unwrap_or(0);progress(&mut marks,sent,remaining);
             if remaining==0{drained=true;break;}
             std::thread::sleep(Duration::from_millis(40));

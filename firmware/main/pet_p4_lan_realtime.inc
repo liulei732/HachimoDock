@@ -46,6 +46,7 @@ static uint32_t rtc_hud_generation;
 static void rtc_hud_process(pet_p4_runtime_state_t *state, uint64_t now, bool allowed, uint32_t pair_generation) {
   portENTER_CRITICAL(&rtc_hud_mux);
   pet_lan_hud_apply(&rtc_hud, state, now, !allowed || pair_generation != rtc_hud_generation);
+  if (rtc_hud.cue_count) pet_lan_hud_advance(&rtc_hud, state, pet_p4_audio_stream_played_bytes(), now);
   portEXIT_CRITICAL(&rtc_hud_mux);
 }
 
@@ -134,6 +135,7 @@ static size_t rtc_wire_downlink_bytes(unsigned kind) {
     case PET_LAN_RTC_KEEPALIVE: case PET_LAN_RTC_CLOSE: return 0;
     case LAN_RTC_BEGIN: case LAN_RTC_END: case LAN_RTC_FLUSH: return LAN_RTC_TURN_BYTES;
     case PET_LAN_RTC_AUDIO: return LAN_RTC_BODY_MAX;
+    case PET_LAN_CAPTION_KIND: return PET_LAN_CAPTION_BYTES;
     case PET_LAN_HUD_KIND: return PET_LAN_HUD_BYTES;
     default: return SIZE_MAX;
   }
@@ -225,7 +227,7 @@ static void rtc_wire_task(void *unused) {
   uint32_t rx = 0, tx = 0, turn = 0;
   size_t read_at = 0, read_goal = PET_LAN_RTC_HEADER, written = 0, write_goal = 0;
   int64_t read_until = 0, write_until = 0;
-  bool play_open = false, close_requested = false;
+  bool play_open = false, flushed = false, close_requested = false;
   int previous_power_save = -1;
   uint32_t reason = 1;
   pet_p4_audio_wifi_session_t session = 0;
@@ -362,9 +364,19 @@ static void rtc_wire_task(void *unused) {
         if (!incoming || (incoming > turn && kind != LAN_RTC_BEGIN)) { reason = 8; break; }
         esp_err_t result = ESP_OK;
         if (kind == LAN_RTC_BEGIN && incoming > turn) {
+          portENTER_CRITICAL(&rtc_hud_mux);
+          pet_lan_hud_turn(&rtc_hud, incoming);
+          portEXIT_CRITICAL(&rtc_hud_mux);
           result = pet_p4_audio_wifi_play(session, incoming, PET_P4_AUDIO_WIFI_PLAY_BEGIN, NULL, 0);
           turn = incoming;
           play_open = true;
+          flushed = false;
+        } else if (incoming == turn && kind == PET_LAN_CAPTION_KIND && play_open) {
+          portENTER_CRITICAL(&rtc_hud_mux);
+          const bool accepted = pet_lan_hud_cue(&rtc_hud, incoming, ota_wire_u32(body + 4),
+                                                (const char *)body + 8);
+          portEXIT_CRITICAL(&rtc_hud_mux);
+          if (!accepted) { reason = 15; break; }
         } else if (incoming == turn && kind == PET_LAN_RTC_AUDIO && play_open) {
           /* Give the existing DAC worker one frame interval to free space. */
           result = pet_p4_audio_wifi_play(session, turn, PET_P4_AUDIO_WIFI_PLAY_FRAME,
@@ -375,7 +387,13 @@ static void rtc_wire_task(void *unused) {
             result = pet_p4_audio_wifi_play(session, turn, PET_P4_AUDIO_WIFI_PLAY_FRAME,
                                            body + LAN_RTC_TURN_BYTES, PET_LAN_RTC_PCM);
           }
-        } else if (incoming == turn && (kind == LAN_RTC_FLUSH || (kind == LAN_RTC_END && play_open))) {
+        } else if (incoming == turn && ((kind == LAN_RTC_FLUSH && !flushed) || (kind == LAN_RTC_END && play_open))) {
+          if (kind == LAN_RTC_FLUSH) {
+            flushed = true;
+            portENTER_CRITICAL(&rtc_hud_mux);
+            pet_lan_hud_turn(&rtc_hud, 0);
+            portEXIT_CRITICAL(&rtc_hud_mux);
+          }
           result = pet_p4_audio_wifi_play(session, turn,
             kind == LAN_RTC_FLUSH ? PET_P4_AUDIO_WIFI_PLAY_FLUSH : PET_P4_AUDIO_WIFI_PLAY_END, NULL, 0);
           play_open = false;
@@ -387,6 +405,11 @@ static void rtc_wire_task(void *unused) {
   }
 
 cleanup:
+  if (!rtc_wire.ptt) {
+    portENTER_CRITICAL(&rtc_hud_mux);
+    pet_lan_hud_turn(&rtc_hud, 0);
+    portEXIT_CRITICAL(&rtc_hud_mux);
+  }
   if (!close_requested) close(fd);
   if ((!session || pet_p4_audio_wifi_stop(session) == ESP_OK) && close_requested &&
       rtc_wire_trusted(pair_generation) &&

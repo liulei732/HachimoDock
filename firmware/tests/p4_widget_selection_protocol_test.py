@@ -18,6 +18,9 @@ def test_real_selection_parser_preserves_active_and_restores_visible_id(tmp_path
     native = (ROOT/'main/pet_p4_usb_native.c').read_text()
     code = r'''
 #include <assert.h>
+#include <math.h>
+#include "pet_p4_evidence_identity.h"
+#include "pet_p4_voice_feedback.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -40,12 +43,13 @@ def test_real_selection_parser_preserves_active_and_restores_visible_id(tmp_path
 typedef int pet_widget_trace_kind_t;
 static void pet_widget_trace_end(int*p,bool ok){(void)p;(void)ok;}
 typedef void (*pet_p4_send_line_fn)(const char*,void*);
-typedef struct {char board_device_id[48],screen_page[24];unsigned stats,last_update_ms;}pet_p4_runtime_state_t;
+typedef struct {char board_device_id[48],screen_page[24];unsigned stats,last_update_ms;pet_voice_feedback_t voice_feedback;}pet_p4_runtime_state_t;
+static pet_boot_identity_t g_boot_identity;
 typedef struct {char *line;}pet_p4_query_reply_t;
-typedef struct {char widget_id[48],title[64];bool active;unsigned resource_state,image_count,center_title_checksum,center_title_slot,center_title_generation;pet_p4_component_metadata_t package_metadata;}pet_p4_miniapp_catalog_entry_t;
-typedef struct {char widget_id[48],title[64];unsigned resource_state,image_count,center_title_checksum,slot,package_generation;pet_center_filter_t center_category;pet_p4_component_metadata_t package_metadata;}miniapp_catalog_item_t;
+typedef struct {char widget_id[48],title[64];bool active;unsigned resource_state,image_count,center_title_checksum,center_title_slot,center_title_generation,center_thumb_checksum,center_thumb_generation;pet_p4_component_metadata_t package_metadata;}pet_p4_miniapp_catalog_entry_t;
+typedef struct {char widget_id[48],title[64];unsigned resource_state,image_count,center_title_checksum,center_thumb_checksum,center_thumb_generation,slot,package_generation;pet_center_filter_t center_category;pet_p4_component_metadata_t package_metadata;}miniapp_catalog_item_t;
 static miniapp_catalog_item_t g_catalog[4]={
- {.widget_id="music-player"},{.widget_id="user-z",.resource_state=1},
+ {.widget_id="music-player"},{.widget_id="user-z",.resource_state=1,.slot=9,.package_generation=1,.center_thumb_checksum=0xfedc1234u,.center_thumb_generation=2},
  {.widget_id="user-a",.resource_state=1},{.widget_id="fixture",.resource_state=1}};
 static size_t g_catalog_count=4,g_catalog_selected=2;
 static bool g_catalog_recovery_blocked;
@@ -59,6 +63,9 @@ static int64_t esp_timer_get_time(void){return 123000;}
 static const char*json_string(const cJSON*p,const char*k){const cJSON*v=cJSON_GetObjectItemCaseSensitive(p,k);return cJSON_IsString(v)?v->valuestring:"";}
 static bool pet_p4_miniapp_active_id(char*out,size_t n){if(g_runtime.active)copy_text(out,n,g_runtime.widget_id);return g_runtime.active;}
 static bool forbidden(void){forbidden_calls++;assert(!"selection invoked unrelated side effect");return false;}
+static void pet_p4_audio_feedback_sync(pet_p4_runtime_state_t *state,uint64_t now){forbidden();}
+bool pet_voice_feedback_update(pet_voice_feedback_t *view,uint32_t token,const char *capture,
+    uint32_t revision,const char *phase,const char *text,bool inserted,uint64_t now){return forbidden();}
 static bool refused_install(const cJSON*p,char*e,size_t n){(void)p;(void)e;(void)n;return forbidden();}
 static bool refused_remove(const char*p,char*e,size_t n){(void)p;(void)e;(void)n;return forbidden();}
 #define pet_p4_miniapp_transfer_begin refused_install
@@ -116,8 +123,9 @@ static void pet_p4_native_usb_send_json_line(const char*line,void*ctx){(void)lin
         code += function(native,name)+'\n'
     code += function(protocol,'asset_phase_send_current')+'\n'
     code += '\n'.join(commit_errors)+'\n'
-    for name in ('send_topic_payload','send_protocol_ack','send_widget_ack',
-                 'pet_p4_widget_inventory','send_widget_inventory','handle_widget_topic','pet_p4_protocol_source_valid'):
+    inventory_builder = ('pet_p4_widget_inventory',) if 'cJSON *pet_p4_widget_inventory(' in protocol else ()
+    for name in ('json_bounded_u64','send_topic_payload','send_protocol_ack','send_widget_ack',
+                 *inventory_builder,'send_widget_inventory','handle_widget_topic','pet_p4_protocol_source_valid'):
         code += function(protocol,name)+'\n'
     # The real outer representation/envelope parser prefix, then only its real
     # widget delegate; unrelated hardware dispatch branches are not compiled.
@@ -199,9 +207,18 @@ int main(void){
  assert(!wire("{\"topic\":\"widget/select_by_id\",\"payload\":{\"requestId\":\"nul\",\"widgetId\":\"fixture\\u0000suffix\"}}"));assert(g_catalog_selected==original);
  assert(!wire("{\"topic\":\"widget/select_by_id\",\"payload\":[]}"));assert(g_catalog_selected==original);
  assert(!pet_p4_miniapp_catalog_select(99)&&g_catalog_selected==original);
+ /* Read through the filtered public catalog; a reused destination clears absent artwork. */
+ pet_p4_miniapp_catalog_entry_t card;
+ assert(pet_p4_miniapp_catalog_get(0,&card) && !strcmp(card.widget_id,"user-z"));
+ assert(card.center_title_slot==9 && card.center_title_generation==1);
+ assert(card.center_thumb_generation==2 && card.center_thumb_checksum==0xfedc1234u);
+ assert(pet_p4_miniapp_catalog_get(1,&card) && !strcmp(card.widget_id,"user-a"));
+ assert(!card.center_thumb_generation && !card.center_thumb_checksum);
  /* Restore by ID after visible order changed: index is observational, not authority. */
  miniapp_catalog_item_t swap=g_catalog[1];g_catalog[1]=g_catalog[2];g_catalog[2]=swap;
  assert(wire("{\"topic\":\"widget/select_by_id\",\"payload\":{\"requestId\":\"reorder\",\"widgetId\":\"user-a\"}}"));ack(true,"reorder",NULL);inventory("user-a",0);
+ assert(pet_p4_miniapp_catalog_get(1,&card) && !strcmp(card.widget_id,"user-z"));
+ assert(card.center_thumb_checksum==0xfedc1234u && card.center_thumb_generation==2 && card.center_title_slot==9);
  /* Failed durable cursor IO must not publish a new selection or activate. */
  size_t before=g_catalog_selected;fail_cursor=true;
  assert(!wire("{\"topic\":\"widget/select_by_id\",\"payload\":{\"requestId\":\"write-fault\",\"widgetId\":\"fixture\"}}"));

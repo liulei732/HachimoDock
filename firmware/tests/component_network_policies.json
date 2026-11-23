@@ -1,0 +1,189 @@
+[
+  {
+    "valid": true,
+    "policy": {
+      "profile": "component-network-v1",
+      "https": [
+        {
+          "origin": "https://api.example.org",
+          "methods": [
+            "GET",
+            "POST"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "valid": true,
+    "policy": {
+      "profile": "component-network-v1",
+      "mqtts": [
+        {
+          "host": "events.example.org",
+          "port": 8883,
+          "subscribe": [
+            "sensors/+/state",
+            "alerts/#"
+          ],
+          "publish": [
+            "sensors/one/request"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "valid": true,
+    "policy": {
+      "profile": "component-network-v1",
+      "credentials": {
+        "records": 2,
+        "totalBytes": 4096
+      }
+    }
+  },
+  {
+    "valid": false,
+    "policy": {}
+  },
+  {
+    "valid": false,
+    "policy": {
+      "profile": "component-network-v1"
+    }
+  },
+  {
+    "valid": false,
+    "policy": {
+      "profile": "component-network-v1",
+      "credentials": null
+    }
+  },
+  {
+    "valid": false,
+    "policy": {
+      "profile": "component-network-v1",
+      "credentials": {
+        "records": true,
+        "totalBytes": 4096
+      }
+    }
+  },
+  {
+    "valid": false,
+    "policy": {
+      "profile": "component-network-v1",
+      "https": [
+        {
+          "origin": "http://api.example.org",
+          "methods": [
+            "GET"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "valid": false,
+    "policy": {
+      "profile": "component-network-v1",
+      "https": [
+        {
+          "origin": "https://127.0.0.1",
+          "methods": [
+            "GET"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "valid": false,
+    "policy": {
+      "profile": "component-network-v1",
+      "https": [
+        {
+          "origin": "https://api.example.org/path",
+          "methods": [
+            "GET"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "valid": false,
+    "policy": {
+      "profile": "component-network-v1",
+      "https": [
+        {
+          "origin": "https://api.example.org:443",
+          "methods": [
+            "GET"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "valid": false,
+    "policy": {
+      "profile": "component-network-v1",
+      "https": [
+        {
+          "origin": "https://*.example.org",
+          "methods": [
+            "GET"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "valid": false,
+    "policy": {
+      "profile": "component-network-v1",
+      "https": [
+        {
+          "origin": "https://API.example.org",
+          "methods": [
+            "GET"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "valid": false,
+    "policy": {
+      "profile": "component-network-v1",
+      "mqtts": [
+        {
+          "host": "events.example.org",
+          "port": 8883,
+          "subscribe": [
+            "sensors/#/all"
+          ],
+          "publish": []
+        }
+      ]
+    }
+  },
+  {
+    "valid": false,
+    "policy": {
+      "profile": "component-network-v1",
+      "mqtts": [
+        {
+          "host": "events.example.org",
+          "port": 1883,
+          "subscribe": [
+            "sensors/#/all"
+          ],
+          "publish": []
+        }
+      ]
+    }
+  }
+]

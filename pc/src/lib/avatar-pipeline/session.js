@@ -2,6 +2,7 @@
  * IDB transactions atomically commit source/reference images, prompts and cloud IDs.
  * A submission intent without an ID is deliberately not replayable. */
 import { CUSTOM_GENERATION_FAMILIES } from "./families.js";
+import { QUALITY_REVIEW_VERSION } from "./quality.js";
 import { DEFAULT_VOLCANO_IMAGE_MODEL } from "./providers/volcano-image.js";
 
 // Reconstruct display state from durable evidence, never from an absent UI progress object.
@@ -10,6 +11,35 @@ export function localVideoInspectionNotice(session) {
   const failed=Object.values(session?.actions||{}).some(action=>action?.videoBytes?.byteLength>0 && (
     action.inspectionFailure || (action.failed && !action.inspection && !action.validated && !action.qualityIntent)));
   return failed ? "视频已生成并保存，本地视频检查未通过。恢复将复用已有视频，不会重新生成该片段。" : "";
+}
+
+export function rejectedStartFrames(session) {
+  if (!session?.distinctStartFrames || !session.appearanceId || !session.trialApproved ||
+      !session.referenceApproved || session.config?.provider !== "volcengine") return [];
+  return (session.manifest?.entries || []).map(entry => entry.family).filter(id => {
+    const action = session.actions?.[id];
+    return action?.startFrameQuality?.pass === false && !action.startFrameApproved &&
+      !action.videoBytes?.byteLength && !action.taskId && !action.intent;
+  });
+}
+
+// Mirror the replay rules for paid first-frame requests and completed reviews.
+function manualActionNotice(session, ids, actions) {
+  if (session.phase !== "partial" || !session.appearanceId || !session.distinctStartFrames) return "";
+  let rejected = 0, unknown = 0;
+  for (const id of ids) {
+    const action = actions[id];
+    if (action?.videoBytes?.byteLength && !action.failed) continue;
+    if (!action?.failed || action.deferred || action.videoBytes?.byteLength || action.taskId) return "";
+    if (!action.startFrameApproved && action.startFrameQuality?.pass === false &&
+        action.startFrameQualityVersion === QUALITY_REVIEW_VERSION) rejected++;
+    else if (action.startFrameIntent && !action.startFrameResult && !action.startFrameRaw && !action.startFrame) unknown++;
+    else return "";
+  }
+  return [
+    rejected && `${rejected} 个动作的首帧未通过检查，可在形象详情中单独重做。`,
+    unknown && `${unknown} 个动作的首帧请求结果未知，请先在服务商处核对，再决定是否重做。`,
+  ].filter(Boolean).join(" ");
 }
 
 export function summarizeGenerationSession(session) {
@@ -30,7 +60,9 @@ export function summarizeGenerationSession(session) {
   const families = Object.fromEntries(ids.map(id => [id, { status: actions[id]?.videoBytes?.byteLength > 0 ? "done" : actions[id]?.failed ? "failed" : actions[id]?.taskId ? "polling" : "pending" }]));
   const localInspectionNotice=localVideoInspectionNotice(session);
   if(status==="failed" && localInspectionNotice)label="视频已保存，本地检查未通过";
-  return { status, label, completed, total, failed, families, localInspectionNotice };
+  const manualNotice = manualActionNotice(session, ids, actions);
+  if (manualNotice) label = "部分已保存，剩余动作需单独处理";
+  return { sessionId: session.id, status, label, completed, total, failed, families, localInspectionNotice, manualNotice, rejectedFrames: rejectedStartFrames(session) };
 }
 
 export function canAutoResume(session) {
@@ -113,21 +145,23 @@ export async function listGenerationHistory() {
     return await new Promise((resolve, reject) => {
       const tx = db.transaction("jobs", "readonly");
       const store = tx.objectStore("jobs");
-      const current = store.get("current");
+      let currentId;
       const rows = [];
       const cursor = store.openCursor();
       cursor.onsuccess = () => {
         const entry = cursor.result;
         if (!entry) return;
-        if (String(entry.key).startsWith("archive:")) {
+        if (entry.key === "current" || String(entry.key).startsWith("archive:")) {
           const s = entry.value;
-          rows.push({ key: entry.key, id: s.id, appearanceName: s.appearanceName,
+          const summary = summarizeGenerationSession(s);
+          if (entry.key === "current") currentId = s.id;
+          if (entry.key !== "current" || summary.manualNotice) rows.push({ appearanceId: s.appearanceId, key: entry.key, id: s.id, appearanceName: s.appearanceName,
             createdAt: s.createdAt, finished: !!s.finished, dismissed: !!s.dismissed,
-            ...summarizeGenerationSession(s) });
+            ...summary });
         }
         entry.continue();
       };
-      tx.oncomplete = () => resolve(rows.filter(s => s.id !== current.result?.id)
+      tx.oncomplete = () => resolve(rows.filter(s => s.key === "current" || s.id !== currentId)
         .sort((a,b) => (b.createdAt || 0) - (a.createdAt || 0)));
       tx.onabort = () => reject(new Error("读取生成历史失败"));
     });

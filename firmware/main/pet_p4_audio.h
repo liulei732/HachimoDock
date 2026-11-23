@@ -17,8 +17,6 @@ extern "C" {
 #define PET_P4_AUDIO_CHANNELS 1
 #define PET_P4_AUDIO_BITS_PER_SAMPLE 16
 #define PET_P4_AUDIO_FRAME_MS 20
-/* State-owner only. Copies bounded meter metadata; never performs codec/USB IO. */
-void pet_p4_audio_feedback_sync(pet_p4_runtime_state_t *state, uint64_t now_ms);
 void pet_p4_audio_instrument_set(bool active, unsigned effect, unsigned ambience);
 void pet_p4_audio_fruit_sound(unsigned events,unsigned volume,bool active);
 /* p4-sfx-v1: bounded component cues. Same gating as the fruit/instrument paths:
@@ -55,6 +53,11 @@ esp_err_t pet_p4_audio_init(
   void *ctx
 );
 bool pet_p4_audio_ready(void);
+/* These are native foreground UI calls; never route them through command dispatch. */
+void pet_p4_audio_meter_select(uint32_t owner);
+void pet_p4_audio_meter_shown(uint32_t owner, uint64_t now_ms);
+void pet_p4_audio_meter_key(uint32_t owner, bool down, bool click, uint64_t event_ms);
+int pet_p4_audio_meter_read(uint32_t owner); /* -1 prompt, -2 busy, 0..100 level */
 /* Route capture to the client that enabled it, not every enumerated USB link. */
 void pet_p4_audio_set_transport(pet_p4_send_line_fn send_line, void *ctx);
 bool pet_p4_audio_enabled(void);
@@ -72,6 +75,8 @@ esp_err_t pet_p4_audio_set_enabled(bool enabled);
  * prevents new admitted background FS work, not hard preemption of in-flight
  * flash calls, and does not alter audio format/DSP scheduling parameters. */
 esp_err_t pet_p4_audio_capture_start(bool session_queue_empty);
+esp_err_t pet_p4_audio_capture_start_button(bool session_queue_empty, uint32_t feedback_token);
+void pet_p4_audio_feedback_sync(pet_p4_runtime_state_t *state, uint64_t now_ms);
 esp_err_t pet_p4_audio_capture_stop(void);
 esp_err_t pet_p4_audio_capture_start_owned(bool session_queue_empty,const char *owner);
 esp_err_t pet_p4_audio_capture_stop_owned(const char *owner);
@@ -127,6 +132,7 @@ esp_err_t pet_p4_audio_stream_end(void);
 void pet_p4_audio_stream_flush(void);
 unsigned int pet_p4_audio_stream_played_bytes(void);
 esp_err_t pet_p4_audio_music_begin(const char *session_id);
+bool pet_p4_audio_music_flush_if_owner(const char *session_id);
 bool pet_p4_audio_music_active(void);
 bool pet_p4_audio_music_paused(void);
 bool pet_p4_audio_music_ended(void);

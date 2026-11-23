@@ -123,7 +123,7 @@ def body_frame(style, text, now, *, lan=False, alpha=15, page=0, pages=1):
 
 @pytest.mark.parametrize('style', [2, 4])
 @pytest.mark.parametrize('lan', [False, True])
-def test_medium_body_waits_for_gray_and_keeps_previous_during_updates(renderer_receiver, style, lan):
+def test_medium_body_shows_current_text_immediately_until_exact_gray_arrives(renderer_receiver, style, lan):
     original, updated = '中文字体任务完成', '中文字体任务完成。㐀'
 
     def shown(text, now, *, pending=False, exact=False, mask=False, shade=None):
@@ -139,7 +139,7 @@ def test_medium_body_waits_for_gray_and_keeps_previous_during_updates(renderer_r
     commands = [{'localFonts': True}, body_manifest(style, original, 100, lan=lan)]
     if lan:
         commands.append(request({'phase': 'capabilities'}, reply={'bodyMasks': True}))
-    commands += shown(original, 100, pending=True)
+    commands += shown(original, 100)
     if lan:
         commands.append(request({'phase': 'need'}, now=101, gateMask=4,
                                 reply={'ok': True, 'need': {
@@ -158,7 +158,7 @@ def test_medium_body_waits_for_gray_and_keeps_previous_during_updates(renderer_r
     blended = (14 << 11) | (29 << 5) | 14
     commands += shown(original, 220, mask=True, exact=True, shade=blended)
     commands.append(body_manifest(style, updated, 240, lan=lan))
-    commands += shown(updated, 250, mask=True, shade=blended)
+    commands += shown(updated, 250)
     commands += body_frame(style, updated, 800, lan=lan)
     commands += shown(updated, 820, mask=True, exact=True, shade=0)
     if lan:
@@ -218,7 +218,7 @@ def test_body_paging_keeps_selected_mask_under_eviction_pressure(renderer_receiv
 
 
 @pytest.mark.parametrize('initial', [False, True])
-def test_partial_pressure_and_audio_gate_cannot_extend_the_body_deadline(renderer_receiver, initial):
+def test_partial_pressure_and_audio_gate_keep_current_text_readable(renderer_receiver, initial):
     style, original, start = 4, '中文字体任务完成', 100
     commands = [{'localFonts': True}]
     if initial:
@@ -227,7 +227,6 @@ def test_partial_pressure_and_audio_gate_cannot_extend_the_body_deadline(rendere
         commands += [select('Agent', original, now=40, owner='live')]
     # Repeated stopped or superseded owners occupy no need slots permanently.
     # Exercise 100 distinct versions in one continuously visible owner.
-    deadline = 3200 if initial else 2500
     for i in range(100):
         now, text = start + i * 40, f'{original}{i}'
         version = f'{i + 2:016x}'
@@ -235,9 +234,8 @@ def test_partial_pressure_and_audio_gate_cannot_extend_the_body_deadline(rendere
             body_manifest(style, text, now, version=version),
             {'maintain': {'now': now, 'pause': i % 3 == 0, 'conversation': True}},
             select('Agent', text, now=now, hold=True, owner='live'),
-            {'bodyState': {'mask': initial and now - start < deadline,
-                           'pending': not initial and now - start < deadline}},
-            {'bodyDraw': {'localCalls': int(now - start >= deadline)}},
+            {'bodyState': {'mask': False, 'pending': False}},
+            {'bodyDraw': {'localCalls': 1}},
             {'release': True},
         ])
     commands += [
@@ -257,7 +255,7 @@ def test_partial_pressure_and_audio_gate_cannot_extend_the_body_deadline(rendere
         {'bodyState': {'mask': True, 'exact': True}}, {'bodyDraw': {'localCalls': 0}}, {'release': True},
         body_manifest(style, text + '新', 4700),
         select('Agent', text + '新', now=4710, hold=True, owner='live'),
-        {'bodyState': {'mask': True}}, {'drawHeld': {'style': style, 'ok': True, 'first': 0}},
+        {'bodyState': {'mask': False}}, {'drawHeld': {'style': style, 'ok': False}},
         {'release': True},
     ]
     renderer_receiver(commands)
@@ -278,9 +276,9 @@ def test_previous_body_mask_is_bounded_to_its_display_scope(renderer_receiver, b
         {'bodyState': {'mask': True, 'exact': True}}, {'release': True},
         body_manifest(style, second, now, lan=lan),
         select(title, second, now=now, hold=True, owner=owner),
-        {'bodyState': {'pending': True}}, {'bodyDraw': {'localCalls': 0}}, {'release': True},
+        {'bodyState': {'pending': False}}, {'bodyDraw': {'localCalls': 1}}, {'release': True},
         select(title, second, now=now+10, hold=True, owner=owner),
-        {'bodyState': {'pending': True}}, {'drawHeld': {'style': style, 'ok': False}},
+        {'bodyState': {'pending': False}}, {'drawHeld': {'style': style, 'ok': False}},
         {'release': True},
         *body_frame(style, second, now+20, lan=lan),
         select(title, second, now=now+40, hold=True, owner=owner),
@@ -289,17 +287,17 @@ def test_previous_body_mask_is_bounded_to_its_display_scope(renderer_receiver, b
 
 
 @pytest.mark.parametrize('lan', [False, True])
-def test_new_update_after_fallback_can_wait_without_inheriting_the_previous_key(renderer_receiver, lan):
+def test_new_update_after_fallback_is_readable_without_inheriting_the_previous_key(renderer_receiver, lan):
     first, second = '开始', '下一段'
     renderer_receiver([
         {'localFonts': True}, body_manifest(4, first, 100, lan=lan),
         select('Agent', first, now=100, hold=True, owner='live'),
-        {'bodyState': {'pending': True}}, {'release': True},
+        {'bodyState': {'pending': False}}, {'release': True},
         select('Agent', first, now=2600, hold=True, owner='live'),
         {'bodyState': {}}, {'bodyDraw': {'localCalls': 1}}, {'release': True},
         body_manifest(4, second, 2700, lan=lan),
         select('Agent', second, now=2700, hold=True, owner='live'),
-        {'bodyState': {'pending': True}}, {'bodyDraw': {'localCalls': 0}}, {'release': True},
+        {'bodyState': {'pending': False}}, {'bodyDraw': {'localCalls': 1}}, {'release': True},
         select('Agent', second, now=5200, hold=True, owner='live'),
         {'bodyState': {}}, {'bodyDraw': {'localCalls': 1}}, {'release': True},
         *body_frame(4, second, 5250, lan=lan),
@@ -332,7 +330,7 @@ def test_lan_caption_can_arrive_before_its_manifest(renderer_receiver):
     renderer_receiver([
         {'localFonts': True}, body_manifest(style, '准备中', lan=True),
         select('你', caption, now=100, style=style, hold=True, owner='live'),
-        {'bodyState': {'pending': True}}, {'release': True},
+        {'bodyState': {'pending': False}}, {'release': True},
         request({'phase': 'need'}, now=110, gateMask=4, noNeed=True),
         body_manifest(style, caption, now=120, lan=True),
         *body_frame(style, caption, 130, lan=True),

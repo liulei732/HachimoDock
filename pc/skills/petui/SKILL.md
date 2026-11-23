@@ -1,11 +1,13 @@
 ---
 name: petui
-description: Generate, validate, and publish ESP32-P4 desktop-pet games, tools, PC-fed live-data widgets such as stock watchlists, and bounded PNG sprite assets as .hachiapp packages. Use for new components or repairs to existing Pet Manager components; live data requires an implemented PC data source.
+description: Generate, validate, and publish ESP32-P4 desktop-pet games, tools, live-data widgets, and bounded PNG sprite assets as .hachiapp packages. Use for new or existing Pet Manager components. Live data can come from supported WiFi6 device hosts or a PC provider. Controlled Python data plugins run on the desktop.
 ---
 
 # petui
 
 把自然语言需求实现为 ESP32-P4 组件。交付格式统一为 `.hachiapp`，导入 Pet Manager 后用「保存并同步」安装和更新。
+
+按用途选手册和验收方法，见[创作目标与工具索引](references/authoring-inspection.md)。对交付给其他用户的组件，可用 `petui compatibility` 查看依赖，用 `petui first-data` 核对首条数据，并用 `petui install-rehearsal` 在干净组件库预演安装和升级。
 
 ## 创作工具
 
@@ -13,17 +15,23 @@ description: Generate, validate, and publish ESP32-P4 desktop-pet games, tools, 
 
 有设备诊断文件时，用 `petui data-link <runtime/widget.json> <diagnostics.json>` 离线核对该数据源的 USB 和 Wi-Fi 接收计数与时效。按 [实时数据验收](references/live-data.md#离线核对接收证据) 选定板卡和启动范围。
 
+需要用 Python 在电脑端处理组件数据时，使用 [桌面 Python 插件](references/python-plugins.md)。先检查客户端的 `petui tool-info` 是否公布 `petui-python-v1`，再声明 `pc/plugin.py` 和输入权限，用 `petui python-preview` 验证无隐私样例，最后按普通组件流程打包、授权、同步和发布。
+
 ## 设备独立运行
 
 - 设备可以直接取得的数据、执行的动作和维护的状态，由设备负责。把首次配置、正常运行、断网恢复和重启恢复做成设备端的完整流程。
-- 仅当数据或动作必须来自电脑本机时，使用 PC 提供器及共用的 USB／配对 Wi-Fi 连接。组件说明明确写出依赖的是哪种电脑数据或应用。
+- 电脑数据、桌面操作、受控 Python 以及需要 PC 处理的外部服务走 PC 提供器。分别标明数据生产端、推送链路和动作链路，按[四板自治验收](references/authoring-inspection.md#四板自治验收)记录实机结果。
 - 公开 HTTPS、带 Bearer Token 的 HTTPS JSON 和只读 MQTT TLS 使用设备 Wi-Fi 数据宿主。私有数据源需协商 `widgetPrivateFeed=p4-private-feed-v1`，组件内提示连接服务账号。匿名 MQTT 声明 `connection.type="mqtt-public"`，须协商 `widgetPublicMqtt=p4-public-mqtt-v1`，打开即订阅。参见 [设备联网约定](references/wifi-data.md#设备私有数据源)。
+
+- WiFi6 的组件可声明一次 HTTPS 提交或 MQTT 发布，要求 `widgetScopedWrite=p4-scoped-write-v1`。目标板须具备安全凭证存储。写入按钮、授权范围和验收方法见[组件限域发送](references/wifi-data.md#组件限域发送)。
+
+需要由 WASM 直接发起异步 HTTPS 请求或 MQTT TLS 操作时，按[组件联网 ABI](references/component-network.md)声明目标和权限。安装前核对设备握手；用户的长期凭据由受信宿主配置，组件只能查询是否存在、按绑定目标引用或删除。
 
 ## 统一组件包
 
 - 先读 [hachiapp.md](references/hachiapp.md)。根据需求在包内使用声明式运行时或有界 WASM，向用户交付同一种文件格式。
 - 声明式和 WASM 组件都要校验、自测并通过 `petui publish <组件.hachiapp>` 发布到正式本地组件库。生成包后须确认已出现在「我的组件」。打包前保留原组件 ID。
-- 新交付必须包含 `pc/cover.png`。用实际组件的代表画面，按 [hachiapp.md](references/hachiapp.md) 验收 Pet Manager 列表卡片。
+- 新交付必须包含 `pc/cover.png`。截取实际组件可辨认的运行画面，按 [封面验收](references/hachiapp.md#封面) 同时检查 PC 卡片和 64×48 设备缩图。社区首图由包内封面生成。
 - 先判断能否用有界 WASM 表达，再以声明式限制否决需求。需要维护棋盘数组、记录撤销历史或自定义移动规则的小游戏（例如 5×5 滑块拼图），走 WASM 路径。设备能力尚未读取时可以先离线编译和自测，等握手确认后再同步。
 - 需要 WASM 时按 [hachiapp.md](references/hachiapp.md) 的 SDK 流程走。实际设备须宣告 `widgetWasm=hachi-wasm-v1` 才能同步 WASM；该能力与 `widgetProgram` 无关。
 - 新 WASM 组件使用 640×480 原生画布，设备须宣告 `widgetWasmCanvas=640x480-v1`。交付前用实际组件检查首屏和主操作。按需要覆盖交互、结束等关键状态，若已有确认稿则对照检查。在素材、字号或画布需要调整时，先向用户说明；不能静默缩小素材再放大。
@@ -72,7 +80,7 @@ description: Generate, validate, and publish ESP32-P4 desktop-pet games, tools, 
    - 变量、状态、页面、transition、节点或内容池项数超出 v1 上限时，完整读取 [references/quota.md](references/quota.md)，从实际 `widgetQuota`/`widgetQuotas` 选择显式 v2 或 v3；图片、精灵、表单及持久化仍按各自独立契约限制，不能把某一配额档位用于全局放宽。
    - 组件需要按键、结算或场景事件的短提示音时，完整读取 [references/sfx.md](references/sfx.md)，声明 `sfx: {"engine": "p4-sfx-v1", ...}` 并核验 `widgetSfx`；只有 6 个固定预设、最多 8 个 cue，没有采样、音乐或语音，不与木鱼/播放器混用。
    - 离线随机内容池、排除抽签、思考卡或设备端日期倒计时，完整读取 [references/local-tools.md](references/local-tools.md)。使用通用 local 引擎并校验 widgetLocalTools，不按组件 ID 写固件分支；断电后日期工具必须重新校时。
-   - 近期资讯/新闻简报读取 [references/news.md](references/news.md)，采用有来源、时间窗和数量约束的 PC 资讯宿主，不把模型记忆当作联网结果。
+   - 近期资讯/新闻简报读取 [references/news.md](references/news.md)，WiFi6 可获取 HN 标题；三类全文与朗读使用 PC 资讯宿主，不把模型记忆当作联网结果。
    - 需要应用级布局、图标按钮、精细字号或原生 640×480 背景时，完整读取 [references/app-surface.md](references/app-surface.md)，核对设备图形能力；不得为了迁就旧图片配额静默降低分辨率或删掉图标。
    - 需要 PC 数据源驱动的可见集合行时，另完整读取 [references/host-collection.md](references/host-collection.md) 和 composition 契约；仅 UI 候选明确协商后使用，普通设备不支持时不得伪造能力或声称本地独立动态应用已完成。
    - 需要手机式滚动卡片、固定标题/底栏、打卡进度或记录历史时，另完整读取 [references/app-viewport.md](references/app-viewport.md) 与 [references/composition.md](references/composition.md)。使用通用裁切视口和 ledger，不按组件名字添加宿主逻辑；滚动须协商 widgetAppViewport，不冒充完整手机操作系统。
@@ -85,7 +93,7 @@ description: Generate, validate, and publish ESP32-P4 desktop-pet games, tools, 
    - 需要连续向前的随机平台和跟随镜头时，使用同一 motion 中的 `track` 扩展，另核验 `widgetPlatformTrack=p4-platform-track-v1`；不能用每次落台重置角色位置冒充连续前进。
    - 有目标、玩家输入、即时反馈、局面变化和回合结算时，使用 `game`。
    - 以计时、提醒、追踪、展示、查询或控制为主要价值时，使用 `tool`。
-   - 展示行情等实时数据时，按 [实时数据约定](references/live-data.md) 选择设备直接 HTTPS、PC 经 USB 推送或 PC 经受信 Wi-Fi 推送。PC 快照共用一个 `data.source` 声明。设备直连使用 [设备 HTTPS 约定](references/wifi-data.md) 的能力与公开端点。鉴权来源如 `github.me` 由 PC 提供器处理，令牌留在 PC。接口未确认的 `codex.usage` 保持停用。
+   - 展示行情等实时数据时，按 [实时数据约定](references/live-data.md) 选择设备直接 HTTPS、PC 经 USB 推送或 PC 经受信 Wi-Fi 推送。PC 快照共用一个 `data.source` 声明。设备直连使用 [设备 HTTPS 约定](references/wifi-data.md) 的能力与公开端点。`github.me` 兼容 PC 已有授权，令牌留在 PC。新组件需要私人数据时使用组件内的 Token 授权。接口未确认的 `codex.usage` 保持停用。
    - 把设备当快捷键面板向电脑发组合键时，另读 [references/hotkeys.md](references/hotkeys.md)，使用宿主服务 `hotkeys` 的白名单组合键与场景声明；发送默认关闭，由用户在 PC 开启。
    - 维护城市天气应用时，另读 [references/location-forecast.md](references/location-forecast.md)，使用包内声明式接口、字段映射、城市与文案；宿主只解释受控能力，不运行包内代码。
    - 分类知识库或长文阅读工具另读 [references/knowledge-library.md](references/knowledge-library.md)，知识和来源在 PC 资源包中，设备按页读取；校验数量、长度、随机不重复与授权，不用重复段落凑字数。
@@ -134,6 +142,7 @@ description: Generate, validate, and publish ESP32-P4 desktop-pet games, tools, 
    普通应用自测也探索同一状态/页面内的变量变化，例如先计数再清零。探索受 512 个快照和 32 层输入深度约束，并报告是否截断；这不是无限状态空间或全部路径证明。
    实时列表自测覆盖 0/1/6/11/16/20 行的分页可达性与真实按键反馈；它不验证网络取价、时效或设备画面，这些必须另外验收，不能把结构/模拟通过写成实时链路已通过。
 11. 按 [界面验收指南](references/ui-design.md#验收) 检查运行画面。修正问题后复跑受影响的操作，用实际运行画面替换临时封面并重新打包校验。修复全部结构、素材和玩法错误。使用 PNG 时还要逐条核对没有素材缺失、格式、尺寸、帧数、总像素、文件大小或帧间闪烁风险。结构校验和适用的场景/玩法自测均通过后才可交付。自动脚本须退出码为 `0`，试玩自测须记录各项结果。
+    在最终打包和发布前完成[收尾音效](references/sound-effects.md)：适合声音配合的组件，先让用户用一句话描述风格与触发场景，再生成、绑定并验收配套音效；已说明需求时直接沿用，不需要声音时跳过。**新组件音效默认强度为 80%，用户明确指定其他音量时按用户要求执行**；设置组件参数，不修改设备系统音量。新增配套音效合计不得超过 **30,000 字节**。URL 只用于已有联网音频宿主真实支持的播放方式，不虚构任意按键 URL 音效。
 12. 原子发布到正式本地组件库：
 
    ```bash
@@ -159,7 +168,7 @@ description: Generate, validate, and publish ESP32-P4 desktop-pet games, tools, 
 - 游戏的 `component.json.description` 不是宣传口号：必须简要说明怎么玩、怎样得分或完成、何时结束。组件中心会在它下方根据 `buttons.json` 自动补充当前操作方法，因此描述不得写死可被用户重新映射的物理键位。
 - 所有新组件都声明顶层 `engine: "p4-bounded-runtime-v4"`。`game/tool` 只是产品分类，底层运行时相同；v3 只用于读取和维护历史包。
 - 按玩法和画面选现有渲染路径。简单信息可用 Dashboard，自定义构图、图标和动态内容布局可用 App Surface，复杂玩法或现有原语表达不了的画面可用有界 WASM。声明式行为可由变量、状态、transition 和 tick 表达，按需使用 `scene` 处理坐标、移动、碰撞和边界。
-- 实时数据工具遵循契约 5.1 与 `references/live-data.md`；当前已实现 `stocks.watchlist`，其他 source 先确认或补齐 PC 提供器。股票默认项、刷新周期、鉴权都属于 PC，不写入组件包，不假装任意 URL 可以直接工作。
+- 实时数据工具遵循契约 5.1 与 `references/live-data.md`；`stocks.watchlist` 可由 WiFi6 直取，也可接收 PC 快照。设备使用默认或已保存的名单，编辑名单在 PC。新服务先核对受控 HTTPS/MQTT 数据形状；需要 PC 时核对实际提供器、输入授权与更新链路。
 - 新声明式小游戏需要场景机制时用通用 `scene`。旧版 `game.type=blocks|snake|flappy` 仅用于读取和维护兼容包。
 - 例外：用户要求五子棋 / 五子对弈 / 连珠时，使用原生预设 `game.type="gomoku"`（契约 §6「原生五子棋预设」、app-surface.md「原生五子棋画面」），固定 action 表 `place|left|right|up|down|undo`，需设备 `widgetGamePresets` 含 `gomoku`；description 规则不变，仍需说明目标、规则与结束条件。其他棋类不得借用该预设。
 - 文案出现移动、飞行、射击、子弹、敌人或碰撞时，runtime 必须真实实现对应 scene 机制；不得只在 Dashboard 中描述不存在的玩法。
@@ -168,8 +177,8 @@ description: Generate, validate, and publish ESP32-P4 desktop-pet games, tools, 
 - `assets/` 保留该运行模式正式引用的 PNG、音频 WAV 或 clip 视频 MP4；按对应文档声明资源，不要求 app surface 图片写入 scene.sprites。删除候选图和临时文件；不得改扩展名冒充编码。
 - Dashboard 默认使用 `visualStyle: "clean"`，像素题材可选 `pixel`。配色、排版、图标和素材风格随题材选择，按 640×480 检查实际画面。字段值见 [组件契约](references/contract.md)。
 - 视觉选择必须来自当前需求：发布前说明该风格、配色和每个实体形状为何匹配题材。若两个不同游戏除标题、文案和数值外具有相同的视觉组合，视为未完成并重新设计。
-- 不生成 JS、Python、HTML、CSS、SVG、shell 或可执行代码到组件包中。
-- 已安装且校验通过的组件默认获准使用其声明的受控宿主服务，首次使用和更新均不增加授权确认。可展示非阻塞的数据使用说明；保留手动停用、系统权限、服务配置、实际操作及破坏性操作确认，不把默认授权实现为自动录音、播放或派发任务。
+- 设备执行声明式资源或经校验的 `runtime/app.wasm`。声明了受控桌面 Python 数据源的包可含唯一的 `pc/plugin.py`，由 PC 沙箱在用户授权后执行。其余脚本与任意可执行文件不进入包。
+- 常规桌面扩展沿用已安装组件的服务开关。Python 单独按包版本授权，文件选择、域名许可及设备私有数据源凭据按各自契约处理。可展示非阻塞的数据使用说明；保留手动停用、系统权限、服务配置、实际操作及破坏性操作确认，不把默认授权实现为自动录音、播放或派发任务。
 
 ## 发布边界
 
@@ -216,3 +225,7 @@ description: Generate, validate, and publish ESP32-P4 desktop-pet games, tools, 
 - `media_cmd` 是旧城市电台兼容入口，不是任意本地音乐播放器。需要自定义播放器与导入本地音乐时使用受控 pc/application.json 服务桥，声明真实依赖；未知设备能力不妨碍打包和社区发布，同步时再提示实际兼容情况。
 - 试玩由固件同源解释器执行，遵守相同指令、内存和绘图预算。基础验收覆盖启动、连续帧和六种按键；它不代表所有玩法分支已测。交互组件须交付 game.trace 覆盖开始、主要操作、退出/结束；修改最终 WASM 后重新验收。
 - 导入成功不等于同步成功，传输完成不等于运行通过。分别报告打包、导入、同步、实机试玩结果，不把未验证的阶段说成成功。
+
+运行 `petui compatibility <包> --diagnostics <设备诊断>`，逐项核对 featureManifest 中的数据生产端和路径；混合组件要分别说明离线操作、联网刷新和 PC 管理功能。
+
+前台麦克风工具可以声明 hardware.service=microphone-level-v1。两个仓内样例包含精确握手、实体同意、忙态及退出验收说明。[前台硬件服务](references/foreground-hardware.md)

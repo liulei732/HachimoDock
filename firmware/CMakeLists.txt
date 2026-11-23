@@ -71,10 +71,41 @@ endif()
 message(STATUS "P4 build identity: ${PET_P4_BUILD_ID}, protocol schema ${PET_P4_PROTOCOL_SCHEMA}, UART ${PET_P4_UART_BAUD}")
 project(pet_manager_p4_runtime)
 
+include("${CMAKE_CURRENT_LIST_DIR}/tools/jpeg_v1_security.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/tools/h264_pre_v3.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/tools/h264_simd.cmake")
 
 if("$ENV{PET_P4_SYSTEM_WIFI}" STREQUAL "1")
+  # The JSON printer rereads one finite decimal it has just produced with %g.
+  # Use the same conversion as the JSON reader, avoiding the full scanf engine.
+  idf_component_get_property(json_dir json COMPONENT_DIR)
+  idf_component_get_property(json_target json COMPONENT_LIB)
+  set(json_original "${json_dir}/cJSON/cJSON.c")
+  set(json_fixed "${CMAKE_BINARY_DIR}/pet_p4_json_number.c")
+  set(json_patcher "${CMAKE_CURRENT_LIST_DIR}/tools/patch_cjson_number.py")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${json_original}" "${json_patcher}")
+  execute_process(COMMAND "${PYTHON}" "${json_patcher}" "${json_original}" "${json_fixed}"
+    RESULT_VARIABLE json_patch_status)
+  if(NOT json_patch_status EQUAL 0)
+    message(FATAL_ERROR "Could not prepare the pinned cJSON number formatter")
+  endif()
+  get_target_property(json_sources ${json_target} SOURCES)
+  set(json_replaced 0)
+  set(json_fixed_sources "")
+  foreach(src IN LISTS json_sources)
+    get_filename_component(absolute_src "${src}" REALPATH BASE_DIR "${json_dir}")
+    if(absolute_src STREQUAL json_original)
+      list(APPEND json_fixed_sources "${json_fixed}")
+      math(EXPR json_replaced "${json_replaced} + 1")
+    else()
+      list(APPEND json_fixed_sources "${src}")
+    endif()
+  endforeach()
+  if(NOT json_replaced EQUAL 1)
+    message(FATAL_ERROR "Expected exactly one SDK cJSON source")
+  endif()
+  set_property(TARGET ${json_target} PROPERTY SOURCES "${json_fixed_sources}")
+
   # Size-optimize network/configuration and peripheral control libraries.
   # Audio DSP, media decoders, pixel loops and VM execution keep their profile.
   foreach(component esp-tls lwip espressif__esp_hosted nvs_flash json protobuf-c protocomm esp_netif
@@ -134,6 +165,23 @@ if("$ENV{PET_P4_SYSTEM_WIFI}" STREQUAL "1")
   if(NOT hosted_radio_status EQUAL 0)
     message(FATAL_ERROR "Unreviewed ESP-Hosted radio transport source")
   endif()
+  # Retain printable names for RPC timeout diagnostics. Compact field reflection
+  # for the private transport schema without changing any wire fields.
+  set(hosted_proto "${hosted_dir}/common/proto/esp_hosted_rpc.pb-c.c")
+  set(hosted_proto_fixed "${CMAKE_BINARY_DIR}/pet_p4_hosted_rpc.pb-c.c")
+  set(hosted_proto_patcher "${CMAKE_CURRENT_LIST_DIR}/tools/compact_hosted_descriptors.py")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${hosted_proto}" "${hosted_proto_patcher}")
+  execute_process(COMMAND "${PYTHON}" "${hosted_proto_patcher}" "${hosted_proto}" "${hosted_proto_fixed}"
+    RESULT_VARIABLE hosted_proto_status)
+  if(NOT hosted_proto_status EQUAL 0)
+    message(FATAL_ERROR "Could not prepare the pinned ESP-Hosted RPC descriptors")
+  endif()
+  # Keep the existing descriptor constant-sharing policy on the generated
+  # translation unit that is actually compiled. The original is never linked.
+  set_property(SOURCE "${hosted_proto_fixed}" TARGET_DIRECTORY ${hosted_lib}
+    APPEND PROPERTY COMPILE_OPTIONS "-fmerge-all-constants"
+      "-fmacro-prefix-map=${CMAKE_BINARY_DIR}=esp_hosted")
+  set(hosted_proto_replaced 0)
   get_target_property(hosted_sources ${hosted_lib} SOURCES)
   set(hosted_sdio_replaced 0)
   set(hosted_transport_replaced 0)
@@ -146,12 +194,18 @@ if("$ENV{PET_P4_SYSTEM_WIFI}" STREQUAL "1")
     elseif(hosted_absolute STREQUAL hosted_transport)
       list(APPEND hosted_fixed_sources "${hosted_transport_fixed}")
       math(EXPR hosted_transport_replaced "${hosted_transport_replaced}+1")
+    elseif(hosted_absolute STREQUAL hosted_proto)
+      list(APPEND hosted_fixed_sources "${hosted_proto_fixed}")
+      math(EXPR hosted_proto_replaced "${hosted_proto_replaced}+1")
     else()
       list(APPEND hosted_fixed_sources "${hosted_source}")
     endif()
   endforeach()
   if(NOT hosted_sdio_replaced EQUAL 1 OR NOT hosted_transport_replaced EQUAL 1)
     message(FATAL_ERROR "P4 SDIO fixes must replace the two pinned ESP-Hosted sources")
+  endif()
+  if(NOT hosted_proto_replaced EQUAL 1)
+    message(FATAL_ERROR "ESP-Hosted must compile exactly one numeric RPC schema")
   endif()
   set_property(TARGET ${hosted_lib} PROPERTY SOURCES "${hosted_fixed_sources}")
 endif()
@@ -168,6 +222,15 @@ if(CONFIG_BT_NIMBLE_ENABLED AND "$ENV{PET_P4_SYSTEM_WIFI}" STREQUAL "1")
     message(FATAL_ERROR "Unreviewed NimBLE HID source")
   endif()
   idf_component_get_property(hid_bt_lib bt COMPONENT_LIB)
+  if(CONFIG_BT_NIMBLE_ROLE_CENTRAL AND CONFIG_BT_NIMBLE_GATT_CLIENT)
+    # The accessory broker only discovers a fixed service UUID and reads by UUID.
+    # Keep the existing ATT server and notifications used by the keyboard.
+    foreach(proc DISC_ALL_CHRS DISC_ALL_DSCS DISC_ALL_SVCS DISC_CHR_UUID FIND_INC_SVCS
+                 READ READ_LONG READ_MULT READ_MULT_VAR SIGNED_WRITE WRITE WRITE_LONG
+                 WRITE_NO_RSP WRITE_RELIABLE)
+      target_compile_definitions(${hid_bt_lib} PRIVATE MYNEWT_VAL_BLE_GATT_${proc}=0)
+    endforeach()
+  endif()
   idf_component_get_property(hid_bt_dir bt COMPONENT_DIR)
   get_target_property(hid_sources ${hid_bt_lib} SOURCES)
   set(hid_fixed_sources "")

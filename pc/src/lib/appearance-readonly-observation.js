@@ -8,7 +8,13 @@ export function appearanceObservationError(error) {
   return "当前形象状态未能确认；旧同步结果仍未确认。本次未切换或重发。";
 }
 
-export async function observeAppearanceFromMenu({ invoke, boardDeviceId, isCurrent = () => true }) {
+export async function observeAppearanceFromMenu({ invoke, boardDeviceId, wifiBootId, isCurrent = () => true }) {
+  if (wifiBootId) {
+    if (!boardDeviceId || !isCurrent()) throw new Error("appearance_recovery_connection_changed");
+    const slot = await invoke("lan_read_appearance_slot", { boardDeviceId, bootId: wifiBootId });
+    if (!isCurrent() || ![0, 1].includes(slot)) throw new Error("appearance_recovery_not_quiescent_or_unproven");
+    return { title: "当前形象状态已核对", message: slot === 0 ? "设备正在使用内置形象。" : "设备正在使用自定义形象。" };
+  }
   const boot = status => status?.bootId || status?.capabilities?.debugBootId || "";
   const valid = status => isCurrent() && status?.connected === true
     && status.boardDeviceId === boardDeviceId && !!status.connectionId && !!boot(status);

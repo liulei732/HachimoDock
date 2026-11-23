@@ -12,7 +12,7 @@ import { Download, PackageCheck, Trash2 } from "lucide-react";
 import Button from "../shell/Button";
 import { buildComponentPlayGuide } from "./binding-labels";
 import ComponentCover from "./ComponentCover.jsx";
-import { componentRequiresPc } from "./catalog-state.js";
+import { componentFeatures } from "./component-features.js";
 
 export function resolveComponentKind(kind, gameType) {
   const explicitKind = String(kind || "").trim().toLowerCase();
@@ -32,6 +32,7 @@ export default function CandidateCard({
   isInstalled,
   isEnabled,
   deviceState,
+  featureTarget,
   unavailableReason = "",
   onClick,
   onDeviceAction,
@@ -43,7 +44,7 @@ export default function CandidateCard({
     : "";
   const sourceKind = component.isDeviceOnly ? "device" : isLocal ? "custom" : "builtin";
   const sourceLabel = component.isDeviceOnly ? "仅设备" : isLocal ? "本机" : "内置";
-  const needsPc = componentRequiresPc(component);
+  const features = componentFeatures(component,featureTarget);
   const cardClass = [
     "candidate-card",
     `candidate-card--${component.isDeviceOnly ? "device" : isLocal ? "local" : "builtin"}`,
@@ -64,7 +65,7 @@ export default function CandidateCard({
               <span className={`candidate-card__badge candidate-card__badge--kind-${resolvedKind}`}>
                 {componentKindLabel(resolvedKind)}
               </span>
-              {!component.isDeviceOnly && <span className="candidate-card__badge">{needsPc ? "需连接 PC" : "可离线"}</span>}
+              <span className="candidate-card__badge">{features.summary}</span>
               <span className={`candidate-card__badge candidate-card__badge--${sourceKind}`}>
                 {sourceLabel}
               </span>

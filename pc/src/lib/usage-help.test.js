@@ -24,7 +24,8 @@ test("instructions follow current keys, including unbound actions and multiple b
   assert.match(buildUsageHelp(rows, {}, false).voice, /尚未启用/);
   assert.match(buildUsageHelp(rows, { confirm: "disabled" }).confirm, /手动发送/);
   assert.match(buildUsageHelp(rows, { one: "realtime_chat" }).chat, /长按 1 键或长按 2 键/);
-  assert.match(buildUsageHelp().voice, /连接设备后/);
+  assert.match(buildUsageHelp().voice, /连接设备后.*键盘配置 → 按钮配置/);
+  assert.match(buildUsageHelp(rows, {}, false).voice, /Agent交互 → 语音输入/);
   assert.equal(friendlyControlLabel("摇杆中按短按"), "按下摇杆");
 });
 
@@ -36,6 +37,10 @@ test("chat prerequisites give an actionable next step without claiming a cloud t
   assert.equal(realtimeReadiness({ ...ready, personaReady: false }).action, "persona");
   assert.equal(realtimeReadiness({ ...ready, settings: {} }).action, "api");
   assert.match(realtimeReadiness({ ...ready, settings: { ttsConfigured: true, asrConfigured: true } }).message, /对话大模型/);
+  for (const [configured, missing] of [["asrConfigured", "语音合成（TTS）"], ["ttsConfigured", "语音识别（ASR）"]]) {
+    const settings = {llmConfigured: true, [configured]: true};
+    assert.equal(realtimeReadiness({ ...ready, settings }).message, `请先配置${missing}。`);
+  }
   assert.match(realtimeReadiness({ ...ready, loading: true }).message, /正在检查/);
   assert.equal(realtimeReadiness({ ...ready, failed: true }).action, "retry");
 });

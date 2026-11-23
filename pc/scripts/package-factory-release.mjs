@@ -85,7 +85,21 @@ function sanitizeVersion(value) {
   return value.replace(/[^0-9A-Za-z._-]+/g, "-");
 }
 
-function macFlashScript(imageName) {
+function checkEmbeddedVersion(factoryBytes, version) {
+  const descriptor = factoryBytes.subarray(0x10000 + 32, 0x10000 + 80);
+  const versionField = descriptor.subarray(16);
+  const nul = versionField.indexOf(0);
+  if (descriptor.length !== 48 || descriptor.readUInt32LE(0) !== 0xabcd5432
+      || versionField.subarray(0, nul < 0 ? versionField.length : nul).toString("latin1") !== version) {
+    throw new Error("factory application's embedded board/version does not match its manifest");
+  }
+}
+
+// Shown before entering the ROM loader, while the operator can still disconnect power.
+const adapterBeforeFlash = "使用 HD28142C22 新屏转接板做完整烧录时，请先断开整机所有电源，断开屏幕，再仅给主板接 USB。";
+const adapterAfterFlash = "该转接板的无触摸版请先通过 USB 保存 nv3049-no-touch 屏型，再断开整机所有电源，接回屏幕并冷启动。带触摸版使用自动识别，断电接回即可。";
+
+function macFlashScript(imageName, manifestName, board, sha256) {
   return `#!/bin/zsh
 set -euo pipefail
 
@@ -107,6 +121,7 @@ if ! "\${venv}/bin/python" -c 'import importlib.util, sys; sys.exit(0 if importl
   "\${venv}/bin/python" -m pip install "esptool==5.4.0"
 fi
 
+echo "${adapterBeforeFlash}"
 echo "检测到的候选串口："
 setopt null_glob
 ports=(/dev/cu.usbserial* /dev/cu.wchusbserial* /dev/cu.usbmodem*)
@@ -119,6 +134,8 @@ if [[ -z "\${port}" ]]; then
   exit 1
 fi
 
+echo "本包目标板型：${board}。请核对主板丝印。"
+read "physical_board?请输入实际板型（pico 或 wifi6）："
 echo "警告：将擦除设备全部设置、形象和组件，并写入完整出厂镜像。"
 read "confirmation?输入 ERASE 继续："
 if [[ "\${confirmation}" != "ERASE" ]]; then
@@ -126,12 +143,13 @@ if [[ "\${confirmation}" != "ERASE" ]]; then
   exit 1
 fi
 
-"\${venv}/bin/python" "\${script_dir}/flash_checked.py" --port "\${port}" --baud 921600 --image "\${image}"
+"\${venv}/bin/python" "\${script_dir}/flash_checked.py" --port "\${port}" --baud 921600 --image "\${image}" --manifest "\${package_root}/firmware/${manifestName}" --board "\${physical_board}" --sha256 "${sha256}"
+echo "${adapterAfterFlash}"
 echo "烧录与校验完成。请松开 BOOT，并按一次 RESET/EN 或重新上电。"
 `;
 }
 
-function windowsFlashScript(imageName) {
+function windowsFlashScript(imageName, manifestName, board, sha256) {
   return `param(
     [string]$Port = ""
 )
@@ -163,6 +181,7 @@ if ($LASTEXITCODE -ne 0) {
     if ($LASTEXITCODE -ne 0) { throw "esptool 安装失败。" }
 }
 
+Write-Host "${adapterBeforeFlash}"
 if (-not $Port.Trim()) {
     Write-Host "检测到的串口："
     Get-CimInstance Win32_SerialPort -ErrorAction SilentlyContinue |
@@ -172,12 +191,15 @@ if (-not $Port.Trim()) {
 }
 if (-not $Port.Trim()) { throw "未输入串口，已取消。" }
 
+Write-Host "本包目标板型：${board}。请核对主板丝印。"
+$PhysicalBoard = Read-Host "请输入实际板型（pico 或 wifi6）"
 Write-Warning "将擦除设备全部设置、形象和组件，并写入完整出厂镜像。"
 $Confirmation = Read-Host "输入 ERASE 继续"
 if ($Confirmation -cne "ERASE") { throw "确认不匹配，已取消。" }
 
-& $VenvPython (Join-Path $PSScriptRoot "flash_checked.py") --port $Port --baud 921600 --image $Image
+& $VenvPython (Join-Path $PSScriptRoot "flash_checked.py") --port $Port --baud 921600 --image $Image --manifest (Join-Path $PackageRoot "firmware/${manifestName}") --board $PhysicalBoard --sha256 "${sha256}"
 if ($LASTEXITCODE -ne 0) { throw "烧录未完成。请检查芯片版本和上方错误，勿强制忽略检查。" }
+Write-Host "${adapterAfterFlash}"
 Write-Host "烧录与校验完成。请松开 BOOT，并按一次 RESET/EN 或重新上电。"
 `;
 }
@@ -218,6 +240,11 @@ if (manifest.chip !== "esp32p4" || manifest.flashOffset !== "0x0") {
 }
 if (manifest.bytes !== statSync(factoryPath).size || manifest.sha256 !== await sha256File(factoryPath)) {
   throw new Error("factory image does not match its manifest");
+}
+// All three supported public layouts reserve 0x9000..0xefff for device NVS.
+const factoryBytes = readFileSync(factoryPath);
+if (manifest.displayProfile || !factoryBytes.subarray(0x9000, 0xf000).every(byte => byte === 0xff)) {
+  throw new Error("public factory images require automatic display selection and erased device NVS");
 }
 // Resource locations come from the bound manifest, never from a historical
 // appearance-slot address. Old factory archives remain identifiable.
@@ -265,10 +292,17 @@ if (!["pico", "wifi6"].includes(board) || typeof manifest.version !== "string"
   throw new Error("factory board model is missing or disagrees with firmware version");
 }
 const firmwareVersion = sanitizeVersion(String(manifest.version));
+checkEmbeddedVersion(factoryBytes, manifest.version);
+if (Number(firmwareVersion.match(/-r(\d+)(?:-|$)/)?.[1]) >= 302) {
+  const font = join(resourceTree, "bubble32-v1.fpk");
+  requireFile(font, "factory MiSans font");
+  if (await sha256File(font) !== "c9dd60d79ed2473a447cab7e1960ff8885192df0ff8bb509492f31b6f25033e7") {
+    throw new Error("factory MiSans resource failed verification");
+  }
+}
 const chipFamily = manifest.chipFamily;
 const boardModel = board === "pico" ? "ESP32-P4-Pico" : "Waveshare ESP32-P4-WIFI6";
 const expectedBounds = chipFamily === "v1" ? [1, 199] : chipFamily === "v3" ? [300, 399] : null;
-const factoryBytes = readFileSync(factoryPath);
 if (!expectedBounds || manifest.chipRevisionMin !== expectedBounds[0]
   || manifest.chipRevisionMax !== expectedBounds[1]) throw new Error("factory chip revision is missing or unsupported");
 for (const offset of [0x2000, 0x10000]) {
@@ -310,8 +344,8 @@ cpSync(join(repositoryRoot, "licenses"), join(packageRoot, "licenses"), { recurs
 
 const macTool = join(toolDir, "flash-macOS.command");
 const windowsTool = join(toolDir, "flash-Windows.ps1");
-writeFileSync(macTool, macFlashScript(imageName));
-writeFileSync(windowsTool, windowsFlashScript(imageName));
+writeFileSync(macTool, macFlashScript(imageName, manifestName, board, manifest.sha256));
+writeFileSync(windowsTool, windowsFlashScript(imageName, manifestName, board, manifest.sha256));
 chmodSync(macTool, 0o755);
 
 writeFileSync(
@@ -319,8 +353,14 @@ writeFileSync(
   `# 内置资源说明\n\n- \`expanded-storage/\`：出厂 SPIFFS 的展开内容，含默认形象索引、${manifest.components.count} 个内置组件清单及受限 PNG sprite。\n- \`../firmware/segments/${storageResourceName}\`：完整存储分区镜像。\n- \`../firmware/segments/${appearanceResourceName}\`：默认西高地 H.264 形象分区镜像。\n- 最终烧录请始终使用 \`../firmware/${imageName}\`，不要逐个写入资源文件。\n`,
 );
 
-const readme = `# HachimoDock ESP32-P4 完整出厂烧录包\n\n版本：${manifest.version}\n\n分区布局：${layoutLabel}。普通OTA不会更新分区表。新设备或明确恢复出厂可整片擦除后完整烧录；保留旧数据的布局迁移须另行准备，不能把覆盖分区表或自动格式化当成迁移。\n\n本包不只是应用固件，包含完整 factory.bin、Bootloader、分区表、OTA 元数据、默认西高地形象、${manifest.components.count} 个内置组件、校验清单，以及 Windows/macOS 引导烧录工具。\n\n## 推荐用法\n\n1. 关闭 Pet Manager。\n2. 确认设备板型为 ${boardModel}。WiFi6 板通过 CH343 USB-UART 烧录时，保持 USB 数据路径跳线断开。\n3. macOS 双击 \`tools/flash-macOS.command\`；Windows 右键 \`tools/flash-Windows.ps1\` 并选择“使用 PowerShell 运行”。\n4. 首次运行会在本包内创建隔离的 esptool 环境，需要 Python 3.10+ 和网络。\n5. 按提示选择串口并输入 \`ERASE\`。工具会擦除整片 Flash，再把完整镜像从 \`0x0\` 写入并校验。\n\n## 重要警告\n\n该操作会覆盖设备设置、形象和组件。日常升级请使用 Pet Manager 的“固件升级”；只有新设备或明确恢复出厂时才使用本包。\n\n如果连接失败，按住 BOOT，短按一次 RESET/EN，松开 BOOT 后重试。若 921600 不稳定，可将工具脚本中的波特率改为 460800 后重新完整烧录。\n\n## 内容\n\n- \`firmware/${imageName}\`：推荐烧录的完整镜像（地址 0x0）\n- \`firmware/${manifestName}\`：镜像内容、分区和 SHA-256 清单\n- \`firmware/segments/\`：可独立核验的各二进制段，不建议普通用户分别烧录\n- \`resources/\`：默认形象及组件资源清单/分区资料\n- \`tools/\`：Windows/macOS 烧录工具\n- \`SHA256SUMS\`：包内全部文件校验值\n`;
+const readme = `# HachimoDock ESP32-P4 完整出厂烧录包\n\n版本：${manifest.version}\n\n分区布局：${layoutLabel}。普通OTA不会更新分区表。新设备或明确恢复出厂可整片擦除后完整烧录；保留旧数据的布局迁移须另行准备，不能把覆盖分区表或自动格式化当成迁移。\n\n本包不只是应用固件，包含完整 factory.bin、Bootloader、分区表、OTA 元数据、默认西高地形象、${manifest.components.count} 个内置组件、校验清单，以及 Windows/macOS 引导烧录工具。\n\n## 推荐用法\n\n1. 关闭 Pet Manager。\n2. 确认设备板型为 ${boardModel}。WiFi6 板通过 CH343 USB-UART 烧录时，保持 USB 数据路径跳线断开。\n3. macOS 双击 \`tools/flash-macOS.command\`；Windows 右键 \`tools/flash-Windows.ps1\` 并选择“使用 PowerShell 运行”。\n4. 首次运行会在本包内创建隔离的 esptool 环境，需要 Python 3.10+ 和网络。\n5. 按提示选择串口、核对实物板型并输入 \`ERASE\`。工具会擦除整片 Flash，再把完整镜像从 \`0x0\` 写入并校验。\n\n## 重要警告\n\n该操作会覆盖设备设置、形象和组件。日常升级请使用 Pet Manager 的“固件升级”；只有新设备或明确恢复出厂时才使用本包。\n\n如果连接失败，按住 BOOT，短按一次 RESET/EN，松开 BOOT 后重试。若 921600 不稳定，可将工具脚本中的波特率改为 460800 后重新完整烧录。\n\n## 内容\n\n- \`firmware/${imageName}\`：推荐烧录的完整镜像（地址 0x0）\n- \`firmware/${manifestName}\`：镜像内容、分区和 SHA-256 清单\n- \`firmware/segments/\`：可独立核验的各二进制段，不建议普通用户分别烧录\n- \`resources/\`：默认形象及组件资源清单/分区资料\n- \`tools/\`：Windows/macOS 烧录工具\n- \`SHA256SUMS\`：包内全部文件校验值\n`;
 const toolGuide = `
+## HD28142C22 转接屏的完整烧录
+
+${adapterBeforeFlash}
+${adapterAfterFlash}
+日常升级优先使用客户端应用 OTA，已保存的屏型会保留。
+
 ## 工具版本与 v3 接线
 
 - 运行烧录脚本：Python **3.10+**，首次运行需要联网；脚本自动安装并核对 **esptool 5.4.0**，旧版本会自动更新。

@@ -16,7 +16,7 @@ def test_touch_and_slice_behavior(tmp_path):
 def test_touch_controller_identity_gate(tmp_path):
     source = (ROOT/'main/pet_p4_touch.c').read_text()
     identify = source.split('static esp_err_t identify_register_touch(void) {', 1)[1]
-    identify = 'static esp_err_t identify_register_touch(void) {' + identify.split('\nesp_err_t pet_p4_touch_init', 1)[0]
+    identify = 'static esp_err_t identify_register_touch(void) {' + identify.split('\n}\n', 1)[0] + '\n}\n'
     harness = r'''
 #include <assert.h>
 #include <string.h>

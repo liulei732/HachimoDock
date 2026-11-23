@@ -1130,9 +1130,10 @@ fn local_capability_production_plan() {
 mod tests {
     use super::*;
     fn sample() -> Value {
+        let root = std::path::absolute(std::env::temp_dir()).unwrap();
         json!({"schemaVersion":1,"planId":"offline-unit","sourceDigest":"a".repeat(64),"readerSha256":"b".repeat(64),
-        "expected":{"boardId":"board-test","bootId":"0123456789abcdef","firmware":"0.7.103-p4-r150","buildId":"0.7.103-p4-r150+123456789abc","elfSha256":"c".repeat(64),"elfPath":"/private/tmp/fixture.elf"},
-        "fixtures":[{"id":"hil-fixture","path":"/private/tmp/hil-fixture","files":{"component.json":"d".repeat(64),"runtime/widget.json":"d".repeat(64),"buttons.json":"d".repeat(64),"negative-screen.json":"d".repeat(64),"share.json":"d".repeat(64)}}],
+        "expected":{"boardId":"board-test","bootId":"0123456789abcdef","firmware":"0.7.103-p4-r150","buildId":"0.7.103-p4-r150+123456789abc","elfSha256":"c".repeat(64),"elfPath":root.join("fixture.elf")},
+        "fixtures":[{"id":"hil-fixture","path":root.join("hil-fixture"),"files":{"component.json":"d".repeat(64),"runtime/widget.json":"d".repeat(64),"buttons.json":"d".repeat(64),"negative-screen.json":"d".repeat(64),"share.json":"d".repeat(64)}}],
         "steps":[{"op":"install","fixture":"hil-fixture"},{"op":"activate","fixture":"hil-fixture","show":true},{"op":"action","fixture":"hil-fixture","action":"confirm"},{"op":"screenshot","label":"after"},{"op":"remove","fixture":"hil-fixture"},{"op":"restoreSelection"}]})
     }
     fn valid(v: Value) -> bool {
@@ -1183,6 +1184,22 @@ mod tests {
     }
     #[test]
     fn unsafe_paths_hashes_duplicates_and_budgets_fail_closed() {
+        for (field, relative, error) in [
+            (
+                "/expected/elfPath",
+                "fixture.elf",
+                "absolute ELF path required",
+            ),
+            (
+                "/fixtures/0/path",
+                "hil-fixture",
+                "fixture must be an absolute directory",
+            ),
+        ] {
+            let mut v = sample();
+            *v.pointer_mut(field).unwrap() = json!(relative);
+            assert_eq!(parse(&serde_json::to_vec(&v).unwrap()).unwrap_err(), error);
+        }
         for key in [
             "../escape",
             "runtime/../escape",

@@ -43,6 +43,60 @@ int main(void){
 
 
 def test_busy_refusal_precedes_checkpoint_and_retirement():
-    start=function((ROOT/'main/pet_p4_miniapp_background.inc').read_text(),'pet_p4_miniapp_background_start')
+    start=function((ROOT/'main/pet_p4_miniapp_background.inc').read_text(),'background_start_installed')
     assert start.index('if(duplicate)') < start.index('if(program_busy)') < start.index('if(found&&!background_prepare_remove')
     assert start.index('"PROGRAM_BUSY"') < start.index('save_app_runtime()')
+
+
+def test_repeat_start_confirms_existing_owner_without_storage_io(tmp_path):
+    start = function((ROOT/'main/pet_p4_miniapp_background.inc').read_text(), 'background_start_installed')
+    # Execute all production admission decisions up to the first foreground write.
+    admission = start[:start.index('  if(!save_app_runtime()')] + '  return false;\n}'
+    fixture = tmp_path/'repeat.c'
+    fixture.write_text(r'''
+#include <assert.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <string.h>
+#define PET_P4_EVENTS 1
+typedef struct {int slot,resource_state;uint32_t widget_checksum,buttons_checksum,sprites_checksum;}miniapp_catalog_item_t;
+typedef struct {int slot;uint64_t serial;}pet_program_registration_t;
+typedef struct {uint32_t content[3];bool stopped;struct{bool live;struct{int lease;}host;}session;struct{bool local_background;}config;}pet_program_registry_entry_t;
+typedef int pet_storage_scope_t;
+static miniapp_catalog_item_t g_catalog[]={{0,1,1,2,3}};
+static struct {pet_program_registry_entry_t entries[1];}g_background_programs;
+static int g_catalog_count=1,g_catalog_sequence,io;static bool g_catalog_recovery_blocked,mutating,audio,consent=true;
+#define xSemaphoreTake(a,b) ((void)0)
+#define xSemaphoreGive(a) ((void)0)
+#define pet_program_registry_find(reg,id,out) ((out)->serial=17,true)
+#define pet_resources_device_current(lease) (lease)
+#define storage_audio_busy() audio
+#define pet_p4_miniapp_storage_busy() mutating
+#define pet_p4_miniapp_background_available() true
+#define safe_widget_id(id) true
+#define set_error(buf,size,msg) ((void)0)
+#define catalog_find(items,count,id) ((count)==1?0:-1)
+#define local_program_authorized(slot,id,content) consent
+#define background_other_program_busy(id) false
+static bool storage_scope_begin(pet_storage_scope_t *scope,bool local){io++;return false;}
+static void storage_scope_finish(pet_storage_scope_t *scope){}
+''' + admission + r'''
+int main(void){
+ const uint32_t hash[]={1,2,3};uint64_t token=0;
+ pet_program_registry_entry_t *entry=&g_background_programs.entries[0];
+ memcpy(entry->content,hash,sizeof(hash));entry->session.live=entry->session.host.lease=1;
+ #define start(local) background_start_installed("app",hash,&token,NULL,0,local,NULL,NULL)
+ audio=true;assert(start(false)&&token==17&&!io);token=0;
+ assert(!start(true)&&!token&&!io);
+ entry->config.local_background=true;consent=false;assert(!start(true)&&!token&&!io);
+ consent=true;assert(start(true)&&token==17&&!io);token=0;
+ mutating=true;assert(!start(true)&&!token&&!io);mutating=false;
+ g_catalog_recovery_blocked=true;assert(!start(true)&&!token&&!io);g_catalog_recovery_blocked=false;
+ g_catalog[0].buttons_checksum++;assert(!start(true)&&!token&&!io);g_catalog[0].buttons_checksum--;
+ audio=false;entry->session.host.lease=0;assert(!start(true)&&!token&&io==1);
+}
+''')
+    exe = tmp_path/'repeat'
+    subprocess.run(['cc','-std=c11','-fsanitize=address,undefined',str(fixture),'-o',str(exe)],check=True)
+    subprocess.run([str(exe)],check=True,timeout=5)

@@ -1,0 +1,18 @@
+frame 0
+observe
+event 4 4 0
+event 4 4 0
+event 4 5 0
+frame 33
+frame 33
+changed
+observe
+event 1 19 154
+event 3 19 154
+frame 33
+changed
+observe
+event 1 19 131
+event 3 19 131
+frame 33
+changed

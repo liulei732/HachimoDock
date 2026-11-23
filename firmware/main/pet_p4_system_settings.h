@@ -11,6 +11,7 @@
 #endif
 
 #include "pet_p4_lan.h"
+#include "pet_p4_community.h"
 #include "pet_p4_private_feed.h"
 
 #define PET_SETTINGS_PAGE "settings"
@@ -23,37 +24,40 @@ static inline bool pet_account_button_hit(int x, int y) {
 }
 
 #define PET_SETTINGS_WIFI_ROWS 4
+enum { PET_SETTINGS_WIFI_ACTION_TOP = 154, PET_SETTINGS_WIFI_ACTION_STEP = 72,
+       PET_SETTINGS_WIFI_ACTION_HEIGHT = 60 };
 #define PET_SETTINGS_KEY_ROWS 5
-enum { PET_SETTINGS_KEY_LEFT = 20, PET_SETTINGS_KEY_WIDTH = 600,
-       PET_SETTINGS_KEY_TOP = 166, PET_SETTINGS_KEY_ROW_HEIGHT = 60,
-       PET_SETTINGS_KEY_GAP = 5, PET_SETTINGS_PASSWORD_COLUMNS = 32,
-       PET_SETTINGS_PASSWORD_TOP = 102, PET_SETTINGS_PASSWORD_BOTTOM = 159 };
-enum { PET_SETTINGS_KEY_CASE, PET_SETTINGS_KEY_SYMBOLS, PET_SETTINGS_KEY_SPACE,
-       PET_SETTINGS_KEY_DELETE, PET_SETTINGS_KEY_REVEAL, PET_SETTINGS_KEY_CONNECT,
-       PET_SETTINGS_ACTION_KEYS };
-enum { PET_SETTINGS_SAVED_CONNECT, PET_SETTINGS_SAVED_EDIT, PET_SETTINGS_SAVED_AUTO, PET_SETTINGS_SAVED_FORGET };
-enum { PET_SETTINGS_SAVED_TOP = 89, PET_SETTINGS_SAVED_ROW_HEIGHT = 49,
-       PET_SETTINGS_SAVED_AUTO_X = 352, PET_SETTINGS_SAVED_FORGET_X = 512 };
+enum { PET_SETTINGS_KEY_LEFT = 10, PET_SETTINGS_KEY_WIDTH = 620,
+       PET_SETTINGS_KEY_TOP = 151, PET_SETTINGS_KEY_ROW_HEIGHT = 63,
+       PET_SETTINGS_KEY_GAP = 5 };
 
-typedef enum { PET_SETTINGS_HOME, PET_SETTINGS_WIFI, PET_SETTINGS_PASSWORD, PET_SETTINGS_LAN, PET_SETTINGS_TIMEZONE, PET_SETTINGS_BLE, PET_SETTINGS_FEED, PET_SETTINGS_FEED_ENTRY, PET_SETTINGS_WIFI_DETAILS, PET_SETTINGS_WIFI_SAVED, PET_SETTINGS_WIFI_FORGET } pet_settings_screen_t;
+typedef enum { PET_SETTINGS_HOME, PET_SETTINGS_WIFI, PET_SETTINGS_PASSWORD, PET_SETTINGS_LAN, PET_SETTINGS_TIMEZONE, PET_SETTINGS_BLE, PET_SETTINGS_FEED, PET_SETTINGS_FEED_ENTRY,
+               PET_SETTINGS_WIFI_SAVED, PET_SETTINGS_WIFI_NETWORK, PET_SETTINGS_WIFI_FORGET, PET_SETTINGS_COMMUNITY, PET_SETTINGS_AV,
+} pet_settings_screen_t;
 typedef enum {
   PET_SETTINGS_UP, PET_SETTINGS_DOWN, PET_SETTINGS_LEFT, PET_SETTINGS_RIGHT,
   PET_SETTINGS_ENTER, PET_SETTINGS_BACK,
 } pet_settings_input_t;
+
+typedef enum { PET_AV_UNCONFIRMED, PET_AV_SAVING, PET_AV_SAVED, PET_AV_SAVE_FAILED } pet_av_storage_t;
 
 typedef struct {
   pet_settings_screen_t screen;
   pet_wifi_snapshot_t wifi;
   pet_lan_pair_view_t lan;
   pet_wifi_ap_t target;
-  bool feed_request_failed;
+  int saved_target;
   unsigned selected, list_start, key_row, key_column, password_length;
-  unsigned keyboard, saved_action;
-  bool editing_saved_password, confirm_forget;
-  char password_preview[2][PET_SETTINGS_PASSWORD_COLUMNS + 1];
-  bool password_visible, clock_synchronized;
+  unsigned keyboard;
   int32_t timezone_draft, timezone_effective;
-  bool short_password, unsupported;
+  bool short_password, request_busy, unsupported, entry_full, password_edit;
+  bool ble_enabled, ble_connected, confirm_remove;
+  int volume, brightness;
+  bool av_pending, av_failed, av_applied, brightness_saved;
+  pet_av_storage_t volume_storage;
+
+  pet_community_view_t community;
+  bool community_confirm, community_delete;
   int ble_available;
   bool ble_paired, ble_pairing;
   unsigned ble_code;
@@ -61,7 +65,20 @@ typedef struct {
   pet_private_kind_t feed_kind;
   pet_private_result_t feed_result;
   char feed_host[128], feed_target[128];
+#if PET_P4_SCOPED_WRITE
+  char write_label[48];
+  bool write_submitted;
+#endif
 } pet_settings_view_t;
+
+static inline unsigned pet_settings_feed_actions(const pet_settings_view_t *view) {
+#if PET_P4_SCOPED_WRITE
+  if (view->write_label[0]) return 3;
+#else
+  (void)view;
+#endif
+  return 2;
+}
 
 static inline bool pet_settings_active(const pet_p4_runtime_state_t *state) {
   return state && strcmp(state->screen_page, PET_SETTINGS_PAGE) == 0;
@@ -69,9 +86,14 @@ static inline bool pet_settings_active(const pet_p4_runtime_state_t *state) {
 
 static inline unsigned pet_settings_home_step(const pet_settings_view_t *view) {
   (void)view;
-  return 88;
+  return 75;
 }
 
+bool pet_settings_av_queue(uint32_t ticket);
+bool pet_settings_av_claim(uint32_t ticket, int *volume, int *brightness);
+void pet_settings_av_finish(uint32_t ticket, int volume, int brightness, bool ok, bool brightness_saved);
+void pet_settings_av_disk(int saved, int pending, bool failed);
+const char *pet_settings_wifi_status(const pet_settings_view_t *view);
 bool pet_settings_open(pet_p4_runtime_state_t *state, unsigned long long ts_ms);
 void pet_settings_input(pet_p4_runtime_state_t *state, pet_settings_input_t input,
                         unsigned long long ts_ms);
@@ -79,14 +101,7 @@ void pet_settings_touch(pet_p4_runtime_state_t *state, int x, int y, unsigned lo
 void pet_settings_wifi_swipe(pet_p4_runtime_state_t *state, int start_x, int start_y,
                              bool next, unsigned long long ts_ms);
 void pet_settings_maintain(pet_p4_runtime_state_t *state, bool interrupted);
-void pet_settings_snapshot(pet_settings_view_t *view, uint64_t now_ms);
-void pet_settings_clear_preview(pet_settings_view_t *view);
-unsigned pet_settings_wifi_details_index(const pet_wifi_snapshot_t *wifi);
-unsigned pet_settings_wifi_saved_index(const pet_wifi_snapshot_t *wifi);
-int pet_settings_wifi_find_saved(const pet_wifi_snapshot_t *wifi, const pet_wifi_ap_t *ap);
+void pet_settings_snapshot(pet_settings_view_t *view);
 unsigned pet_settings_key_columns(unsigned row);
-static inline unsigned pet_settings_page_key_columns(pet_settings_screen_t screen, unsigned row) {
-  return screen == PET_SETTINGS_FEED_ENTRY && row == 4 ? 5 : pet_settings_key_columns(row);
-}
 const char *pet_settings_key_label(unsigned keyboard, unsigned row, unsigned column, char ascii[2]);
 #endif

@@ -114,6 +114,7 @@ export default function BoardButtonPanel({
   voiceKeySupported = false,
   selectedTrigger,
   onVoiceConfigChange,
+  onAdoptDeviceButtons,
   onApplyVoiceConfig,
 }) {
   const [hoveredButtonId, setHoveredButton] = useState("");
@@ -135,8 +136,8 @@ export default function BoardButtonPanel({
     return (
       <div className="board-button-panel__unverified" role="status">
         <Usb size={28} aria-hidden="true" />
-        <strong>等待设备协议握手</strong>
-        <span>{usbConnected ? "正在确认设备型号" : "尚未连接受支持的设备"}</span>
+        <strong>{usbConnected || wifiConnected ? "正在识别设备" : "连接设备以配置按键"}</strong>
+        <span>{usbConnected || wifiConnected ? "确认型号后会显示可配置的按键。" : "请接入 USB，或在「其它设置」中配对 Wi-Fi 设备。"}</span>
       </div>
     );
   }
@@ -184,6 +185,8 @@ export default function BoardButtonPanel({
           </span>
         </div>
         <div className="board-button-panel__toolbar-actions">
+          {voiceConfigDirty && syncAvailable && <Button variant="secondary" size="medium"
+            onClick={onAdoptDeviceButtons} disabled={syncPending}>采用设备配置</Button>}
           <Button
             variant="primary"
             size="medium"
@@ -211,7 +214,8 @@ export default function BoardButtonPanel({
       )}
 
       <div className="usage-help">
-        <p>为按键和摇杆选择功能，修改后点击「同步到设备」生效。同一个按键可以分别设置短按和长按。{doublePressSupported && "设置双击后，该键的单击会等待约 280 毫秒。语音长按和组件退出优先。"}</p>
+        <p>为按键和摇杆选择功能，修改后点击「同步到设备」生效。同一个按键可以分别设置短按和长按。{doublePressSupported && "主页绑定双击后，该键的单击会等待约 280 毫秒。组件内按其手势映射处理，全局返回和实时对话优先。"}</p>
+        {isP4Runtime && <p>蓝牙键盘连接电脑时，设备按键和摇杆由「蓝牙快捷键」接管。断开后恢复本页映射。</p>}
         <details open>
           <summary>常用操作 · 按当前配置显示{voiceConfigDirty ? "（待同步）" : ""}</summary>
           <dl className="usage-help__operations">

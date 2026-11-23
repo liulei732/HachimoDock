@@ -8,10 +8,12 @@
  * [Sync] If this file changes, update `pc/src/dashboard/.folder.md`.
  */
 
+import { useDialogFocus } from "../component-center/use-dialog-focus.js";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { AlertTriangle, LoaderCircle, Power, RefreshCw, RotateCcw, X } from "lucide-react";
 import { wifiDeviceControl } from "../lib/wifi-device-control.js";
+import { componentReadiness } from "./component-readiness.js";
 
 function formatBytes(value) {
   if (!Number.isFinite(value)) return "—";
@@ -78,8 +80,14 @@ export default function DeviceDiagnosticsModal({
   expectedBoardDeviceId,
   wifiTarget,
   wasmCapabilities,
+  usb,
+  pairedStatus,
 }) {
-  const [report, setReport] = useState(null);
+  const bootId = wifiTarget ? wifiTarget.bootId : usb?.bootId;
+  const connectionId = wifiTarget ? null : usb?.connectionId;
+  const [reading, setReading] = useState(null);
+  const report = reading && reading.boardDeviceId === expectedBoardDeviceId
+    && reading.bootId === bootId && reading.connectionId === connectionId ? reading.response : null;
   const [pending, setPending] = useState(false);
   const [action, setAction] = useState("");
   const [error, setError] = useState("");
@@ -94,17 +102,24 @@ export default function DeviceDiagnosticsModal({
     try {
       const response = wifiTarget ? await wifiDeviceControl(invoke, wifiTarget, "readDiagnostics")
         : await invoke("usb_get_diagnostics", { expectedBoardDeviceId });
-      if (sequence === readSequence.current) setReport(response);
+      if ((response?.boardDeviceId && response.boardDeviceId !== expectedBoardDeviceId)
+          || (response?.bootId && bootId && response.bootId !== bootId)) {
+        throw new Error("设备或启动标识已变化，请重新打开设备诊断。");
+      }
+      if (sequence === readSequence.current) setReading({ boardDeviceId: expectedBoardDeviceId, bootId, connectionId, response });
     } catch (loadError) {
-      if (sequence === readSequence.current) setError(typeof loadError === "string" ? loadError : String(loadError));
+      if (sequence === readSequence.current) {
+        setReading(null);
+        setError(typeof loadError === "string" ? loadError : String(loadError));
+      }
     } finally {
       if (sequence === readSequence.current) setPending(false);
     }
-  }, [expectedBoardDeviceId, wifiTarget]);
+  }, [expectedBoardDeviceId, wifiTarget, bootId, connectionId]);
 
   useEffect(() => {
     if (!open) return;
-    setReport(null);
+    setReading(null);
     setAction("");
     setError("");
     setNotice("");
@@ -158,17 +173,21 @@ export default function DeviceDiagnosticsModal({
     }
   };
 
+  const dialogRef = useDialogFocus(onClose, false, open);
   if (!open) return null;
+  const readiness = componentReadiness({
+    boardDeviceId: expectedBoardDeviceId, bootId, usb, wifi: pairedStatus,
+    lastResetReason: !pending && !error && report?.lastResetReason,
+  });
   const evidence = widgetDataEvidence(report?.widgetData);
-  const copyWidgetDataEvidence = async () => {
-    if (!evidence) return;
+  const copyEvidence = async (label, value) => {
     setError("");
     setNotice("");
     try {
-      await navigator.clipboard.writeText(JSON.stringify(evidence, null, 2));
-      setNotice("组件数据链路诊断已复制。");
+      await navigator.clipboard.writeText(JSON.stringify(value, null, 2));
+      setNotice(label + "已复制。");
     } catch {
-      setError("无法复制组件数据链路诊断。");
+      setError("无法复制" + label + "。");
     }
   };
   const runtime = report?.runtime || {};
@@ -195,6 +214,7 @@ export default function DeviceDiagnosticsModal({
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={() => onClose?.()}>
       <div
+        ref={dialogRef} tabIndex={-1}
         className="modal-card device-diagnostics-modal"
         role="dialog"
         aria-modal="true"
@@ -218,7 +238,7 @@ export default function DeviceDiagnosticsModal({
               最近复位：{resetReason}
             </span>
             {evidence && (
-              <button type="button" className="btn-secondary btn-sm" onClick={copyWidgetDataEvidence} disabled={pending}>
+              <button type="button" className="btn-secondary btn-sm" onClick={() => copyEvidence("组件数据链路诊断", evidence)} disabled={pending}>
                 复制组件数据链路
               </button>
             )}
@@ -226,6 +246,19 @@ export default function DeviceDiagnosticsModal({
               {pending ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
             </button>
           </div>
+
+          <details>
+            <summary>组件能力与设置</summary>
+            <dl className="device-diagnostics-modal__metrics">
+              {readiness.map(({ id, label, state, detail }) => (
+                <Metric key={id} label={label} value={<><strong>{state}</strong><br />{detail}</>} />
+              ))}
+            </dl>
+            <button type="button" className="btn-secondary btn-sm" disabled={pending}
+              onClick={() => copyEvidence("组件能力摘要", Object.fromEntries(readiness.map(r => [r.label, r.state])))}>
+              复制能力摘要
+            </button>
+          </details>
 
           {report && (
             <dl className="device-diagnostics-modal__metrics">

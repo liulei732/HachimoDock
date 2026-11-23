@@ -53,11 +53,36 @@ test("previous forced Pro default migrates to Lite without losing keys; selected
   }
 });
 
+test("an explicitly selected former Pro default survives saving and reopening", () => {
+  let saved;
+  const storage = { getItem: () => saved, setItem: (_, value) => { saved = value; } };
+  const model = "doubao-seed-2-0-pro-260215";
+  saveProviderConfig("volcengine", { apiKey: "fixture", thinkingModel: model }, storage);
+  assert.equal(loadProviderConfig("volcengine", storage).thinkingModel, model);
+  for (const placeholder of ["••••", "fix…ture", "hachimidock-bundled-ark-v1"]) {
+    assert.equal(resolveProviderApiKey("volcengine", placeholder), "");
+  }
+});
+
 test("failed or unavailable storage never reports a successful save or exposes credentials", () => {
   assert.throws(() => saveProviderConfig("custom", {}, null), /配置未保存/);
   assert.throws(() => saveProviderConfig("custom", { apiKey: "test-secret" }, {
     setItem() { throw new Error("test-secret: quota exceeded"); },
   }), error => error.message.includes("配置未保存") && !error.message.includes("test-secret"));
+});
+
+test("blank and masked generation keys retain only the matching saved credential", () => {
+  for (const id of ["volcengine", "kling", "custom"]) {
+    let raw;
+    const storage = { getItem: () => raw, setItem: (_, value) => { raw = value; } };
+    const baseUrl = "https://one.invalid/v1";
+    saveProviderConfig(id, { apiKey: "fixture-key", baseUrl }, storage);
+    for (const apiKey of ["", "••••", "fix…-key"]) {
+      saveProviderConfig(id, { apiKey, baseUrl }, storage);
+      assert.equal(loadProviderConfig(id, storage).apiKey, "fixture-key");
+      if (id === "custom") assert.throws(() => saveProviderConfig(id, { apiKey, baseUrl: "https://two.invalid" }, storage));
+    }
+  }
 });
 
 test("generation parameters persist without overriding credentials or identity", () => {

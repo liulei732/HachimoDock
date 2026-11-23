@@ -1,0 +1,50 @@
+[
+  {
+    "event": "joystick.up",
+    "action": "field.prev",
+    "control": "joystick",
+    "label": "Previous"
+  },
+  {
+    "event": "joystick.down",
+    "action": "field.next",
+    "control": "joystick",
+    "label": "Next"
+  },
+  {
+    "event": "knob.rotate_ccw",
+    "action": "key.down",
+    "control": "joystick",
+    "label": "Key down"
+  },
+  {
+    "event": "knob.rotate_cw",
+    "action": "key.up",
+    "control": "joystick",
+    "label": "Key up"
+  },
+  {
+    "event": "button.sw1.short_press",
+    "action": "form.accept",
+    "control": "sw1",
+    "label": "Edit / accept"
+  },
+  {
+    "event": "button.sw2.short_press",
+    "action": "form.cancel",
+    "control": "sw2",
+    "label": "Cancel"
+  },
+  {
+    "event": "button.encoder.short_press",
+    "action": "text.append",
+    "control": "encoder",
+    "label": "Append"
+  },
+  {
+    "event": "button.encoder.long_press",
+    "action": "text.erase",
+    "control": "encoder",
+    "label": "Erase"
+  }
+]

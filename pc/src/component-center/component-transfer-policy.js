@@ -5,13 +5,23 @@ export async function syncAudioPreflight(request, boardDeviceId) {
   if(!audio||typeof audio.blocked!=='boolean')throw new Error('无法确认设备音频状态，尚未开始同步；请稍后重新检查。');
   return audio;
 }
+export function canRepairThumbnail(component, inventory, scope, target, usb, wifi) {
+  if (!component?.libraryPath || !component.coverDataUrl || component.isDeviceOnly ||
+      !target || inventory?.freshness !== "live" || inventory.scope !== scope) return false;
+  const installed = inventory.items?.find(item => item.id === component.id);
+  if (!installed || (installed.version && component.version !== installed.version)) return false;
+  if (target.transport === "wifi") return wifi?.centerThumb === true;
+  return target.transport === "usb" && usb?.capabilities?.widgetCenterThumb === "p4t-64x48-v1" &&
+    usb.capabilities.widgetTransfer === "p4-widget-files-v2";
+}
+
 export function deviceDeletePolicy({clearSave=false,transport,capabilities={}}) {
   if(!clearSave&&transport!=='wifi'&&(transport!=='usb'||capabilities.widgetDeletePreserveSave!==true))
     throw new Error('当前设备或连接不支持保留存档卸载；未删除。请升级固件，或明确勾选清除设备存档。');
   return {preserveSave:!clearSave,clearDeviceSaveConfirmed:clearSave};
 }
 export function componentCommitOutcomeUnknown(error) {
-  return /acknowledg.*timed out|commit.*(?:timeout|timed out)|回执.*超时|组件提交(?:结果尚未确认|回执格式未确认)|未收到板端组件 OTA 确认:.*phase=commit\b|component catalog outcome unknown|durable catalog media publication failed/i.test(String(error));
+  return /无线安装提交结果未确认|安装结果未确认。请查看设备组件列表|无线安装任务未完成，请查看设备组件列表|acknowledg.*timed out|commit.*(?:timeout|timed out)|回执.*超时|组件提交(?:结果尚未确认|回执格式未确认)|未收到板端组件 OTA 确认:.*phase=commit\b|component catalog outcome unknown|durable catalog media publication failed/i.test(String(error));
 }
 
 export function componentTransferError(error) {
@@ -34,4 +44,18 @@ export function componentTransferError(error) {
   }
   if (/storage.*busy/i.test(raw)) return '设备正在处理组件存储。请等待当前操作结束并检查设备清单，再决定是否重新同步。';
   return raw;
+}
+
+/** Only a new observation from the original boot can confirm a version change. */
+export async function verifyWifiInstall(check, currentScope, readInventory) {
+  if (currentScope() !== check.scope) throw Error("设备或连接已变化，请在原设备上核对。");
+  const inventory = await readInventory();
+  if (currentScope() !== check.scope || inventory?.scope !== check.scope || inventory.freshness !== "live")
+    throw Error("尚未取得原设备的最新组件清单，请重新核对。");
+  const installed = inventory.items.find(item => item.id === check.id);
+  if (!check.version || !installed?.version || installed.version !== check.version)
+    throw Error("最新清单尚未确认目标版本，请检查设备组件列表。");
+  if (check.previousVersion === check.version)
+    throw Error("设备已列出该版本；同版本重装的结果无法通过版本号确认。");
+  return installed;
 }

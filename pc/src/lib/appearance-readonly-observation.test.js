@@ -12,3 +12,27 @@ test("post-query route change rejects stale result",async()=>{for(const status o
 test("raw quarantine or busy stops once without reset/probe/clear/replay",async()=>{for(const error of ["appearance_raw_stream_quarantined_no_probe","appearance_recovery_busy","appearance_recovery_query_unknown_no_replay"]){const f=fixture(Error(error));await assert.rejects(observeAppearanceFromMenu({invoke:f.invoke,boardDeviceId:BOARD}));assert.deepEqual(f.calls.map(x=>x.command),["usb_get_status","usb_reconcile_appearance_unknown"]);}assert.match(appearanceObservationError("appearance_raw_stream_quarantined_no_probe"),/确认重启并恢复/);});
 test("malformed or mutation-positive proofs never report observed",async()=>{for(const reply of [{},{...PROOF,mutationSent:true},{...PROOF,oldResult:"success"},{...PROOF,requiresFreshUserIntent:false}]){const f=fixture(reply);await assert.rejects(observeAppearanceFromMenu({invoke:f.invoke,boardDeviceId:BOARD}));}});
 test("each explicit click uses a fresh observation UUID; cancelled view cannot report stale result",async()=>{const a=fixture(),b=fixture();await observeAppearanceFromMenu({invoke:a.invoke,boardDeviceId:BOARD});await observeAppearanceFromMenu({invoke:b.invoke,boardDeviceId:BOARD});assert.notEqual(a.calls[1].args.userIntentId,b.calls[1].args.userIntentId);const c=fixture();await assert.rejects(observeAppearanceFromMenu({invoke:c.invoke,boardDeviceId:BOARD,isCurrent:()=>false}));assert.equal(c.calls.length,0);});
+
+test("wireless verification reads the actual active slot without activating or sending a pack", async () => {
+  for (const [slot, label] of [[0, "内置"], [1, "自定义"]]) {
+    const calls = [];
+    const result = await observeAppearanceFromMenu({
+      boardDeviceId: BOARD, wifiBootId: "live-boot",
+      invoke: async (command, args) => { calls.push([command, args]); return slot; },
+    });
+    assert.deepEqual(calls, [["lan_read_appearance_slot", { boardDeviceId: BOARD, bootId: "live-boot" }]]);
+    assert.ok(result.message.includes(label));
+  }
+});
+
+test("an undetermined slot or a connection change discards the wireless observation", async () => {
+  const opts = { boardDeviceId: BOARD, wifiBootId: "live-boot" };
+  for (const slot of [null, "", 2]) {
+    await assert.rejects(observeAppearanceFromMenu({ ...opts, invoke: async () => slot }));
+  }
+  let current = true;
+  await assert.rejects(observeAppearanceFromMenu({
+    ...opts, isCurrent: () => current,
+    invoke: async () => { current = false; return 1; },
+  }));
+});

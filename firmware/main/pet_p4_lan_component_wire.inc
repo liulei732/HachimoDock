@@ -26,9 +26,15 @@ static uint8_t bundle_wire_run(int fd, bundle_job_t *job, int64_t deadline) {
   return queue_delivery(!job->record);
 }
 
-static void bundle_wire_session(int fd, mbedtls_gcm_context *gcm, uint8_t *cipher,
-                                uint8_t *plain, uint32_t request_generation) {
-  bundle_job_t job = {0};
+/* The application sets commit_reason only for an explicitly negotiated commit.
+ * No detail may override success or a possibly published mutation. */
+static uint8_t bundle_wire_status(uint8_t result, const bundle_job_t *job) {
+  return result == 0 ? job->commit_reason : result;
+}
+
+static void bundle_wire_session_kind(int fd, mbedtls_gcm_context *gcm, uint8_t *cipher,
+                                uint8_t *plain, uint32_t request_generation, uint32_t association, bool repair_only) {
+  bundle_job_t job = {.generation = request_generation, .association = association, .repair_only = repair_only};
   const int enabled = 1;
   setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
   const int64_t end = esp_timer_get_time() + LAN_BUNDLE_SESSION_US;
@@ -50,7 +56,7 @@ static void bundle_wire_session(int fd, mbedtls_gcm_context *gcm, uint8_t *ciphe
     job.record = plain;
     job.size = size;
     const int64_t work = esp_timer_get_time() + (terminal ? LAN_COMPONENT_WORK_US : LAN_BUNDLE_IDLE_US);
-    const uint8_t result = bundle_wire_run(fd, &job, work < end ? work : end);
+    const uint8_t result = bundle_wire_status(bundle_wire_run(fd, &job, work < end ? work : end), &job);
     // Wipe only the current immutable record after the serialized worker returns.
     mbedtls_platform_zeroize(plain, size);
     nonce[0] = 3;
@@ -69,4 +75,9 @@ static void bundle_wire_session(int fd, mbedtls_gcm_context *gcm, uint8_t *ciphe
     if (!bundle_wire_run(fd, &job, 0)) pet_p4_miniapp_lan_bundle_revoke();
     cJSON_Delete(job.manifest);
   }
+}
+
+static void bundle_wire_session(int fd, mbedtls_gcm_context *gcm, uint8_t *cipher,
+                                uint8_t *plain, uint32_t generation_id, uint32_t association) {
+  bundle_wire_session_kind(fd,gcm,cipher,plain,generation_id,association,false);
 }

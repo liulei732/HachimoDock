@@ -1,19 +1,19 @@
-/* Explicit PC grant, on the existing protocol storage worker only. Never run
+/* Recover one locally granted slot, or atomically stage the legacy PC grant. Never run
  * from the frame loop. Stage private saved alarms without publishing a runtime,
  * starting a program, arming declarations or executing an action. */
 typedef struct {
   miniapp_catalog_item_t catalog[PET_P4_MINIAPP_CATALOG_MAX];
-  ext_alarm_entry_t pending[PET_CEV_COMPONENTS];
   bool skip[PET_P4_MINIAPP_CATALOG_MAX];
   miniapp_runtime_t runtime;
   miniapp_catalog_item_t loaded;
   char save[PET_APP_SAVE_BYTES];
   char error[128];
   size_t count, pending_count;
+  ext_alarm_entry_t pending[];
 } ext_alarm_boot_workspace_t;
 
-bool pet_p4_miniapp_alarm_policy_prepare(bool background_notify) {
-  if (!background_notify) { pet_p4_miniapp_alarm_policy(false); return true; }
+static bool alarm_restore_saved(int local_slot) {
+  const bool local_only = local_slot >= 0;
   if (g_catalog_recovery_blocked || storage_audio_busy()) return false;
   pet_storage_scope_t storage __attribute__((cleanup(storage_scope_finish))) = {0};
   if (!storage_scope_begin(&storage, false)) return false;
@@ -21,7 +21,7 @@ bool pet_p4_miniapp_alarm_policy_prepare(bool background_notify) {
    * This is not a synchronous native/main-task fallback for disk scanning. */
   if (!storage.may_unlock || !pet_storage_scope_advance(&storage, PET_STORAGE_PREPARE)
       || !pet_storage_scope_unlock(&storage)) return false;
-  ext_alarm_boot_workspace_t *w = heap_caps_calloc(1, sizeof(*w), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  ext_alarm_boot_workspace_t *w = heap_caps_calloc(1, sizeof(*w) + (local_only ? 1 : PET_CEV_COMPONENTS) * sizeof(w->pending[0]), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!w) return false;
   bool ok = false;
   uint32_t sequence = 0;
@@ -34,7 +34,8 @@ bool pet_p4_miniapp_alarm_policy_prepare(bool background_notify) {
   policy_revision = g_ext_alarm_policy_revision;
   for (size_t i = 0; i < w->count; i++) {
     const char *id = w->catalog[i].widget_id;
-    w->skip[i] = (g_runtime.active && !strcmp(g_runtime.widget_id, id)) || ext_alarm_entry(id, false) != NULL;
+    w->skip[i] = (local_only && (w->catalog[i].slot != local_slot || local_alarm_mode(id) < PET_ALARM_COUNT))
+        || (g_runtime.active && !strcmp(g_runtime.widget_id,id)) || ext_alarm_entry(id,false) != NULL;
   }
   ext_unlock(); miniapp_runtime_unlock();
   if (!pet_storage_scope_unlock(&storage)) goto done;
@@ -44,15 +45,16 @@ bool pet_p4_miniapp_alarm_policy_prepare(bool background_notify) {
     if (!storage_work_current() || !safe_widget_id(item->widget_id)) goto done;
     pet_app_store_status_t status = pet_app_store_load_with_lease(item->widget_id, w->save, g_storage_resource_lease);
     if (status == PET_APP_STORE_EMPTY) continue; /* No save never creates a timer. */
-    if (status != PET_APP_STORE_VALUE || !pet_form_source_valid(w->save)) goto done;
+    if (status != PET_APP_STORE_VALUE) goto done;
+    if (!pet_form_source_valid(w->save)) { if (local_only) continue; goto done; }
     cJSON *saved = cJSON_ParseWithOpts(w->save, NULL, true);
-    if (!cJSON_IsObject(saved)) { cJSON_Delete(saved); goto done; }
+    if (!cJSON_IsObject(saved)) { cJSON_Delete(saved); if (local_only) continue; goto done; }
     const cJSON *alarms = cJSON_GetObjectItemCaseSensitive(saved, "alarms");
     bool absent = alarms == NULL;
     bool valid = absent || (cJSON_IsString(alarms) && strlen(alarms->valuestring) < PET_CEV_SAVE_TEXT_MAX);
     bool empty = !absent && valid && !alarms->valuestring[0];
     cJSON_Delete(saved);
-    if (!valid) goto done;
+    if (!valid) { if (local_only) continue; goto done; }
     if (absent || empty) continue;
     /* Reuse the installed package checksum + full declaration validator, and
      * the ordinary save-version/state/vars/alarms validator. Neither publishes
@@ -62,7 +64,10 @@ bool pet_p4_miniapp_alarm_policy_prepare(bool background_notify) {
     if (!load_catalog_runtime_item(&w->loaded, &w->runtime, false, w->error, sizeof(w->error))
         || !w->runtime.save_version || !w->runtime.cext.alarms.count
         || !restore_app_runtime_buffer(&w->runtime, true, w->save)
-        || w->pending_count >= PET_CEV_COMPONENTS) goto done;
+        || w->pending_count >= PET_CEV_COMPONENTS) {
+      if (local_only) continue;
+      goto done;
+    }
     ext_alarm_entry_t *entry = &w->pending[w->pending_count++];
     copy_utf8(entry->widget_id, sizeof(entry->widget_id), item->widget_id);
     copy_utf8(entry->title, sizeof(entry->title), w->runtime.view.title);
@@ -91,7 +96,8 @@ bool pet_p4_miniapp_alarm_policy_prepare(bool background_notify) {
       entry->alarms = staged->alarms;
       copy_utf8(entry->title, sizeof(entry->title), staged->title);
     }
-    g_ext_background_notify = true; g_ext_alarm_policy_revision++; ok = true;
+    if (!local_only) g_ext_background_notify = true;
+    g_ext_alarm_policy_revision++; ok = true;
   }
   ext_unlock(); miniapp_runtime_unlock();
 done:
@@ -102,4 +108,9 @@ done:
   }
   heap_caps_free(w);
   return ok;
+}
+
+bool pet_p4_miniapp_alarm_policy_prepare(bool background_notify) {
+  if (!background_notify) { pet_p4_miniapp_alarm_policy(false); return true; }
+  return alarm_restore_saved(-1);
 }

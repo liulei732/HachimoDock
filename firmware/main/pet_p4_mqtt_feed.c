@@ -2,6 +2,12 @@
 
 #if PET_P4_SYSTEM_WIFI
 #include <stdio.h>
+#include <stdatomic.h>
+#if PET_P4_SCOPED_WRITE
+#include <time.h>
+#include "pet_p4_miniapp.h"
+#include "pet_p4_wifi_clock.h"
+#endif
 #include "esp_crt_bundle.h"
 #include "esp_random.h"
 #include "mbedtls/platform_util.h"
@@ -10,6 +16,13 @@
 #include "pet_p4_wifi_data_sources.h"
 
 enum { IO_MS = 5000, PING_MS = 15000 };
+static atomic_uint mqtt_subscriptions, mqtt_messages, mqtt_applied;
+
+void pet_mqtt_feed_counts(unsigned *subscriptions,unsigned *messages,unsigned *applied) {
+  *applied = atomic_load(&mqtt_applied);
+  *messages = atomic_load(&mqtt_messages);
+  *subscriptions = atomic_load(&mqtt_subscriptions);
+}
 
 static int64_t clock_ms(void) { return esp_timer_get_time() / 1000; }
 
@@ -17,6 +30,9 @@ typedef struct {
   esp_tls_t *tls;
   pet_mqtt_feed_current_fn current;
   void *context;
+#if PET_P4_SCOPED_WRITE
+  ssize_t (*guarded_write)(esp_tls_t *, const void *, size_t);
+#endif
 } mqtt_feed_t;
 
 /* Zero means an idle deadline. EOF, cancellation and TLS errors fail
@@ -26,7 +42,11 @@ static int transfer(mqtt_feed_t *feed, void *bytes, size_t size, bool send, int6
   while (done < size && feed->current(feed->context)) {
     if (clock_ms() >= until) return done ? -1 : 0;
     uint8_t *at = (uint8_t *)bytes + done;
-    const ssize_t n = send ? esp_tls_conn_write(feed->tls, at, size - done)
+    const ssize_t n =
+#if PET_P4_SCOPED_WRITE
+      send && feed->guarded_write ? feed->guarded_write(feed->tls, at, size - done) :
+#endif
+      send ? esp_tls_conn_write(feed->tls, at, size - done)
                            : esp_tls_conn_read(feed->tls, at, size - done);
     if (n > 0) done += n;
     else if (n == ESP_TLS_ERR_SSL_WANT_READ || n == ESP_TLS_ERR_SSL_WANT_WRITE)
@@ -82,14 +102,18 @@ static int receive(mqtt_feed_t *feed, char *body, uint8_t *type, size_t *length,
 }
 
 static bool accept_publish(const pet_private_feed_t *binding, uint8_t type, const char *body,
-    size_t length, pet_mqtt_feed_value_fn accept, void *context) {
+    size_t length, pet_mqtt_feed_value_fn accept, void *context, bool *applied) {
   if ((type & 0xfe) != 0x30 || length < 2) return false;
   const size_t topic = pet_mqtt_u16((const uint8_t *)body);
   if (topic > length - 2 || topic != strlen(binding->topic) ||
       memcmp(body + 2, binding->topic, topic)) return false;
   const size_t payload = length - 2 - topic;
   if (payload > PET_WIFI_DATA_BODY_MAX) return false;
-  if (payload) accept(body + 2 + topic, payload, context);
+  atomic_fetch_add(&mqtt_messages, 1);
+  if (payload && accept(body + 2 + topic, payload, context)) {
+    atomic_fetch_add(&mqtt_applied, 1);
+    *applied = true;
+  }
   return true;
 }
 
@@ -108,7 +132,7 @@ bool pet_mqtt_feed_run(const pet_wifi_endpoint_t *endpoint, const pet_private_fe
     .context = ctx,
   };
   if (!feed.tls) return false;
-  bool received = false;
+  bool any_applied = false;
   uint8_t type;
   size_t length;
   if (!connect_packet(&feed, secret) ||
@@ -137,12 +161,13 @@ bool pet_mqtt_feed_run(const pet_wifi_endpoint_t *endpoint, const pet_private_fe
     if (!subscribed && type == 0x90 && length == 3 && workspace[0] == 0 &&
         workspace[1] == 1 && workspace[2] == 0) {
       subscribed = true;
+      atomic_fetch_add(&mqtt_subscriptions, 1);
     } else if (type == 0xd0 && !length && ping_until) {
       ping_until = 0;
       ping_at = clock_ms() + PING_MS;
-    } else if (current(ctx) && accept_publish(binding, type, workspace, length, accept, ctx)) {
+    } else if (current(ctx) && accept_publish(binding, type, workspace, length, accept, ctx, &any_applied)) {
       /* A broker may deliver retained PUBLISH before its SUBACK. */
-      received = true;
+      /* Empty/ignored messages keep the subscription alive without resetting backoff. */
       mbedtls_platform_zeroize(workspace, length);
       vTaskDelay(pdMS_TO_TICKS(125));
     } else {
@@ -152,6 +177,9 @@ bool pet_mqtt_feed_run(const pet_wifi_endpoint_t *endpoint, const pet_private_fe
 done:
   mbedtls_platform_zeroize(workspace, PET_MQTT_BODY_LIMIT);
   esp_tls_conn_destroy(feed.tls);
-  return received;
+  return any_applied;
 }
+#if PET_P4_SCOPED_WRITE
+#include "pet_p4_device_write.inc"
+#endif
 #endif

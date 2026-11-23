@@ -7,6 +7,7 @@
  * [Sync] If discovery or state-tail semantics change, update `pc/.folder.md`.
  */
 
+const sessionTail = require("./session-tail");
 const fs = require("fs");
 const { createHash } = require("node:crypto");
 const { requestText } = require("./codex-request-text");
@@ -1060,7 +1061,7 @@ class CodexLogMonitor {
     this.emit(entry, state, key);
   }
 
-  pollFile(filePath, fileName) {
+  pollFile(filePath, fileName, budget) {
     let stat;
     try {
       stat = fs.statSync(filePath);
@@ -1080,39 +1081,20 @@ class CodexLogMonitor {
       this.tracked.set(filePath, entry);
     }
 
-    if (stat.size <= entry.offset) return;
-
-    let buffer;
     try {
-      const fd = fs.openSync(filePath, "r");
-      const readLen = stat.size - entry.offset;
-      buffer = Buffer.alloc(readLen);
-      fs.readSync(fd, buffer, 0, readLen, entry.offset);
-      fs.closeSync(fd);
-    } catch {
-      return;
-    }
-    entry.offset = stat.size;
-
-    const text = entry.partial + buffer.toString("utf8");
-    const lines = text.split("\n");
-    entry.partial = lines.pop() || "";
-    if (entry.dropFirstLine) {
-      lines.shift();
-      entry.dropFirstLine = false;
-    }
-
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line) continue;
-      this.processLine(line, entry);
+      sessionTail.readLines(filePath, stat, entry, () => {
+        const fresh = this.createEntry(this.extractSessionId(fileName), 0, false);
+        this.tracked.set(filePath, fresh);
+        return fresh;
+      }, (line, target) => this.processLine(line, target), budget);
+    } catch (error) {
+      if (!error.code) throw error;
     }
   }
 
   createEntry(sessionId, offset, dropFirstLine) {
     return {
       offset,
-      partial: "",
       dropFirstLine,
       sessionId,
       cwd: "",
@@ -1316,7 +1298,9 @@ class CodexLogMonitor {
     if (!sessionId) return;
     try {
       const current = stat || fs.statSync(filePath);
-      this.tracked.set(filePath, this.createEntry(sessionId, current.size, false));
+      const entry = this.createEntry(sessionId, current.size, false);
+      entry.fileId = sessionTail.identity(current);
+      this.tracked.set(filePath, entry);
     } catch {}
   }
 
@@ -1338,7 +1322,7 @@ class CodexLogMonitor {
     entry.suppressEmit = true;
     this.tracked.set(filePath, entry);
     try {
-      this.pollFile(filePath, fileName);
+      this.pollFile(filePath, fileName, current.size - initialOffset);
     } finally {
       entry.suppressEmit = false;
     }

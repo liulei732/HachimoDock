@@ -8,7 +8,7 @@ void *memmove(void *p,const void *q,size_t n){unsigned char*d=p;const unsigned c
 static pet_fruit_t game;
 static float snapshot[512];
 void fruit_init(unsigned seconds,unsigned lives,unsigned volume){pet_fruit_init(&game,seconds,lives,volume);}
-void fruit_action(unsigned action,unsigned now,unsigned seed){if(!action)pet_fruit_start(&game,now,seed);else pet_fruit_pause(&game,now);}
+void fruit_action(unsigned action,unsigned now,unsigned seed){if(!action)pet_fruit_start_or_resume(&game,now,seed);else pet_fruit_pause(&game,now);}
 void fruit_tick(unsigned now){pet_fruit_tick(&game,now);}
 void fruit_pointer(unsigned kind,int x,int y,unsigned now){pet_p4_pointer_event_t e={kind,x,y,now};pet_fruit_pointer(&game,&e);}
 void fruit_suspend(unsigned now){pet_fruit_suspend(&game,now);}

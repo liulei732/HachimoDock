@@ -89,7 +89,7 @@ export default function ToastStack() {
       {items.map(({ id, tone = "info", title, message, action }) => {
         const Icon = ICONS[tone] || Info;
         return (
-          <div key={id} className={`toast toast--${tone}`} role="status" aria-live="polite">
+          <div key={id} className={`toast toast--${tone}`} role={tone === "error" ? "alert" : "status"}>
             <div className="toast__head">
               <Icon size={16} />
               <span className="toast__title">{title}</span>

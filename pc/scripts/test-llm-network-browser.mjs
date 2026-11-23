@@ -21,8 +21,10 @@ try {
       if (command === 'load_llm_network_settings') return { mode: 'system', proxyUrl: '', certificateConfigured: false };
       if (command === 'save_llm_network_settings') return { ...args.input, certificateConfigured: Boolean(args.input.caFile) };
       if (command === 'test_llm_network_settings') return [
-        { provider: '火山方舟（豆包）', reachable: true, message: '已收到 HTTPS 响应' },
-        { provider: 'DeepSeek', reachable: false, message: '访问被拒绝' },
+        { provider: '火山方舟（豆包）', reachable: true, httpStatus: 401, message: '已收到 HTTPS 响应' },
+        { provider: 'DeepSeek', reachable: false, httpStatus: 403, message: '访问被拒绝' },
+        { provider: '豆包语音', reachable: false, httpStatus: null, message: 'TLS 证书校验失败' },
+        { provider: 'MiMo', reachable: true, httpStatus: 404, message: '已收到 HTTPS 响应' },
       ];
       if (command === 'plugin:dialog|open') return '/test/company-public-ca.pem';
       throw new Error(command);
@@ -43,9 +45,12 @@ try {
   await page.getByRole('button', { name: '保存网络设置' }).click();
   await page.getByText('已保存到这台电脑', { exact: false }).waitFor();
   await page.getByRole('button', { name: '测试已保存配置' }).click();
-  await page.getByText('DeepSeek：访问被拒绝', { exact: false }).waitFor();
-  assert.equal(await page.locator('.is-error').count(), 1);
-  assert.equal(await page.locator('.is-success').count(), 1);
+  await page.getByText(/DeepSeek.*HTTP 403.*已收到 HTTPS 响应.*模型权限尚未验证/).waitFor();
+  await page.getByText(/豆包语音.*证书/).waitFor();
+  await page.getByText(/MiMo.*HTTP 404/).waitFor();
+  await page.getByText(/火山方舟.*HTTP 401/).waitFor();
+  assert.equal(await page.locator('.is-error').count(), 2);
+  assert.equal(await page.locator('.is-success').count(), 2);
   if (process.env.PET_TEST_SCREENSHOT) await page.screenshot({ path: process.env.PET_TEST_SCREENSHOT, fullPage: true });
   await page.getByRole('button', { name: '移除导入的证书' }).click();
   await page.getByLabel('连接方式').selectOption('system');

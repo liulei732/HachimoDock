@@ -1,4 +1,5 @@
 .shared-location {
+  container: shared-location / inline-size;
   display: grid;
   gap: 8px;
   min-width: 0;
@@ -74,3 +75,19 @@
 }
 .shared-location__suggestion:hover,
 .shared-location__suggestion--active { background: var(--accent-soft, #fff0e4); }
+
+@container shared-location (max-width: 420px) {
+  .shared-location__row { flex-wrap: wrap; }
+  .shared-location__city {
+    /* Keep the location label and mode beside the city, with actions below. */
+    flex: 1 1 calc(100% - 118px);
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .shared-location__suggest-field { flex: 1 1 calc(100% - 66px); }
+  .shared-location__feedback > span {
+    flex-basis: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}

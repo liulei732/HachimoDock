@@ -12,9 +12,18 @@ try {
   await page.evaluate(async () => {
     const Refresh = (await import("/@react-refresh")).default;
     Refresh.injectIntoGlobalHook(window); window.$RefreshReg$ = () => {}; window.$RefreshSig$ = () => type => type; window.__vite_plugin_react_preamble_installed__ = true;
+    window.stockLoadError = "自选股配置损坏。请检查 stock-watchlist.json 后重新启动客户端。";
+    window.stockWrites = 0;
     window.stockTest = { settings: { symbols: [] }, quotes: [], error: "", fetchedAtMs: 0 };
     window.__TAURI_INTERNALS__ = { invoke: async (command, args) => {
-      if (command === "stock_watchlist_status") return structuredClone(window.stockTest);
+      if (command === "stock_watchlist_status") {
+        if (window.holdStockRead) {
+          window.heldReads++;
+          await new Promise(resolve => { window.finishStockRead = resolve; });
+        }
+        if (window.stockLoadError) throw window.stockLoadError;
+        return structuredClone(window.stockTest);
+      }
       if (command === "stock_search") {
         window.stockSearchQueries = [...(window.stockSearchQueries || []), args.query];
         if (args.query === "腾讯") return [{ symbol: "hk00700", name: "腾讯控股", market: "港股" }];
@@ -27,6 +36,7 @@ try {
         return { symbol: args.symbol, name: args.symbol === "sh600000" ? "测试沪市股票" : "测试港股" };
       }
       if (command === "stock_watchlist_save") {
+        window.stockWrites++;
         window.stockTest.settings = args.input;
         window.stockTest.quotes = args.input.symbols.map(symbol => ({ symbol, name: symbol === "sh600000" ? "测试沪市股票" : "测试港股", price: "12.30", changePercent: "1.20", quoteTime: "2026-09-21 12:00:00", currency: symbol.startsWith("hk") ? "HKD" : "CNY", stale: false, tone: 1 }));
         return structuredClone(window.stockTest);
@@ -39,6 +49,8 @@ try {
     const { default: ComponentPreviewModal } = await import("/src/component-center/ComponentPreviewModal.jsx");
     const css = document.createElement("link"); css.rel = "stylesheet"; css.href = "/src/styles.css"; document.head.append(css);
     const root = (dom.createRoot || dom.default.createRoot)(document.getElementById("root"));
+    const { default: StockWatchlist } = await import("/src/component-center/StockWatchlist.jsx");
+    window.renderEditorOnly = () => root.render(React.createElement(StockWatchlist));
     window.renderStockModal = (id = "stock-watchlist") => root.render(React.createElement(ComponentPreviewModal, {
       component: { id, name: id === "stock-watchlist" ? "自选股行情" : "其他组件", dashboard: {} },
       kind: "tool", isLocal: true, deviceConnected: true,
@@ -49,6 +61,14 @@ try {
   await page.getByRole("dialog").waitFor();
   assert.equal(await page.getByRole("dialog").locator(".stock-watchlist").count(), 1);
   assert.equal(await page.getByRole("button", { name: "添加行情组件", exact: true }).count(), 0);
+  await page.getByRole("alert").filter({ hasText: "自选股配置损坏" }).waitFor();
+  assert.equal(await page.getByText("还没有自选股。", { exact: false }).count(), 0);
+  const input = page.getByLabel("股票名称或代码", { exact: true });
+  await input.fill("600000");
+  assert.equal(await page.getByRole("button", { name: "添加股票", exact: true }).isDisabled(), true);
+  await input.press("Enter");
+  assert.equal(await page.evaluate(() => window.stockWrites), 0);
+  await page.evaluate(() => { window.stockLoadError = ""; });
   await page.getByText("还没有自选股。", { exact: false }).waitFor();
   await page.getByText("当前设备固件尚不支持", { exact: false }).waitFor();
   await page.getByLabel("股票名称或代码", { exact: true }).fill("600000");
@@ -87,6 +107,19 @@ try {
   await page.evaluate(() => window.renderStockModal("other-tool"));
   await page.getByRole("dialog").waitFor();
   assert.equal(await page.locator(".stock-watchlist").count(), 0);
+  await page.clock.install();
+  await page.evaluate(() => {
+    window.heldReads = 0;
+    window.holdStockRead = true;
+    window.renderEditorOnly();
+  });
+  await page.waitForFunction(() => window.heldReads === 1);
+  await page.clock.runFor(4500);
+  assert.equal(await page.evaluate(() => window.heldReads), 1);
+  await page.evaluate(() => window.finishStockRead());
+  await page.getByLabel("删除 hk00700", { exact: true }).waitFor();
+  await page.clock.runFor(2100);
+  assert.equal(await page.evaluate(() => window.heldReads), 2);
   assert.deepEqual(errors, []);
-  console.log("PASS: stock details only, Chinese typeahead, stale-result isolation, add/reorder/delete, stale quote, firmware gate and narrow modal");
+  console.log("PASS: serialized slow polls, failed read blocks edits without claiming an empty list, recovery, stock details only, Chinese typeahead, stale-result isolation, add/reorder/delete, stale quote, firmware gate and narrow modal");
 } finally { await browser.close(); }

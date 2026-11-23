@@ -143,8 +143,8 @@ def test_actual_worker_dispatch_sends_once_after_state_unlock_and_preserves_rout
 #define portMAX_DELAY 0xffffffffu
 #define configASSERT assert
 typedef void(*send_fn)(const char*,void*);
-typedef struct{char screen_page[16];bool asset_transfer_active;}state_t;
-static state_t g_state={"main",false};static unsigned held,dispatches,sends,freed,leaves;
+typedef struct{char screen_page[16];bool asset_transfer_active,approval_active;}state_t;
+static state_t g_state={"main",false,false};static unsigned held,dispatches,sends,freed,leaves;
 static bool g_protocol_storage_command_entered;
 static int g_state_mutex=1;static unsigned long long clock_us;
 #if PET_P4_QUERY_REPLY_TRACE
@@ -158,6 +158,8 @@ static bool pet_p4_miniapp_storage_lane_leave(void){assert(held);leaves++;return
 static bool pet_p4_conversation_active(state_t *s){assert(s==&g_state&&held);return false;}
 static bool pet_p4_ota_transfer_active(void){assert(held);return false;}
 static void pet_p4_miniapp_activation_guard(bool b){assert(held&&!b);}
+static unsigned hardware_leaves;
+static void pet_p4_miniapp_hardware_guard(bool foreground){assert(held&&!foreground);hardware_leaves++;}
 static void cJSON_free(char *p){assert(!held&&p);freed++;free(p);}
 static bool mutation;
 static void tx(const char *line,void *ctx){assert(ctx==(void*)123&&line);sends++;
@@ -189,7 +191,7 @@ int main(void){
  for(unsigned m=0;m<2;m++){
   mutation=m;test_dispatch(false);assert(dispatches==m+1&&sends==m+1&&leaves==m+1&&!held&&!g_protocol_storage_command_entered);
  }
- assert(freed==PET_P4_QUERY_REPLY_DEFERRED);
+ assert(freed==PET_P4_QUERY_REPLY_DEFERRED&&hardware_leaves==2);
 #if PET_P4_QUERY_REPLY_TRACE
  assert(g_query_timing.sequence==1&&g_query_timing.detached==PET_P4_QUERY_REPLY_DEFERRED&&!g_query_timing.invalid_clock);
 #endif

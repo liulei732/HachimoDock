@@ -1,17 +1,20 @@
 #include "pet_p4_radio.c"
 #include <assert.h>
+#include "lwip/dns.h"
+#include <arpa/inet.h>
 
 static char response[32768];
 static size_t response_len, response_pos, played;
 static bool current, stall, reject_certificate, wifi = true;
 static int64_t wifi_return_at, cancel_at;
-static bool drop_on_pcm;
+static bool drop_on_pcm, short_connections;
 static unsigned reconnects;
 static pet_radio_error_t finished;
 static radio_job_t next_job;
 static const char *expected_host = RADIO_HOST;
 static unsigned connections, first_timeout;
-static unsigned resume_on_connection;
+static unsigned resume_on_connection, recovery_start;
+static size_t payload_start, session_samples;
 static bool queued_job, delivery_waiting, stop_early = true;
 static radio_job_t submitted_job;
 static const radio_job_t station_job = {
@@ -54,6 +57,15 @@ pet_radio_write_t pet_p4_media_radio_write(uint32_t generation, const int16_t *p
     if (pcm[i] > 500 || pcm[i] < -500) ++loud;
   }
   played += samples;
+  if (recovery_start) {
+    session_samples += samples;
+    unsigned session = connections - recovery_start;
+    if (session == 3) current = false;
+    else if (session == 1 || short_connections || session_samples >= RADIO_STABLE_SAMPLES) {
+      wifi = false;
+      wifi_return_at = now_ms() + 1500;
+    }
+  }
   if (drop_on_pcm) {
     drop_on_pcm = false;
     wifi = false;
@@ -90,6 +102,11 @@ esp_tls_t *esp_tls_init(void) {
     stall = false;
     response_pos = 0;
   }
+  if (recovery_start) {
+    response_pos = session_samples = 0;
+    wifi = true;
+    wifi_return_at = 0;
+  }
   return &tls;
 }
 esp_err_t esp_tls_get_error_handle(esp_tls_t *tls, esp_tls_error_handle_t *handle) {
@@ -119,6 +136,7 @@ int esp_tls_conn_new_async(const char *host, int length, int port,
 ssize_t esp_tls_conn_read(esp_tls_t *tls, void *out, size_t max) {
   assert(tls);
   if (stall) return ESP_TLS_ERR_SSL_WANT_READ;
+  if (recovery_start && response_pos == response_len) response_pos = payload_start;
   size_t n = response_len - response_pos;
   if (n > max) n = max;
   if (n > 17) n = 17;
@@ -136,20 +154,14 @@ ssize_t esp_tls_conn_write(esp_tls_t *tls, const void *data, size_t bytes) {
 void esp_tls_conn_destroy(esp_tls_t *tls) { assert(tls); }
 
 static const char *dns_address = "8.8.4.4";
-int getaddrinfo(const char *host, const char *service, const struct addrinfo *hints,
-                struct addrinfo **out) {
-  assert(!strcmp(host, expected_host) && !service && hints->ai_family == AF_INET);
-  static struct sockaddr_in address;
-  static struct addrinfo result;
-  address.sin_family = AF_INET;
-  assert(inet_pton(AF_INET, dns_address, &address.sin_addr) == 1);
-  result.ai_family = AF_INET;
-  result.ai_addrlen = sizeof(address);
-  result.ai_addr = (struct sockaddr *)&address;
-  *out = &result;
-  return 0;
+int tcpip_try_callback(void (*fn)(void *), void *context) { fn(context); return ERR_OK; }
+err_t dns_gethostbyname_addrtype(const char *host, ip_addr_t *address,
+    void (*done)(const char *,const ip_addr_t *,void *), void *context, unsigned type) {
+  (void)done; (void)context;
+  assert(!strcmp(host, expected_host) && type == LWIP_DNS_ADDRTYPE_IPV4);
+  assert(inet_pton(AF_INET, dns_address, address) == 1);
+  return ERR_OK;
 }
-void freeaddrinfo(struct addrinfo *addr) { assert(addr); }
 esp_err_t esp_crt_bundle_attach(void *cfg) { assert(cfg); return ESP_OK; }
 esp_err_t esp_tls_get_conn_state(esp_tls_t *tls, esp_tls_conn_state_t *state) {
   assert(tls);
@@ -221,6 +233,7 @@ int main(int argc, char **argv) {
   assert(file);
   radio_stream_t *s = open_response("HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\n"
                                    "Transfer-Encoding: chunked\r\n\r\n");
+  payload_start = response_len;
   char chunk[219];
   size_t n;
   while ((n = fread(chunk, 1, sizeof(chunk), file))) {
@@ -268,6 +281,23 @@ int main(int argc, char **argv) {
   radio_task(NULL);
   assert(connections == before_drop + 2 && reconnects == before_recovery + 1 && played >= 48000);
 
+  // Two outages in one session. Only the second connection delivers a full
+  // stable window, so exactly one further recovery is admitted.
+  recovery_start = connections;
+  wifi = true;
+  stop_early = false;
+  current = queued_job = true;
+  radio_task(NULL);
+  assert(connections == recovery_start + 3 && played >= RADIO_STABLE_SAMPLES);
+  recovery_start = connections;
+  short_connections = true;
+  current = queued_job = true;
+  radio_task(NULL);
+  assert(connections == recovery_start + 2 && finished == PET_RADIO_WIFI_DISCONNECTED);
+  short_connections = false;
+  recovery_start = 0;
+  stop_early = true;
+  wifi = false;
   wifi_return_at = 0;
   current = queued_job = true;
   cancel_at = now_ms() + 1000;

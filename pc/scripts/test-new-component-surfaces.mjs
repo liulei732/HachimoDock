@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {chromium} from 'playwright';
 const output=process.env.PET_NEW_COMPONENT_QA||'new-components/qa';fs.mkdirSync(output,{recursive:true});
-const browser=await chromium.launch({executablePath:process.env.PET_TEST_BROWSER||'/Applications/360Chrome.app/Contents/MacOS/360Chrome',headless:true});
+const browser=await chromium.launch({executablePath:process.env.PET_TEST_BROWSER,headless:true});
 try{
   const page=await browser.newPage({viewport:{width:960,height:880}}),errors=[];
   page.on('pageerror',e=>errors.push(e.message));
